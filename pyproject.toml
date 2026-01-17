@@ -23,6 +23,9 @@ classifiers = [
 dependencies = [
     "requests>=2.28.0",
     "urllib3>=2.0.0",
+    "internetarchive>=4.0.0",
+    "datasketch>=1.6.0",
+    "xxhash>=3.0.0",
 ]
 
 [project.optional-dependencies]
@@ -34,14 +37,15 @@ dev = [
 [project.scripts]
 # Main collectors
 tc-gutenberg = "timecapsule_data.collectors.gutenberg:main"
-tc-ia = "timecapsule_data.collectors.internet_archive:main"
+tc-ia = "timecapsule_data.collectors.internet_archive_v2:main"
 tc-perseus = "timecapsule_data.collectors.perseus:main"
 
 # Utilities
 tc-analyze = "timecapsule_data.utils.analyze:main"
 tc-validate = "timecapsule_data.utils.validate:main"
-tc-dedup = "timecapsule_data.utils.dedup:main"
+tc-dedup = "timecapsule_data.utils.dedup_v2:main"
 tc-ocr-clean = "timecapsule_data.utils.ocr_cleanup:main"
+tc-quality = "timecapsule_data.utils.quality:main"
 
 [project.urls]
 Homepage = "https://github.com/robotdad/timecapsule-data"
@@ -64,4 +68,3 @@ select = ["E", "F", "I", "W"]
 ignore = ["E501"]  # Line length handled separately
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
