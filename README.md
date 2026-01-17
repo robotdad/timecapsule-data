@@ -205,10 +205,51 @@ MIT License - See LICENSE file.
 - [Perseus Digital Library](https://www.perseus.tufts.edu/) - Classical texts
 - [Internet Archive](https://archive.org/) - Massive text archive
 
-## Complete Pre-WWI Corpus Workflow
+## Automated Pre-WWI Corpus Collection
 
-This section documents the complete workflow for building a pre-WWI (1914) corpus.
+For a fully automated end-to-end collection, use the orchestration script:
 
+```bash
+cd timecapsule-data
+
+# Mini validation run first (~5-10 minutes, ~200 items)
+uv run python scripts/collect_prewwi_corpus.py --mode mini
+
+# Full collection (~3-5 days, ~147k items)
+uv run python scripts/collect_prewwi_corpus.py --mode full
+
+# Custom output directory
+uv run python scripts/collect_prewwi_corpus.py --mode full --output /path/to/corpus
+
+# Check status of running collection
+uv run python scripts/collect_prewwi_corpus.py --status
+
+# Resume interrupted collection
+uv run python scripts/collect_prewwi_corpus.py --resume
+```
+
+The script handles the complete pipeline:
+1. **Gutenberg** - ~17k high-quality proofread texts
+2. **Internet Archive Books** - ~50k books with Gutenberg deduplication
+3. **Internet Archive Newspapers** - ~80k newspaper issues
+4. **Validation** - Temporal purity check
+5. **OCR Cleanup** - Fix common OCR errors in IA texts
+6. **Deduplication** - Merge sources, prefer Gutenberg quality
+7. **Summary** - Generate metadata and statistics
+
+Features:
+- **Resume support** - Ctrl+C anytime, `--resume` to continue
+- **Progress tracking** - Real-time file counts and ETAs
+- **State persistence** - Saves progress after each stage
+- **Human-readable output** - Times like "2h 15m", sizes like "1.2 GB"
+
+Output defaults to `./corpus-prewwi/` relative to current directory.
+
+---
+
+## Manual Pre-WWI Corpus Workflow
+
+For manual step-by-step collection with full control:
 ### Step 1: Collect from Sources
 
 ```bash
