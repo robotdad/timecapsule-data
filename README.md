@@ -204,3 +204,93 @@ MIT License - See LICENSE file.
 - [Project Gutenberg](https://www.gutenberg.org/) - Source for proofread public domain texts
 - [Perseus Digital Library](https://www.perseus.tufts.edu/) - Classical texts
 - [Internet Archive](https://archive.org/) - Massive text archive
+
+## Complete Pre-WWI Corpus Workflow
+
+This section documents the complete workflow for building a pre-WWI (1914) corpus.
+
+### Step 1: Collect from Sources
+
+```bash
+# Create corpus directory structure
+mkdir -p corpus/{gutenberg,perseus,ia}
+
+# Collect from Project Gutenberg (highest quality, ~17k pre-1914 English texts)
+tc-gutenberg --cutoff-year 1914 --language en -o ./corpus/gutenberg
+
+# Collect from Perseus (classical Greek/Latin)
+tc-perseus --languages grc,lat --no-translations -o ./corpus/perseus
+
+# Collect from Internet Archive (newspapers, with Gutenberg dedup)
+tc-ia --year-end 1914 \
+      --gutenberg-metadata ./corpus/gutenberg/metadata.csv \
+      --content-type newspaper \
+      --min-quality 0.7 \
+      -o ./corpus/ia
+```
+
+### Step 2: Validate Temporal Purity
+
+```bash
+# Check all sources for anachronistic content
+tc-validate ./corpus/gutenberg/en --cutoff-year 1914
+tc-validate ./corpus/perseus --cutoff-year 1914
+tc-validate ./corpus/ia --cutoff-year 1914
+```
+
+### Step 3: Clean OCR Errors (for IA texts)
+
+```bash
+# Analyze OCR quality
+tc-ocr-clean analyze ./corpus/ia --report ocr-report.json
+
+# Clean OCR errors
+tc-ocr-clean batch ./corpus/ia -o ./corpus/ia-cleaned --report ocr-fixes.json
+```
+
+Note: Gutenberg texts are human-proofread and typically don't need OCR cleanup.
+Perseus texts are scholarly editions, also high quality.
+
+### Step 4: Deduplicate Across Sources
+
+```bash
+# Analyze duplicates
+tc-dedup analyze ./corpus/gutenberg/en ./corpus/perseus ./corpus/ia-cleaned
+
+# Merge with Gutenberg preferred (highest quality)
+tc-dedup merge ./corpus/gutenberg/en ./corpus/perseus ./corpus/ia-cleaned \
+         -o ./corpus/merged \
+         --prefer gutenberg
+```
+
+### Step 5: Final Validation
+
+```bash
+# Validate merged corpus
+tc-validate ./corpus/merged --cutoff-year 1914
+
+# Check OCR quality of final corpus
+tc-ocr-clean analyze ./corpus/merged
+```
+
+### Estimated Sizes
+
+| Source | Pre-1914 Texts | Est. Size |
+|--------|----------------|-----------|
+| Gutenberg (English) | ~17,000 | ~15 GB |
+| Perseus (Greek/Latin) | ~3,500 | ~1 GB |
+| Internet Archive (newspapers) | ~80,000+ | ~50 GB |
+| **Total (deduped)** | ~90,000 | ~50 GB |
+
+### Validation Test Run
+
+To verify the pipeline works before a full run:
+
+```bash
+# Quick test with limits
+tc-gutenberg --cutoff-year 1914 --language en --limit 100 -o ./test/gutenberg
+tc-perseus --languages grc,lat --limit 50 -o ./test/perseus
+tc-validate ./test/gutenberg/en --cutoff-year 1914
+tc-ocr-clean analyze ./test/gutenberg/en
+tc-dedup analyze ./test/gutenberg/en ./test/perseus
+```

@@ -12,3 +12,6 @@ __all__ = [
     "dedup_corpus", 
     "analyze_catalog",
 ]
+from .ocr_cleanup import main as ocr_cleanup, clean_text, clean_batch
+
+__all__.extend(["ocr_cleanup", "clean_text", "clean_batch"])

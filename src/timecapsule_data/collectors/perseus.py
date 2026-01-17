@@ -34,7 +34,7 @@ except ImportError:
     CorpusMetadataWriter = None
 
 
-CTS_BASE = "https://cts.perseids.org/api/cts"
+CTS_BASE = "https://cts.perseids.org/api/cts/"
 
 # Namespace mapping for XML parsing
 NS = {
@@ -57,12 +57,16 @@ class PerseusText:
 
 def fetch_url(url: str, retries: int = 3, delay: float = 1.0) -> str:
     """Fetch URL with retries and rate limiting."""
+    import requests
     for attempt in range(retries):
         try:
-            req = Request(url, headers={'User-Agent': 'PerseusCollector/1.0 (research)'})
-            with urlopen(req, timeout=30) as response:
-                return response.read().decode('utf-8')
-        except (HTTPError, URLError) as e:
+            response = requests.get(url, 
+                                   headers={'User-Agent': 'PerseusCollector/1.0 (research)'},
+                                   timeout=60,
+                                   allow_redirects=True)
+            response.raise_for_status()
+            return response.text
+        except Exception as e:
             if attempt < retries - 1:
                 print(f"  Retry {attempt + 1}/{retries} after error: {e}")
                 time.sleep(delay * (attempt + 1))

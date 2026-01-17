@@ -41,6 +41,7 @@ tc-perseus = "timecapsule_data.collectors.perseus:main"
 tc-analyze = "timecapsule_data.utils.analyze:main"
 tc-validate = "timecapsule_data.utils.validate:main"
 tc-dedup = "timecapsule_data.utils.dedup:main"
+tc-ocr-clean = "timecapsule_data.utils.ocr_cleanup:main"
 
 [project.urls]
 Homepage = "https://github.com/robotdad/timecapsule-data"
