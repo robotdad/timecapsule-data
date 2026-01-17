@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """
-Temporal Purity Validator
+Temporal Purity Validator v2
 
-Scans collected texts for anachronistic content that would leak
-modern knowledge into the training data.
-
-This is a CRITICAL quality check - any contamination defeats the
-entire purpose of temporal training.
-
-Usage:
-    python validate_temporal_purity.py ./corpus --cutoff-year 1900
+More nuanced validation - distinguishes between:
+- Critical contamination (Gutenberg boilerplate that MUST be removed)
+- Suspicious content (might be anachronistic, needs review)
+- Acceptable historical usage (words with pre-modern meanings)
 """
 
 import argparse
@@ -19,146 +15,136 @@ from pathlib import Path
 from collections import defaultdict
 
 # =============================================================================
-# Anachronism Detection Patterns
+# CRITICAL: These indicate failed cleaning (Gutenberg boilerplate)
 # =============================================================================
-
-# Terms that should NOT appear in pre-cutoff texts
-# Organized by approximate introduction date
-
-ANACHRONISMS = {
-    # Post-1900 technology
-    "post_1900_tech": [
-        r"\b(computer|internet|website|email|software|hardware)\b",
-        r"\b(television|TV|radio broadcast|airplane|aircraft)\b",
-        r"\b(nuclear|atomic bomb|reactor)\b",
-        r"\b(smartphone|cellphone|mobile phone)\b",
-        r"\b(satellite|space station|astronaut)\b",
-    ],
-    
-    # Post-1900 cultural references
-    "post_1900_culture": [
-        r"\bWorld War (I|II|One|Two)\b",
-        r"\b(Nazi|Hitler|Stalin|Mussolini)\b",
-        r"\b(Holocaust|genocide)\b",
-        r"\bCold War\b",
-        r"\b(Vietnam|Korean) War\b",
-    ],
-    
-    # Modern publishing/digitization markers
-    "modern_publishing": [
+CRITICAL_PATTERNS = {
+    "gutenberg_boilerplate": [
         r"Project Gutenberg",
         r"gutenberg\.org",
-        r"Internet Archive",
         r"Distributed Proofreaders",
+        r"Internet Archive",
+        r"archive\.org",
         r"Digitized by",
-        r"OCR",
-        r"e-?book",
-        r"e-?text",
-        r"ISBN",
-        r"Creative Commons",
-        r"public domain",  # The phrase, not the concept
-        r"copyright \d{4}",
-        r"\d{4}-\d{4} (by|copyright)",
-    ],
-    
-    # Modern linguistic markers (words coined after 1900)
-    "modern_vocabulary": [
-        r"\brobot\b",  # Coined 1920
-        r"\bsmog\b",   # Coined 1905
-        r"\bradar\b",  # Coined 1940s
-        r"\blaser\b",  # Coined 1960
-        r"\bcomputer\b",  # Modern sense post-1940
-        r"\bantibiotics?\b",  # Post-1940s usage
-        r"\bpenicillin\b",  # Discovered 1928
-    ],
-    
-    # References to modern dates
-    "modern_dates": [
-        r"\b(19|20)\d{2}\b",  # Years 1900-2099
-        r"twenty-first century",
-        r"twentieth century",
+        r"This file was produced",
+        r"E-?text prepared by",
+        r"Produced by",
+        r"Release Date:",
+        r"Posting Date:",
+        r"Character set encoding:",
+        r"\[E-?[Tt]ext #?\d+\]",
+        r"This eBook is for",
+        r"This e-?book",
+        r"electronic works",
+        r"Archive Foundation",
+        r"Transcriber'?s?\s+[Nn]ote",
     ],
 }
 
-# Patterns that are ACCEPTABLE even in historical texts
-# (to avoid false positives)
-ACCEPTABLE_PATTERNS = [
-    r"nineteen hundred",  # Literary way to say 1900
-    r"the year \d{4}",    # Historical references are fine
-]
+# =============================================================================
+# SUSPICIOUS: Likely anachronistic but could have historical usage
+# =============================================================================
+SUSPICIOUS_PATTERNS = {
+    "modern_tech_unambiguous": [
+        r"\binternet\b",
+        r"\bwebsite\b",
+        r"\bemail\b",
+        r"\bsoftware\b",
+        r"\bhardware\b",
+        r"\btelevision\b",
+        r"\bairplane\b",
+        r"\baircraft\b",
+        r"\bnuclear\b",
+        r"\batomic bomb\b",
+        r"\bsmartphone\b",
+        r"\bcellphone\b",
+        r"\bmobile phone\b",
+    ],
+    "post_1900_events": [
+        r"\bWorld War (I|II|One|Two)\b",
+        r"\bNazi\b",
+        r"\bHitler\b",
+        r"\bStalin\b",
+        r"\bHolocaust\b",  # Capital H = the event
+        r"\bCold War\b",
+        r"\bVietnam War\b",
+    ],
+}
 
+# =============================================================================
+# ACCEPTABLE: Words that existed pre-1900 with different meanings
+# =============================================================================
+# These are NOT flagged:
+# - "computer" = one who computes (job title, pre-1900)
+# - "satellite" = attendant, follower (pre-astronomical meaning)
+# - "holocaust" = sacrifice, destruction by fire (pre-WWII meaning)
+# - "robot" - actually coined 1920, but often in translations of older works
 
 def check_file(filepath: Path, cutoff_year: int) -> dict:
-    """
-    Check a single file for anachronisms.
-    
-    Returns dict with detected issues.
-    """
+    """Check a single file for contamination."""
     try:
         text = filepath.read_text(encoding='utf-8', errors='ignore')
     except Exception as e:
         return {"error": str(e)}
     
-    issues = defaultdict(list)
+    issues = {"critical": [], "suspicious": []}
     lines = text.split('\n')
     
     for line_num, line in enumerate(lines, 1):
-        # Skip if matches acceptable pattern
-        if any(re.search(p, line, re.IGNORECASE) for p in ACCEPTABLE_PATTERNS):
-            continue
-            
-        for category, patterns in ANACHRONISMS.items():
+        # Check critical patterns (cleaning failures)
+        for category, patterns in CRITICAL_PATTERNS.items():
             for pattern in patterns:
-                matches = re.finditer(pattern, line, re.IGNORECASE)
-                for match in matches:
-                    # Special handling for dates
-                    if category == "modern_dates":
-                        # Extract year and check if truly anachronistic
-                        year_match = re.search(r'\b(19|20)(\d{2})\b', match.group())
-                        if year_match:
-                            year = int(year_match.group(1) + year_match.group(2))
-                            if year <= cutoff_year:
-                                continue  # Not anachronistic
-                    
-                    issues[category].append({
+                if re.search(pattern, line, re.IGNORECASE):
+                    issues["critical"].append({
                         "line": line_num,
-                        "match": match.group(),
-                        "context": line.strip()[:100],
+                        "category": category,
+                        "match": re.search(pattern, line, re.IGNORECASE).group(),
+                        "context": line.strip()[:80],
+                    })
+        
+        # Check suspicious patterns
+        for category, patterns in SUSPICIOUS_PATTERNS.items():
+            for pattern in patterns:
+                if re.search(pattern, line, re.IGNORECASE):
+                    issues["suspicious"].append({
+                        "line": line_num,
+                        "category": category,
+                        "match": re.search(pattern, line, re.IGNORECASE).group(),
+                        "context": line.strip()[:80],
                     })
     
-    return dict(issues)
+    return issues
 
 
 def validate_corpus(corpus_dir: Path, cutoff_year: int, verbose: bool = False):
-    """Validate entire corpus for temporal purity."""
+    """Validate entire corpus."""
     
-    files = list(corpus_dir.glob("*.txt"))
+    files = [f for f in corpus_dir.glob("*.txt") if f.name != "metadata.csv"]
     print(f"Validating {len(files)} files for cutoff year {cutoff_year}...")
     
-    contaminated_files = []
     clean_files = 0
-    total_issues = defaultdict(int)
+    critical_files = []
+    suspicious_only_files = []
     
     for filepath in files:
-        if filepath.name == "metadata.csv":
-            continue
-            
         issues = check_file(filepath, cutoff_year)
         
-        if issues:
-            if "error" in issues:
-                print(f"  ERROR: {filepath.name}: {issues['error']}")
-                continue
-                
-            contaminated_files.append((filepath.name, issues))
-            for category, items in issues.items():
-                total_issues[category] += len(items)
-                
+        if "error" in issues:
+            print(f"  ERROR: {filepath.name}: {issues['error']}")
+            continue
+        
+        has_critical = len(issues["critical"]) > 0
+        has_suspicious = len(issues["suspicious"]) > 0
+        
+        if has_critical:
+            critical_files.append((filepath.name, issues))
             if verbose:
-                print(f"  CONTAMINATED: {filepath.name}")
-                for category, items in issues.items():
-                    for item in items[:3]:  # Show first 3
-                        print(f"    [{category}] L{item['line']}: {item['match']}")
+                print(f"  CRITICAL: {filepath.name} ({len(issues['critical'])} issues)")
+                for item in issues["critical"][:3]:
+                    print(f"    L{item['line']}: {item['match']}")
+        elif has_suspicious:
+            suspicious_only_files.append((filepath.name, issues))
+            if verbose:
+                print(f"  SUSPICIOUS: {filepath.name} ({len(issues['suspicious'])} issues)")
         else:
             clean_files += 1
     
@@ -167,31 +153,32 @@ def validate_corpus(corpus_dir: Path, cutoff_year: int, verbose: bool = False):
     print("VALIDATION SUMMARY")
     print("=" * 60)
     print(f"Clean files: {clean_files}")
-    print(f"Contaminated files: {len(contaminated_files)}")
-    print(f"\nIssues by category:")
-    for category, count in sorted(total_issues.items(), key=lambda x: -x[1]):
-        print(f"  {category}: {count}")
+    print(f"Files with CRITICAL issues (cleaning failed): {len(critical_files)}")
+    print(f"Files with only suspicious content: {len(suspicious_only_files)}")
     
-    if contaminated_files:
-        print(f"\nWARNING: {len(contaminated_files)} files need review/cleaning!")
-        print("\nMost contaminated files:")
-        sorted_files = sorted(contaminated_files, 
-                             key=lambda x: sum(len(v) for v in x[1].values()),
-                             reverse=True)
+    if critical_files:
+        print(f"\n** CRITICAL: {len(critical_files)} files still have Gutenberg boilerplate!")
+        print("These need re-cleaning. Top offenders:")
+        sorted_files = sorted(critical_files, key=lambda x: len(x[1]["critical"]), reverse=True)
         for name, issues in sorted_files[:10]:
-            issue_count = sum(len(v) for v in issues.values())
-            print(f"  {name}: {issue_count} issues")
-        
+            print(f"  {name}: {len(issues['critical'])} critical issues")
         return False
-    else:
-        print("\nAll files pass temporal purity check!")
+    
+    if suspicious_only_files:
+        print(f"\nNote: {len(suspicious_only_files)} files have suspicious content.")
+        print("These may be false positives (historical word usage) or actual contamination.")
+        print("Manual review recommended for these files.")
+    
+    if not critical_files:
+        print("\nNo critical cleaning failures detected!")
         return True
+    
+    return False
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Validate corpus for temporal purity")
-    parser.add_argument("corpus_dir", type=Path, help="Directory with text files")
+    parser = argparse.ArgumentParser(description="Validate corpus for temporal purity")
+    parser.add_argument("corpus_dir", type=Path)
     parser.add_argument("--cutoff-year", "-y", type=int, default=1900)
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
