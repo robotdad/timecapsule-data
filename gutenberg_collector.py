@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 """
-Gutenberg Temporal Dataset Collector - v2
+Gutenberg Temporal Dataset Collector - v3
 
 Downloads and cleans Project Gutenberg texts filtered by author death year.
-Improved cleaning to handle various Gutenberg format variations.
+Supports multiple languages for multilingual corpus building.
+
+Usage:
+    # English only (default)
+    python gutenberg_collector.py -y 1900 -o ./corpus_en
+    
+    # Multiple languages
+    python gutenberg_collector.py -y 1900 -l en,fr,de,la,el -o ./corpus_multilingual
+    
+    # All languages
+    python gutenberg_collector.py -y 1900 -l all -o ./corpus_all
 """
 
 import argparse
@@ -104,20 +114,34 @@ def download_catalog(session: requests.Session, logger: logging.Logger) -> str:
     return resp.text
 
 
-def parse_catalog(csv_content: str, cutoff_year: int, language: str, logger: logging.Logger) -> list:
-    logger.info(f"Parsing catalog (cutoff_year={cutoff_year}, language={language})...")
+def parse_catalog(csv_content: str, cutoff_year: int, languages: list, 
+                  logger: logging.Logger) -> list:
+    """
+    Parse catalog CSV and filter by temporal constraints.
+    
+    Args:
+        languages: List of language codes, or ['all'] for all languages
+    """
+    lang_str = "all" if languages == ['all'] else ",".join(languages)
+    logger.info(f"Parsing catalog (cutoff_year={cutoff_year}, languages={lang_str})...")
     
     reader = csv.DictReader(io.StringIO(csv_content))
     books = []
     stats = {"no_year": 0, "after_cutoff": 0, "wrong_lang": 0, "not_text": 0}
+    lang_counts = {}
     
     for row in reader:
         if row.get("Type") != "Text":
             stats["not_text"] += 1
             continue
-        if row.get("Language", "").lower() != language.lower():
-            stats["wrong_lang"] += 1
-            continue
+        
+        row_lang = row.get("Language", "").lower()
+        
+        # Language filtering
+        if languages != ['all']:
+            if row_lang not in [l.lower() for l in languages]:
+                stats["wrong_lang"] += 1
+                continue
         
         authors_str = row.get("Authors", "")
         authors = [a.strip() for a in authors_str.split(";") if a.strip()]
@@ -145,10 +169,13 @@ def parse_catalog(csv_content: str, cutoff_year: int, language: str, logger: log
             book_id = int(row.get("Text#", 0))
         except ValueError:
             continue
+        
+        # Track language distribution
+        lang_counts[row_lang] = lang_counts.get(row_lang, 0) + 1
             
         books.append(BookMetadata(
             id=book_id, title=row.get("Title", "Unknown"), authors=authors,
-            language=row.get("Language", "en"), subjects=subjects,
+            language=row_lang, subjects=subjects,
             author_birth_year=birth_year, author_death_year=death_year,
         ))
     
@@ -159,32 +186,24 @@ def parse_catalog(csv_content: str, cutoff_year: int, language: str, logger: log
     logger.info(f"  - Skipped (wrong language): {stats['wrong_lang']}")
     logger.info(f"  - Skipped (not text): {stats['not_text']}")
     
+    if len(lang_counts) > 1:
+        logger.info(f"  - Language distribution:")
+        for lang, count in sorted(lang_counts.items(), key=lambda x: -x[1])[:10]:
+            logger.info(f"      {lang}: {count:,}")
+    
     return books
 
 
-# =============================================================================
-# IMPROVED TEXT CLEANING - handles various Gutenberg formats
-# =============================================================================
-
 def clean_gutenberg_text(raw_text: str) -> str:
-    """
-    Aggressively remove ALL Gutenberg boilerplate and modern contamination.
-    
-    Strategy:
-    1. Find the actual work content using multiple marker patterns
-    2. Strip line-by-line contamination
-    3. Remove any remaining modern references
-    """
+    """Remove ALL Gutenberg boilerplate and modern contamination."""
     text = raw_text
     
-    # === STEP 1: Find content boundaries ===
-    
-    # START markers - try multiple patterns (order matters - most specific first)
+    # START markers
     start_patterns = [
         r"\*\*\*\s*START OF TH(?:E|IS) PROJECT GUTENBERG EBOOK[^\*]*\*\*\*",
         r"\*\*\*\s*START OF THE PROJECT GUTENBERG[^\*]*\*\*\*",
         r"\*\*\*\s*START OF THIS PROJECT GUTENBERG[^\*]*\*\*\*",
-        r"\*{3,}\s*$",  # Line of just asterisks (often precedes content)
+        r"\*{3,}\s*$",
     ]
     
     for pattern in start_patterns:
@@ -208,63 +227,31 @@ def clean_gutenberg_text(raw_text: str) -> str:
             text = text[:match.start()]
             break
     
-    # === STEP 2: Remove entire sections that are editorial ===
-    
-    # Remove "Transcriber's Notes" sections (often at start or end)
+    # Remove editorial sections
     text = re.sub(
         r"(?:^|\n)Transcriber'?s?\s+Notes?:?.*?(?=\n\n\n|\n[A-Z]{2,}|\Z)",
         "", text, flags=re.IGNORECASE | re.DOTALL
     )
-    
-    # Remove "Editor's Notes" sections
     text = re.sub(
         r"(?:^|\n)Editor'?s?\s+Notes?:?.*?(?=\n\n\n|\n[A-Z]{2,}|\Z)",
         "", text, flags=re.IGNORECASE | re.DOTALL
     )
     
-    # === STEP 3: Line-by-line contamination removal ===
-    
-    # Patterns that indicate a LINE should be removed entirely
+    # Line-by-line contamination removal
     line_kill_patterns = [
-        r"Project Gutenberg",
-        r"Gutenberg Literary Archive",
-        r"gutenberg\.org",
-        r"www\.gutenberg",
-        r"Distributed Proofreaders",
-        r"proofreaders\.net",
-        r"Internet Archive",
-        r"archive\.org",
-        r"Digitized by",
-        r"This file was produced",
-        r"This eBook is for the use of",
-        r"E-?text prepared by",
-        r"Produced by",
-        r"Updated editions will replace",
-        r"electronic works",
-        r"Archive Foundation",
-        r"Release Date:",
-        r"Posting Date:",
-        r"Last [Uu]pdated:",
-        r"Character set encoding:",
-        r"Language:\s*English",
-        r"\[E-?[Tt]ext",
-        r"\[Illustration",  # Image placeholders
-        r"^\s*\*\*\*\s*$",  # Lines of just asterisks
-        r"Transcriber'?s?\s+[Nn]ote",
-        r"Scanner'?s?\s+[Nn]ote",
-        r"Editor'?s?\s+[Nn]ote",
-        r"^\s*NOTE:",
-        r"OCR",
-        r"This text has been",
-        r"public domain",
-        r"PUBLIC DOMAIN",
-        r"This work is in the",
-        r"This ebook",
-        r"This e-book",
-        r"This etext",
-        r"This e-text",
-        r"Etext #",
-        r"EBook #",
+        r"Project Gutenberg", r"Gutenberg Literary Archive", r"gutenberg\.org",
+        r"www\.gutenberg", r"Distributed Proofreaders", r"proofreaders\.net",
+        r"Internet Archive", r"archive\.org", r"Digitized by",
+        r"This file was produced", r"This eBook is for the use of",
+        r"E-?text prepared by", r"Produced by", r"Updated editions will replace",
+        r"electronic works", r"Archive Foundation", r"Release Date:",
+        r"Posting Date:", r"Last [Uu]pdated:", r"Character set encoding:",
+        r"Language:\s*English", r"\[E-?[Tt]ext", r"\[Illustration",
+        r"^\s*\*\*\*\s*$", r"Transcriber'?s?\s+[Nn]ote", r"Scanner'?s?\s+[Nn]ote",
+        r"Editor'?s?\s+[Nn]ote", r"^\s*NOTE:", r"OCR", r"This text has been",
+        r"public domain", r"PUBLIC DOMAIN", r"This work is in the",
+        r"This ebook", r"This e-book", r"This etext", r"This e-text",
+        r"Etext #", r"EBook #",
     ]
     
     lines = text.split('\n')
@@ -281,21 +268,21 @@ def clean_gutenberg_text(raw_text: str) -> str:
     
     text = '\n'.join(clean_lines)
     
-    # === STEP 4: Remove modern date references in brackets ===
-    # [JT, Apr 2005: ...] style editorial notes
+    # Remove editorial date notes
     text = re.sub(r'\[[A-Z]{1,3},\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*\d{4}:[^\]]*\]', '', text)
     
-    # === STEP 5: Clean up whitespace ===
-    text = re.sub(r'\n{4,}', '\n\n\n', text)  # Max 3 newlines
-    text = re.sub(r'^\s+', '', text)  # Leading whitespace
-    text = text.strip()
-    
-    return text
+    # Clean whitespace
+    text = re.sub(r'\n{4,}', '\n\n\n', text)
+    text = re.sub(r'^\s+', '', text)
+    return text.strip()
 
 
 def download_text(book: BookMetadata, session: requests.Session, 
                   output_dir: Path, logger: logging.Logger) -> tuple:
-    output_file = output_dir / f"{book.id}.txt"
+    # Organize by language
+    lang_dir = output_dir / book.language
+    lang_dir.mkdir(parents=True, exist_ok=True)
+    output_file = lang_dir / f"{book.id}.txt"
     
     if output_file.exists() and output_file.stat().st_size > 100:
         return (book.id, True, "skipped (exists)")
@@ -325,13 +312,13 @@ def download_text(book: BookMetadata, session: requests.Session,
     return (book.id, False, "no valid download source")
 
 
-def collect_corpus(cutoff_year: int, language: str, output_dir: Path,
+def collect_corpus(cutoff_year: int, languages: list, output_dir: Path,
                    concurrency: int, limit: Optional[int], logger: logging.Logger):
     output_dir.mkdir(parents=True, exist_ok=True)
     session = create_session()
     
     catalog_csv = download_catalog(session, logger)
-    books = parse_catalog(catalog_csv, cutoff_year, language, logger)
+    books = parse_catalog(catalog_csv, cutoff_year, languages, logger)
     
     if limit:
         books = books[:limit]
@@ -363,41 +350,76 @@ def collect_corpus(cutoff_year: int, language: str, output_dir: Path,
                 logger.error(f"Book {book.id}: {e}")
                 results["failed"] += 1
     
+    # Write metadata (one file per language + combined)
     metadata_file = output_dir / "metadata.csv"
     with open(metadata_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(["id", "title", "authors", "death_year", "birth_year", 
                         "language", "subjects", "downloaded"])
         for book in books:
+            lang_dir = output_dir / book.language
             writer.writerow([
                 book.id, book.title, "; ".join(book.authors),
                 book.author_death_year, book.author_birth_year,
                 book.language, "; ".join(book.subjects),
-                (output_dir / f"{book.id}.txt").exists()
+                (lang_dir / f"{book.id}.txt").exists()
             ])
     
     logger.info(f"\nComplete! Success: {results['success']}, "
                 f"Skipped: {results['skipped']}, Failed: {results['failed']}")
     logger.info(f"Metadata: {metadata_file}")
+    
+    # Report by language
+    if languages == ['all'] or len(languages) > 1:
+        logger.info("Files by language directory:")
+        for lang_dir in sorted(output_dir.iterdir()):
+            if lang_dir.is_dir():
+                count = len(list(lang_dir.glob("*.txt")))
+                if count > 0:
+                    logger.info(f"  {lang_dir.name}/: {count} files")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Collect temporally-filtered Project Gutenberg texts")
-    parser.add_argument("--cutoff-year", "-y", type=int, default=1900)
-    parser.add_argument("--language", "-l", default="en")
+    parser = argparse.ArgumentParser(
+        description="Collect temporally-filtered Project Gutenberg texts",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # English only, pre-1900
+  python gutenberg_collector.py -y 1900 -o ./corpus_en
+  
+  # Multiple languages (scholarly corpus)
+  python gutenberg_collector.py -y 1900 -l en,fr,de,la,el -o ./corpus_scholarly
+  
+  # All languages pre-1900
+  python gutenberg_collector.py -y 1900 -l all -o ./corpus_all
+  
+  # Ancient texts only (pre-500 CE)
+  python gutenberg_collector.py -y 500 -l all -o ./corpus_ancient
+        """)
+    parser.add_argument("--cutoff-year", "-y", type=int, default=1900,
+                       help="Include authors who died on/before this year")
+    parser.add_argument("--language", "-l", default="en",
+                       help="Language(s): 'en', 'en,fr,de', or 'all'")
     parser.add_argument("--output-dir", "-o", type=Path, default=Path("./gutenberg_corpus"))
     parser.add_argument("--concurrency", "-c", type=int, default=4)
-    parser.add_argument("--limit", type=int)
+    parser.add_argument("--limit", type=int, help="Limit books (for testing)")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
     
+    # Parse language argument
+    if args.language.lower() == 'all':
+        languages = ['all']
+    else:
+        languages = [l.strip().lower() for l in args.language.split(',')]
+    
     logger = setup_logger(args.verbose)
     logger.info("=" * 60)
-    logger.info("Gutenberg Temporal Dataset Collector v2")
-    logger.info(f"Cutoff: {args.cutoff_year} | Language: {args.language}")
+    logger.info("Gutenberg Temporal Dataset Collector v3")
+    logger.info(f"Cutoff: {args.cutoff_year} | Languages: {args.language}")
     logger.info("=" * 60)
     
-    collect_corpus(args.cutoff_year, args.language, args.output_dir,
+    collect_corpus(args.cutoff_year, languages, args.output_dir,
                    args.concurrency, args.limit, logger)
 
 
