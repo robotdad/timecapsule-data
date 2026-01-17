@@ -1,167 +1,206 @@
 # TimeCapsule Data Collection Tools
 
-Tools for collecting temporally-filtered text corpora from Project Gutenberg
-for training time-constrained language models.
+Tools for collecting temporally-filtered text corpora for training time-constrained language models.
 
-## The Temporal Purity Problem
+## The Problem
 
-When training a model that should only "know" pre-1900 information, we face
-two contamination risks:
+When training a language model that should only "know" information up to a certain date (e.g., 1914), you need training data that:
 
-1. **Source selection**: Including texts from authors who wrote after 1900
-2. **Modern additions**: Gutenberg adds headers, footers, and editorial notes
+1. **Was written before the cutoff** - No anachronistic knowledge
+2. **Is high quality** - Proofread text, not raw OCR garbage
+3. **Is properly licensed** - Public domain for unrestricted use
+4. **Has verifiable provenance** - Know where each text came from
 
-### Solution: Author Death Year + Text Cleaning
+This toolkit solves these problems by collecting from curated sources with temporal metadata.
 
-**Filtering strategy**: We filter by **author death year**, not publication date.
-- Gutenberg doesn't track original publication dates
-- But the catalog includes author birth/death years
-- If an author died in 1870, ALL their works are pre-1870 knowledge
-- This is conservative but guarantees temporal purity
+## Installation
 
-**Cleaning strategy**: We strip ALL Gutenberg-added content:
-- Headers ("The Project Gutenberg EBook of...")
-- Footers (license text, donation requests)
-- Editorial notes ("Transcriber's note:", "Produced by...")
-- Any line containing modern references
-
-## Available Tools
-
-### 1. `analyze_catalog.py` - Survey What's Available
-
-Before collecting, see what exists by time period:
+Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv).
 
 ```bash
-python analyze_catalog.py
+# Clone the repository
+git clone https://github.com/robotdad/timecapsule-data.git
+cd timecapsule-data
 
-# Output shows:
-# - Texts available by era (Ancient, Medieval, Victorian, etc.)
-# - Cumulative counts for different cutoff years
-# - Sample authors and subjects per era
+# Install with uv
+uv sync
+
+# Or install in development mode
+uv pip install -e .
 ```
 
-### 2. `gutenberg_collector.py` - Download & Clean Texts
+## Quick Start
 
 ```bash
-# Greek classics and ancient texts
-python gutenberg_collector.py --cutoff-year 500 --output-dir ./corpus_ancient
+# Collect pre-1914 English texts from Project Gutenberg
+tc-gutenberg --death-year 1914 --language en -o ./corpus/gutenberg
 
-# Pre-industrial (Enlightenment era)  
-python gutenberg_collector.py --cutoff-year 1800 --output-dir ./corpus_1800
+# Collect classical Greek and Latin from Perseus
+tc-perseus --languages grc,lat --no-translations -o ./corpus/perseus
 
-# Victorian era (like TimeCapsuleLLM)
-python gutenberg_collector.py --cutoff-year 1900 --output-dir ./corpus_1900
+# Collect pre-1914 newspapers from Internet Archive
+tc-ia --year-end 1914 --content-type newspaper -o ./corpus/ia-newspapers
 
-# Test with small sample first
-python gutenberg_collector.py --cutoff-year 1900 --limit 100 --output-dir ./test_corpus
+# Validate temporal purity of your corpus
+tc-validate ./corpus/ --cutoff-year 1914
+
+# Deduplicate across sources
+tc-dedup ./corpus/ -o ./corpus-deduped/
 ```
 
-Options:
-- `--cutoff-year`: Include authors who died on/before this year
-- `--language`: ISO code (default: en)
-- `--concurrency`: Download workers (default: 4)
-- `--limit`: Limit books for testing
+## Sources
 
-### 3. `validate_temporal_purity.py` - Check for Contamination
+### Project Gutenberg (`tc-gutenberg`)
 
-After collection, verify no modern content leaked through:
+**Quality**: ⭐⭐⭐⭐⭐ Excellent - Human proofread
+
+The gold standard for public domain texts. Uses author death year for temporal filtering (most reliable metadata).
 
 ```bash
-python validate_temporal_purity.py ./corpus_1900 --cutoff-year 1900
+# English texts by authors who died before 1900
+tc-gutenberg --death-year 1900 --language en -o ./gutenberg
 
-# Checks for:
-# - Modern technology terms (computer, internet, etc.)
-# - Post-cutoff historical references (World Wars, etc.)
-# - Gutenberg boilerplate that wasn't stripped
-# - Modern vocabulary (robot, radar, etc.)
-# - Date references after cutoff year
+# Multiple languages
+tc-gutenberg --death-year 1914 --language en,fr,de -o ./gutenberg-multi
+
+# Preview without downloading
+tc-gutenberg --death-year 1914 --dry-run
 ```
 
-## Workflow
+### Perseus Digital Library (`tc-perseus`)
+
+**Quality**: ⭐⭐⭐⭐⭐ Excellent - Scholarly editions
+
+Classical Greek and Latin texts in original languages. These are the actual Plato, Aristotle, Homer, Cicero, etc.
 
 ```bash
-# 1. Analyze what's available
-python analyze_catalog.py --language en
+# Greek and Latin originals only
+tc-perseus --languages grc,lat --no-translations -o ./perseus
 
-# 2. Collect corpus (start small)
-python gutenberg_collector.py -y 1900 -o ./corpus_1900 --limit 100
+# Include English translations
+tc-perseus --languages grc,lat,eng -o ./perseus-with-translations
 
-# 3. Validate purity
-python validate_temporal_purity.py ./corpus_1900 -y 1900 --verbose
-
-# 4. If clean, collect full corpus
-python gutenberg_collector.py -y 1900 -o ./corpus_1900
-
-# 5. Final validation
-python validate_temporal_purity.py ./corpus_1900 -y 1900
+# List available texts
+tc-perseus --list-only
 ```
 
-## Expected Corpus Sizes (English)
+### Internet Archive (`tc-ia`)
 
-| Cutoff Year | Era | ~Texts Available |
-|-------------|-----|------------------|
-| 500 | Ancient (Greeks, Romans) | ~200 |
-| 1000 | Classical + Early Medieval | ~300 |
-| 1600 | + Renaissance | ~500 |
-| 1800 | + Enlightenment | ~2,000 |
-| 1875 | + Early Victorian | ~8,000 |
-| 1900 | + Late Victorian | ~15,000 |
-| 1950 | + Early 20th Century | ~40,000 |
+**Quality**: ⭐⭐⭐ Variable - OCR with quality filtering
 
-## Combining with TimeCapsuleLLM Dataset
-
-The original TimeCapsuleLLM uses 90GB of 1800-1875 London texts from
-Internet Archive. You can combine:
-
-```python
-# In your training script, combine datasets
-from datasets import concatenate_datasets, load_from_disk
-
-# TimeCapsuleLLM's London corpus
-london = load_from_disk("./data/london-1800-1875")
-
-# Gutenberg broader corpus
-gutenberg = load_dataset("text", data_dir="./corpus_1875")
-
-# Combine
-combined = concatenate_datasets([london["train"], gutenberg["train"]])
-```
-
-## Technical Notes
-
-### Why Author Death Year?
-
-Consider Shakespeare (1564-1616):
-- Hamlet was written ~1600
-- But Gutenberg doesn't record that
-- We only know Shakespeare died in 1616
-- So with cutoff 1700, we safely include all Shakespeare
-
-This is conservative - we might exclude some 1890s works from authors
-who died in 1910 - but it guarantees no post-cutoff knowledge.
-
-### BCE Handling
-
-Ancient authors are handled correctly:
-- "Sophocles, 496? BCE-407 BCE" → death_year = -407
-- Cutoff 500 CE means any death_year ≤ 500 qualifies
-- So -407 ≤ 500 → Sophocles is included
-
-### Contamination Patterns
-
-The cleaner removes these modern additions:
-- `***START OF THE PROJECT GUTENBERG EBOOK***` markers
-- Any line containing "Project Gutenberg", "gutenberg.org"
-- "Transcriber's note", "Produced by", "E-text prepared by"
-- Release dates, posting dates, encoding notes
-- License and donation text
-
-## Dependencies
+Massive collection with variable quality. The collector includes:
+- Pre-download deduplication against Gutenberg
+- OCR quality estimation and filtering
+- Collection-based quality scoring
+- Content type inference (newspaper, magazine, book, etc.)
 
 ```bash
-pip install requests urllib3
+# Pre-1914 newspapers
+tc-ia --year-end 1914 --content-type newspaper -o ./ia-news
+
+# High-quality books from known-good collections
+tc-ia --year-end 1900 --collection americana --min-quality 0.85 -o ./ia-americana
+
+# Dedupe against existing Gutenberg corpus
+tc-ia --gutenberg-metadata ./gutenberg/metadata.csv --year-end 1914 -o ./ia
+
+# Dry run to see what's available
+tc-ia --year-end 1914 --dry-run --max-items 100
+```
+
+## Utilities
+
+### Validate Temporal Purity (`tc-validate`)
+
+Check your corpus for anachronistic content:
+
+```bash
+tc-validate ./corpus/ --cutoff-year 1914 --report validation-report.json
+```
+
+### Deduplicate (`tc-dedup`)
+
+Remove duplicates across multiple sources:
+
+```bash
+tc-dedup ./corpus/ -o ./corpus-clean/ --prefer gutenberg
+```
+
+### Analyze Catalog (`tc-analyze`)
+
+Analyze Gutenberg catalog for available texts:
+
+```bash
+tc-analyze --death-year 1914 --language en
+```
+
+## Metadata Schema
+
+All collectors output consistent metadata for downstream processing:
+
+```json
+{
+  "source": "gutenberg|perseus|internet_archive",
+  "identifier": "unique-id",
+  "title": "Text Title",
+  "author": "Author Name",
+  "date": "1850",
+  "language": "en",
+  "filepath": "relative/path/to/file.txt",
+  "word_count": 50000,
+  "quality_score": 0.95
+}
+```
+
+Internet Archive includes additional fields for quality analysis:
+- `collections`: Which IA collections the item belongs to
+- `content_type`: Inferred type (newspaper, magazine, book, etc.)
+- `ocr_quality`: Estimated OCR accuracy (0-1)
+- `collection_score`: Quality score based on source collection
+
+## Recommended Corpus Configurations
+
+| Use Case | Cutoff | Sources | Est. Size |
+|----------|--------|---------|-----------|
+| Classical only | Ancient | Perseus | ~1 GB |
+| Pre-modern | 1800 | Gutenberg + Perseus | ~10 GB |
+| Victorian era | 1900 | Gutenberg + IA | ~50 GB |
+| Pre-WWI (maximum) | 1914 | All sources | ~100 GB |
+
+## Rate Limiting
+
+The Internet Archive collector implements adaptive rate limiting:
+- Starts at 2 seconds between requests
+- Backs off exponentially on errors (429, 503)
+- Speeds up gradually after consistent success
+
+For large-scale collection, contact Internet Archive at info@archive.org.
+
+## Project Structure
+
+```
+timecapsule-data/
+├── src/timecapsule_data/
+│   ├── collectors/
+│   │   ├── gutenberg.py      # Project Gutenberg collector
+│   │   ├── internet_archive.py  # Internet Archive collector
+│   │   └── perseus.py        # Perseus Digital Library collector
+│   └── utils/
+│       ├── schema.py         # Unified metadata schema
+│       ├── validate.py       # Temporal purity validation
+│       ├── dedup.py          # Cross-source deduplication
+│       └── analyze.py        # Catalog analysis
+├── pyproject.toml
+└── README.md
 ```
 
 ## License
 
-These tools are for research purposes. Gutenberg texts are public domain.
+MIT License - See LICENSE file.
+
+## Related Projects
+
+- [TimeCapsuleLLM](https://github.com/haykgrigo3/TimeCapsuleLLM) - The model training framework
+- [Project Gutenberg](https://www.gutenberg.org/) - Source for proofread public domain texts
+- [Perseus Digital Library](https://www.perseus.tufts.edu/) - Classical texts
+- [Internet Archive](https://archive.org/) - Massive text archive
