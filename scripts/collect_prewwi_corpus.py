@@ -127,6 +127,8 @@ class Stage(Enum):
     IA_NEWSPAPERS = "ia_newspapers"
     VALIDATE = "validate"
     OCR_CLEAN = "ocr_clean"
+    VOCAB_EXTRACT = "vocab_extract"
+    VOCAB_REVIEW = "vocab_review"  # Human review checkpoint
     DEDUP = "dedup"
     FINALIZE = "finalize"
     COMPLETE = "complete"
@@ -134,7 +136,8 @@ class Stage(Enum):
 
 STAGE_ORDER = [
     Stage.INIT, Stage.GUTENBERG, Stage.IA_BOOKS, Stage.IA_NEWSPAPERS,
-    Stage.VALIDATE, Stage.OCR_CLEAN, Stage.DEDUP, Stage.FINALIZE, Stage.COMPLETE,
+    Stage.VALIDATE, Stage.OCR_CLEAN, Stage.VOCAB_EXTRACT, Stage.VOCAB_REVIEW,
+    Stage.DEDUP, Stage.FINALIZE, Stage.COMPLETE,
 ]
 
 STAGE_DESCRIPTIONS = {
@@ -144,6 +147,8 @@ STAGE_DESCRIPTIONS = {
     Stage.IA_NEWSPAPERS: "Collecting newspapers from Internet Archive",
     Stage.VALIDATE: "Validating temporal purity",
     Stage.OCR_CLEAN: "Cleaning OCR errors",
+    Stage.VOCAB_EXTRACT: "Extracting vocabulary for review",
+    Stage.VOCAB_REVIEW: "STOP - Review vocabulary candidates before continuing",
     Stage.DEDUP: "Deduplicating across sources",
     Stage.FINALIZE: "Generating summary",
     Stage.COMPLETE: "Complete",
@@ -152,12 +157,14 @@ STAGE_DESCRIPTIONS = {
 STAGE_ESTIMATES_FULL = {
     Stage.INIT: 0.01, Stage.GUTENBERG: 2.0, Stage.IA_BOOKS: 24.0,
     Stage.IA_NEWSPAPERS: 48.0, Stage.VALIDATE: 2.0, Stage.OCR_CLEAN: 6.0,
+    Stage.VOCAB_EXTRACT: 1.0, Stage.VOCAB_REVIEW: 0.0,  # Manual step
     Stage.DEDUP: 4.0, Stage.FINALIZE: 0.5,
 }
 
 STAGE_ESTIMATES_MINI = {
     Stage.INIT: 0.002, Stage.GUTENBERG: 0.1, Stage.IA_BOOKS: 0.1,
     Stage.IA_NEWSPAPERS: 0.1, Stage.VALIDATE: 0.02, Stage.OCR_CLEAN: 0.02,
+    Stage.VOCAB_EXTRACT: 0.02, Stage.VOCAB_REVIEW: 0.0,  # Manual step
     Stage.DEDUP: 0.02, Stage.FINALIZE: 0.01,
 }
 
@@ -651,6 +658,116 @@ def stage_ocr_clean(state: CollectionState, logger: logging.Logger) -> StageProg
     return progress
 
 
+
+
+def stage_vocab_extract(state: CollectionState, logger: logging.Logger) -> StageProgress:
+    """Extract vocabulary from cleaned files for review before SymSpell correction."""
+    progress = StageProgress(start_time=datetime.now().isoformat())
+    
+    # Find cleaned directories
+    sources = []
+    cleaned_ia = Config.cleaned_dir() / "ia"
+    gutenberg_dir = Config.raw_dir() / "gutenberg" / "en"
+    
+    for subdir in ["books", "newspapers"]:
+        cleaned = cleaned_ia / subdir
+        if cleaned.exists() and list(cleaned.rglob("*.txt")):
+            sources.append(cleaned)
+    
+    if gutenberg_dir.exists() and list(gutenberg_dir.glob("*.txt")):
+        sources.append(gutenberg_dir)
+    
+    if not sources:
+        logger.warning("No sources found for vocabulary extraction")
+        progress.end_time = datetime.now().isoformat()
+        progress.duration_seconds = 0.1
+        return progress
+    
+    # Count total files
+    total_files = sum(len(list(s.rglob("*.txt"))) for s in sources)
+    progress.items_total = total_files
+    
+    vocab_dir = Config.OUTPUT_BASE / "vocab_review"
+    vocab_dir.mkdir(parents=True, exist_ok=True)
+    vocab_file = vocab_dir / "vocabulary_candidates.json"
+    
+    logger.info(f"Extracting vocabulary from {total_files} files across {len(sources)} sources...")
+    
+    # Run vocab extraction on each source
+    for source in sources:
+        source_name = source.name
+        logger.info(f"  Processing {source_name}...")
+        
+        args = [str(source), "-o", str(vocab_file), "--min-freq", "3"]
+        if vocab_file.exists():
+            args.append("--merge")  # Merge with existing
+        
+        success = run_tc_command("tc-ocr-vocab", args, logger)
+        
+        if not success:
+            progress.errors += 1
+            logger.warning(f"Vocab extraction had issues for {source_name}")
+    
+    # Count results
+    if vocab_file.exists():
+        import json
+        with open(vocab_file) as f:
+            vocab_data = json.load(f)
+        candidate_count = len(vocab_data.get("candidates", []))
+        progress.items_completed = candidate_count
+        logger.info(f"Vocabulary extraction complete: {candidate_count} candidates for review")
+        logger.info(f"Review file: {vocab_file}")
+    
+    progress.end_time = datetime.now().isoformat()
+    progress.duration_seconds = (datetime.fromisoformat(progress.end_time) - 
+                                  datetime.fromisoformat(progress.start_time)).total_seconds()
+    return progress
+
+
+def stage_vocab_review(state: CollectionState, logger: logging.Logger) -> StageProgress:
+    """Human review checkpoint - pipeline stops here until manually resumed."""
+    progress = StageProgress(start_time=datetime.now().isoformat())
+    
+    vocab_dir = Config.OUTPUT_BASE / "vocab_review"
+    vocab_file = vocab_dir / "vocabulary_candidates.json"
+    approved_file = vocab_dir / "approved_vocabulary.json"
+    
+    print()
+    logger.info("=" * 60)
+    logger.info("VOCABULARY REVIEW CHECKPOINT")
+    logger.info("=" * 60)
+    print()
+    print("The pipeline has stopped for human review of vocabulary candidates.")
+    print()
+    print(f"1. Review candidates in: {vocab_file}")
+    print(f"2. Create approved list: {approved_file}")
+    print()
+    print("You can review interactively with:")
+    print(f"  uv run tc-ocr-vocab review {vocab_file} -o {approved_file}")
+    print()
+    print("Or use auto-approval for capitalized words:")
+    print(f"  uv run tc-ocr-vocab review {vocab_file} -o {approved_file} --auto-approve-capitalized")
+    print()
+    print("Once review is complete, resume the pipeline with:")
+    print(f"  uv run python scripts/collect_prewwi_corpus.py --resume")
+    print()
+    logger.info("=" * 60)
+    
+    # Check if approved file exists (allows continuing)
+    if approved_file.exists():
+        logger.info("Approved vocabulary file found - continuing pipeline")
+        progress.items_completed = 1
+    else:
+        logger.info("Waiting for vocabulary review...")
+        # Mark as incomplete so pipeline stops
+        progress.errors = 1  # This will trigger a stop
+    
+    progress.items_total = 1
+    progress.end_time = datetime.now().isoformat()
+    progress.duration_seconds = (datetime.fromisoformat(progress.end_time) - 
+                                  datetime.fromisoformat(progress.start_time)).total_seconds()
+    return progress
+
 def stage_dedup(state: CollectionState, logger: logging.Logger) -> StageProgress:
     progress = StageProgress(start_time=datetime.now().isoformat())
     sources = []
@@ -771,6 +888,8 @@ STAGE_HANDLERS = {
     Stage.IA_NEWSPAPERS: stage_ia_newspapers,
     Stage.VALIDATE: stage_validate,
     Stage.OCR_CLEAN: stage_ocr_clean,
+    Stage.VOCAB_EXTRACT: stage_vocab_extract,
+    Stage.VOCAB_REVIEW: stage_vocab_review,
     Stage.DEDUP: stage_dedup,
     Stage.FINALIZE: stage_finalize,
 }

@@ -3,20 +3,12 @@
 SymSpell-based OCR Cleanup
 
 Uses SymSpell for fast, dictionary-based spell correction of OCR errors.
-Much more comprehensive than the pattern-based tc-ocr-clean.
-
-SymSpell uses symmetric delete algorithm - very fast (1M+ corrections/sec)
-but limited to words within edit distance of dictionary entries.
+Supports custom vocabulary files to protect proper nouns and corpus-specific terms.
 
 Usage:
-    # Clean a single file
     tc-ocr-symspell clean input.txt -o output.txt
-
-    # Clean entire corpus
-    tc-ocr-symspell batch ./corpus_raw -o ./corpus_clean
-
-    # Analyze what would be corrected (dry run)
-    tc-ocr-symspell analyze input.txt
+    tc-ocr-symspell batch ./corpus -o ./cleaned --vocab approved_vocab.txt
+    tc-ocr-symspell analyze input.txt --vocab approved_vocab.txt
 """
 
 import argparse
@@ -31,38 +23,48 @@ from typing import Optional
 
 from symspellpy import SymSpell, Verbosity
 
-# =============================================================================
-# SymSpell Setup
-# =============================================================================
-
 
 def create_symspell(max_edit_distance: int = 2) -> SymSpell:
-    """
-    Create and load SymSpell with frequency dictionary.
-    """
+    """Create and load SymSpell with frequency dictionary."""
     sym_spell = SymSpell(max_dictionary_edit_distance=max_edit_distance)
-
     dictionary_path = str(
         importlib.resources.files("symspellpy").joinpath("frequency_dictionary_en_82_765.txt")
     )
     sym_spell.load_dictionary(dictionary_path, term_index=0, count_index=1)
-
     return sym_spell
 
 
-# =============================================================================
-# Text Processing
-# =============================================================================
+def load_custom_vocab(vocab_path: str) -> set[str]:
+    """Load custom vocabulary (words to skip during correction)."""
+    vocab = set()
+    path = Path(vocab_path)
+    if not path.exists():
+        print(f"Warning: vocab file not found: {vocab_path}", file=sys.stderr)
+        return vocab
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Handle format from tc-ocr-vocab (FREQ | FLAGS | WORD | CONTEXT)
+        if "|" in line:
+            parts = line.split("|")
+            if len(parts) >= 3:
+                word = parts[2].strip().lower()
+                if word:
+                    vocab.add(word)
+        else:
+            vocab.add(line.lower())
+
+    return vocab
+
 
 WORD_PATTERN = re.compile(r"\b([a-zA-Z]+(?:'[a-zA-Z]+)?)\b")
 
-# Words/patterns to never correct
 SKIP_WORDS = {
-    # Single letters
     "i",
     "a",
     "o",
-    # Common abbreviations
     "mr",
     "mrs",
     "ms",
@@ -85,7 +87,6 @@ SKIP_WORDS = {
     "rev",
     "messrs",
     "mesdames",
-    # Roman numerals
     "ii",
     "iii",
     "iv",
@@ -96,7 +97,6 @@ SKIP_WORDS = {
     "xi",
     "xii",
     "xx",
-    # Word fragments (OCR splits) - don't "fix" these to wrong words
     "ing",
     "tion",
     "sion",
@@ -133,7 +133,6 @@ SKIP_WORDS = {
     "al",
     "ic",
     "ical",
-    # American spellings (don't convert to British)
     "labor",
     "color",
     "honor",
@@ -178,7 +177,6 @@ class CorrectionStats:
 def should_skip_word(word: str) -> bool:
     """Check if word should be skipped."""
     word_lower = word.lower()
-
     if word_lower in SKIP_WORDS:
         return True
     if len(word) == 1 and word_lower not in ("a", "i", "o"):
@@ -187,12 +185,8 @@ def should_skip_word(word: str) -> bool:
         return True
     if any(c.isdigit() for c in word):
         return True
-    # Skip short all-caps (acronyms)
     if word.isupper() and len(word) <= 5:
         return True
-    # Skip words that look like proper nouns (capitalized, not start of sentence)
-    # This is imperfect but helps avoid mangling names
-
     return False
 
 
@@ -214,15 +208,19 @@ def correct_word(
     stats: Optional[CorrectionStats] = None,
     max_edit_distance: int = 2,
     min_word_length: int = 4,
+    custom_vocab: Optional[set[str]] = None,
 ) -> str:
-    """
-    Attempt to correct a single word using SymSpell.
-    """
+    """Attempt to correct a single word using SymSpell."""
     if stats:
         stats.total_words += 1
 
-    # More conservative: require min length of 4
     if should_skip_word(word) or len(word) < min_word_length:
+        if stats:
+            stats.skipped_words += 1
+        return word
+
+    # Skip words in custom vocabulary
+    if custom_vocab and word.lower() in custom_vocab:
         if stats:
             stats.skipped_words += 1
         return word
@@ -238,19 +236,16 @@ def correct_word(
 
     best = suggestions[0]
 
-    # No change needed
     if best.term.lower() == word.lower():
         return word
 
-    # Conservative: for words <= 5 chars, only accept distance 1
     if len(word) <= 5 and best.distance > 1:
         return word
 
-    # Require high frequency suggestion
     if best.count < 1000:
         return word
 
-    # Don't correct if it would just change American->British spelling
+    # Don't correct American->British spelling
     if best.term.lower().replace("ou", "o") == word.lower():
         return word
     if best.term.lower().replace("re", "er") == word.lower():
@@ -270,6 +265,7 @@ def correct_text(
     sym_spell: SymSpell,
     stats: Optional[CorrectionStats] = None,
     max_edit_distance: int = 2,
+    custom_vocab: Optional[set[str]] = None,
 ) -> str:
     """Correct all words in text using SymSpell."""
     result = []
@@ -278,7 +274,7 @@ def correct_text(
     for match in WORD_PATTERN.finditer(text):
         result.append(text[last_end : match.start()])
         word = match.group(1)
-        corrected = correct_word(word, sym_spell, stats, max_edit_distance)
+        corrected = correct_word(word, sym_spell, stats, max_edit_distance, 4, custom_vocab)
         result.append(corrected)
         last_end = match.end()
 
@@ -292,6 +288,7 @@ def correct_file(
     sym_spell: SymSpell,
     stats: Optional[CorrectionStats] = None,
     max_edit_distance: int = 2,
+    custom_vocab: Optional[set[str]] = None,
 ) -> bool:
     """Correct a single file. Returns True if modified."""
     try:
@@ -300,7 +297,7 @@ def correct_file(
         print(f"  Error reading {input_path}: {e}", file=sys.stderr)
         return False
 
-    corrected = correct_text(content, sym_spell, stats, max_edit_distance)
+    corrected = correct_text(content, sym_spell, stats, max_edit_distance, custom_vocab)
     was_modified = corrected != content
 
     if output_path:
@@ -310,22 +307,22 @@ def correct_file(
     return was_modified
 
 
-# =============================================================================
-# CLI Commands
-# =============================================================================
-
-
 def cmd_clean(args):
     """Clean a single file."""
     print("Loading SymSpell dictionary...", file=sys.stderr)
     sym_spell = create_symspell(args.max_edit_distance)
     print(f"Dictionary loaded: {len(sym_spell.words):,} words", file=sys.stderr)
 
+    custom_vocab = None
+    if args.vocab:
+        custom_vocab = load_custom_vocab(args.vocab)
+        print(f"Custom vocabulary: {len(custom_vocab):,} words to skip", file=sys.stderr)
+
     input_path = Path(args.input)
     output_path = Path(args.output) if args.output else None
 
     stats = CorrectionStats()
-    correct_file(input_path, output_path, sym_spell, stats, args.max_edit_distance)
+    correct_file(input_path, output_path, sym_spell, stats, args.max_edit_distance, custom_vocab)
 
     print(f"\nFile: {input_path}")
     print(f"Total words: {stats.total_words:,}")
@@ -349,6 +346,11 @@ def cmd_batch(args):
     sym_spell = create_symspell(args.max_edit_distance)
     print(f"Dictionary loaded: {len(sym_spell.words):,} words", file=sys.stderr)
 
+    custom_vocab = None
+    if args.vocab:
+        custom_vocab = load_custom_vocab(args.vocab)
+        print(f"Custom vocabulary: {len(custom_vocab):,} words to skip", file=sys.stderr)
+
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir) if args.output_dir else None
 
@@ -370,7 +372,9 @@ def cmd_batch(args):
         else:
             out_path = None
 
-        if correct_file(file_path, out_path, sym_spell, stats, args.max_edit_distance):
+        if correct_file(
+            file_path, out_path, sym_spell, stats, args.max_edit_distance, custom_vocab
+        ):
             modified_count += 1
 
     print(f"\n{'=' * 60}")
@@ -399,11 +403,16 @@ def cmd_analyze(args):
     print("Loading SymSpell dictionary...", file=sys.stderr)
     sym_spell = create_symspell(args.max_edit_distance)
 
+    custom_vocab = None
+    if args.vocab:
+        custom_vocab = load_custom_vocab(args.vocab)
+        print(f"Custom vocabulary: {len(custom_vocab):,} words to skip", file=sys.stderr)
+
     input_path = Path(args.input)
     content = input_path.read_text(encoding="utf-8", errors="replace")
 
     stats = CorrectionStats()
-    _ = correct_text(content, sym_spell, stats, args.max_edit_distance)
+    _ = correct_text(content, sym_spell, stats, args.max_edit_distance, custom_vocab)
 
     print(f"\nAnalysis of: {input_path}")
     print(f"{'=' * 60}")
@@ -426,19 +435,16 @@ def main():
         epilog="""
 SymSpell uses symmetric delete algorithm for very fast spell correction.
 
-Best for:
-  - Common misspellings and OCR errors within edit distance 2
-  - Words close to correct dictionary spellings
-
-Limitations:
-  - Cannot fix severely corrupted words (edit distance > 2)
-  - May not recognize proper nouns or historical terms
-  - Conservative by default to avoid false positives
+Workflow with custom vocabulary:
+  1. Run tc-ocr-clean first (light cleanup)
+  2. Run tc-ocr-vocab to extract candidates
+  3. Review candidates, save approved words
+  4. Run tc-ocr-symspell --vocab approved_vocab.txt
 
 Examples:
-  tc-ocr-symspell clean document.txt -o cleaned.txt
-  tc-ocr-symspell batch ./corpus_raw -o ./corpus_clean --report stats.json
-  tc-ocr-symspell analyze document.txt
+  tc-ocr-symspell clean doc.txt -o cleaned.txt
+  tc-ocr-symspell batch ./corpus -o ./cleaned --vocab vocab.txt
+  tc-ocr-symspell analyze doc.txt --vocab vocab.txt
         """,
     )
 
@@ -454,15 +460,18 @@ Examples:
     clean_parser = subparsers.add_parser("clean", help="Clean a single file")
     clean_parser.add_argument("input", type=str, help="Input file")
     clean_parser.add_argument("-o", "--output", type=str, help="Output file")
+    clean_parser.add_argument("--vocab", type=str, help="Custom vocabulary file (words to skip)")
 
     batch_parser = subparsers.add_parser("batch", help="Clean all files in directory")
     batch_parser.add_argument("input_dir", type=str, help="Input directory")
     batch_parser.add_argument("-o", "--output-dir", type=str, help="Output directory")
     batch_parser.add_argument("--pattern", default="*.txt", help="File pattern (default: *.txt)")
+    batch_parser.add_argument("--vocab", type=str, help="Custom vocabulary file (words to skip)")
     batch_parser.add_argument("--report", type=str, help="Save stats report to JSON")
 
     analyze_parser = subparsers.add_parser("analyze", help="Analyze without modifying")
     analyze_parser.add_argument("input", type=str, help="Input file")
+    analyze_parser.add_argument("--vocab", type=str, help="Custom vocabulary file (words to skip)")
 
     args = parser.parse_args()
 
