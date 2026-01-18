@@ -50,12 +50,12 @@ from typing import Optional
 class Config:
     OUTPUT_BASE: Path = None
     REPO_DIR: Path = Path(__file__).parent.parent.resolve()
-    CUTOFF_YEAR = 1914
+    YEAR_START = 0  # Start from year 0 (earliest available data)
+    CUTOFF_YEAR = 1914  # Pre-WWI cutoff
     LANGUAGE = "en"
     IA_MIN_QUALITY = 0.65  # Include newspapers and general book collections
     MINI_GUTENBERG_LIMIT = 100
-    MINI_IA_BOOKS_LIMIT = 1000
-    MINI_IA_NEWSPAPERS_LIMIT = 1000
+    MINI_IA_LIMIT = 1000  # Combined limit for mini mode
 
     @classmethod
     def init(cls, output_dir: Optional[str] = None):
@@ -126,8 +126,9 @@ def format_size(bytes_val: int) -> str:
 class Stage(Enum):
     INIT = "init"
     GUTENBERG = "gutenberg"
-    IA_BOOKS = "ia_books"
-    IA_NEWSPAPERS = "ia_newspapers"
+    IA_INDEX = "ia_index"
+    IA_ENRICH = "ia_enrich"
+    IA_DOWNLOAD = "ia_download"
     VALIDATE = "validate"
     OCR_CLEAN = "ocr_clean"
     VOCAB_EXTRACT = "vocab_extract"
@@ -140,8 +141,9 @@ class Stage(Enum):
 STAGE_ORDER = [
     Stage.INIT,
     Stage.GUTENBERG,
-    Stage.IA_BOOKS,
-    Stage.IA_NEWSPAPERS,
+    Stage.IA_INDEX,
+    Stage.IA_ENRICH,
+    Stage.IA_DOWNLOAD,
     Stage.VALIDATE,
     Stage.OCR_CLEAN,
     Stage.VOCAB_EXTRACT,
@@ -154,8 +156,9 @@ STAGE_ORDER = [
 STAGE_DESCRIPTIONS = {
     Stage.INIT: "Initializing directories",
     Stage.GUTENBERG: "Collecting from Project Gutenberg",
-    Stage.IA_BOOKS: "Collecting books from Internet Archive",
-    Stage.IA_NEWSPAPERS: "Collecting newspapers from Internet Archive",
+    Stage.IA_INDEX: "Building Internet Archive catalog index",
+    Stage.IA_ENRICH: "Enriching index with text filenames",
+    Stage.IA_DOWNLOAD: "Downloading texts from Internet Archive",
     Stage.VALIDATE: "Validating temporal purity",
     Stage.OCR_CLEAN: "Cleaning OCR errors",
     Stage.VOCAB_EXTRACT: "Extracting vocabulary for review",
@@ -168,8 +171,9 @@ STAGE_DESCRIPTIONS = {
 STAGE_ESTIMATES_FULL = {
     Stage.INIT: 0.01,
     Stage.GUTENBERG: 2.0,
-    Stage.IA_BOOKS: 24.0,
-    Stage.IA_NEWSPAPERS: 48.0,
+    Stage.IA_INDEX: 0.25,  # ~15 minutes for 2.3M items
+    Stage.IA_ENRICH: 12.0,  # ~12 hours for ~1.5M items @ 0.65 threshold
+    Stage.IA_DOWNLOAD: 48.0,  # ~48 hours for 50-100k items
     Stage.VALIDATE: 2.0,
     Stage.OCR_CLEAN: 6.0,
     Stage.VOCAB_EXTRACT: 1.0,
@@ -181,8 +185,9 @@ STAGE_ESTIMATES_FULL = {
 STAGE_ESTIMATES_MINI = {
     Stage.INIT: 0.002,
     Stage.GUTENBERG: 0.1,
-    Stage.IA_BOOKS: 0.1,
-    Stage.IA_NEWSPAPERS: 0.1,
+    Stage.IA_INDEX: 0.01,  # ~30 seconds for small range
+    Stage.IA_ENRICH: 0.08,  # ~5 minutes for ~1000 items
+    Stage.IA_DOWNLOAD: 0.05,  # ~3 minutes for 100 items
     Stage.VALIDATE: 0.02,
     Stage.OCR_CLEAN: 0.02,
     Stage.VOCAB_EXTRACT: 0.02,
@@ -460,8 +465,7 @@ def stage_init(state: CollectionState, logger: logging.Logger) -> StageProgress:
     progress = StageProgress(start_time=datetime.now().isoformat())
     dirs = [
         Config.raw_dir() / "gutenberg",
-        Config.raw_dir() / "ia" / "books",
-        Config.raw_dir() / "ia" / "newspapers",
+        Config.raw_dir() / "ia",  # Single IA directory (no books/newspapers split)
         Config.cleaned_dir(),
         Config.deduped_dir(),
         Config.metadata_dir(),
@@ -522,10 +526,110 @@ def stage_gutenberg(state: CollectionState, logger: logging.Logger) -> StageProg
     return progress
 
 
-def stage_ia_books(state: CollectionState, logger: logging.Logger) -> StageProgress:
+def stage_ia_index(state: CollectionState, logger: logging.Logger) -> StageProgress:
+    """Build IA catalog index (Phase 1 - fast, Scraping API)."""
     progress = StageProgress(start_time=datetime.now().isoformat())
-    output_dir = Config.raw_dir() / "ia" / "books"
+
+    index_file = Config.metadata_dir() / f"ia_index_{Config.YEAR_START}_{Config.CUTOFF_YEAR}.json"
+
+    # Skip if index already exists
+    if index_file.exists():
+        logger.info(f"IA index already exists: {index_file}")
+        progress.items_completed = 1
+        progress.items_total = 1
+        progress.end_time = datetime.now().isoformat()
+        progress.duration_seconds = 0.1
+        return progress
+
+    logger.info(f"Building IA index for {Config.YEAR_START}-{Config.CUTOFF_YEAR}...")
+
+    args = [
+        "--year-start",
+        str(Config.YEAR_START),
+        "--year-end",
+        str(Config.CUTOFF_YEAR),
+        "-o",
+        str(Config.OUTPUT_BASE),
+    ]
+
+    success = run_tc_command("tc-ia-index", args, logger)
+
+    if success and index_file.exists():
+        progress.items_completed = 1
+        progress.items_total = 1
+        logger.info(f"IA index built: {index_file}")
+    else:
+        progress.errors = 1
+        logger.error("IA index build failed")
+
+    progress.end_time = datetime.now().isoformat()
+    progress.duration_seconds = (
+        datetime.fromisoformat(progress.end_time) - datetime.fromisoformat(progress.start_time)
+    ).total_seconds()
+    return progress
+
+
+def stage_ia_enrich(state: CollectionState, logger: logging.Logger) -> StageProgress:
+    """Enrich IA index with text filenames (Phase 2 - selective, Metadata API)."""
+    progress = StageProgress(start_time=datetime.now().isoformat())
+
+    index_file = Config.metadata_dir() / f"ia_index_{Config.YEAR_START}_{Config.CUTOFF_YEAR}.json"
+
+    if not index_file.exists():
+        logger.error(f"IA index not found: {index_file}")
+        progress.errors = 1
+        progress.end_time = datetime.now().isoformat()
+        progress.duration_seconds = 0.1
+        return progress
+
+    logger.info(f"Enriching IA index with text filenames (quality >= {Config.IA_MIN_QUALITY})...")
+
+    args = [
+        "--index",
+        str(index_file),
+        "--min-quality",
+        str(Config.IA_MIN_QUALITY),
+        "--workers",
+        "4",
+    ]
+
+    success = run_tc_command("tc-ia-enrich", args, logger)
+
+    if success:
+        # Count enriched items
+        with open(index_file) as f:
+            import json
+
+            data = json.load(f)
+        enriched = data.get("enrichment_status", {}).get("total_enriched", 0)
+        progress.items_completed = enriched
+        progress.items_total = enriched
+        logger.info(f"IA enrichment complete: {enriched:,} items with filenames")
+    else:
+        progress.errors = 1
+        logger.error("IA enrichment failed")
+
+    progress.end_time = datetime.now().isoformat()
+    progress.duration_seconds = (
+        datetime.fromisoformat(progress.end_time) - datetime.fromisoformat(progress.start_time)
+    ).total_seconds()
+    return progress
+
+
+def stage_ia_download(state: CollectionState, logger: logging.Logger) -> StageProgress:
+    """Download texts from enriched index (Phase 3 - smart download)."""
+    progress = StageProgress(start_time=datetime.now().isoformat())
+
+    index_file = Config.metadata_dir() / f"ia_index_{Config.YEAR_START}_{Config.CUTOFF_YEAR}.json"
+    output_dir = Config.raw_dir() / "ia"
     gutenberg_meta = Config.raw_dir() / "gutenberg" / "metadata.csv"
+
+    if not index_file.exists():
+        logger.error(f"IA index not found: {index_file}")
+        progress.errors = 1
+        progress.end_time = datetime.now().isoformat()
+        progress.duration_seconds = 0.1
+        return progress
 
     # Count existing files for resume
     existing_files = list(output_dir.rglob("*.txt")) if output_dir.exists() else []
@@ -533,16 +637,16 @@ def stage_ia_books(state: CollectionState, logger: logging.Logger) -> StageProgr
     if existing_count > 0:
         logger.info(f"Found {existing_count} existing files, will skip already downloaded")
 
-    limit = Config.MINI_IA_BOOKS_LIMIT if state.mode == "mini" else 50000
+    limit = Config.MINI_IA_LIMIT if state.mode == "mini" else 100000
     progress.items_total = limit
 
+    logger.info(f"Downloading up to {limit:,} items from IA index...")
+
     args = [
-        "--year-end",
-        str(Config.CUTOFF_YEAR),
-        "--content-type",
-        "book",
-        "--min-quality",
-        str(Config.IA_MIN_QUALITY),
+        "--index",
+        str(index_file),
+        "--max-items",
+        str(limit),
         "--workers",
         "4",
         "-o",
@@ -550,13 +654,9 @@ def stage_ia_books(state: CollectionState, logger: logging.Logger) -> StageProgr
     ]
     if gutenberg_meta.exists():
         args.extend(["--gutenberg-metadata", str(gutenberg_meta)])
-    if state.mode == "mini":
-        args.extend(["--max-items", str(limit)])
 
-    logger.info(f"Downloading up to {limit} books from Internet Archive...")
-
-    monitor = ProgressMonitor(output_dir, limit, "books")
-    success = run_tc_command("tc-ia", args, logger, monitor)
+    monitor = ProgressMonitor(output_dir, limit, "items")
+    success = run_tc_command("tc-ia-download", args, logger, monitor)
 
     # Count final files
     if output_dir.exists():
@@ -566,16 +666,16 @@ def stage_ia_books(state: CollectionState, logger: logging.Logger) -> StageProgr
 
     if success:
         logger.info(
-            f"IA books complete: {progress.items_completed} books, {format_size(progress.bytes_downloaded)}"
+            f"IA download complete: {progress.items_completed:,} items, {format_size(progress.bytes_downloaded)}"
         )
     else:
         progress.errors = 1
         if progress.items_completed > 0:
             logger.warning(
-                f"IA books failed but got {progress.items_completed} files, {format_size(progress.bytes_downloaded)}"
+                f"IA download had errors but got {progress.items_completed:,} files, {format_size(progress.bytes_downloaded)}"
             )
         else:
-            logger.error("IA books collection failed")
+            logger.error("IA download failed")
 
     progress.end_time = datetime.now().isoformat()
     progress.duration_seconds = (
@@ -584,177 +684,10 @@ def stage_ia_books(state: CollectionState, logger: logging.Logger) -> StageProgr
     return progress
 
 
-def stage_ia_newspapers(state: CollectionState, logger: logging.Logger) -> StageProgress:
-    progress = StageProgress(start_time=datetime.now().isoformat())
-    output_dir = Config.raw_dir() / "ia" / "newspapers"
-
-    # Count existing files for resume
-    existing_files = list(output_dir.rglob("*.txt")) if output_dir.exists() else []
-    existing_count = len(existing_files)
-    if existing_count > 0:
-        logger.info(f"Found {existing_count} existing files, will skip already downloaded")
-
-    limit = Config.MINI_IA_NEWSPAPERS_LIMIT if state.mode == "mini" else 80000
-    progress.items_total = limit
-
-    args = [
-        "--year-end",
-        str(Config.CUTOFF_YEAR),
-        "--content-type",
-        "newspaper",
-        "--min-quality",
-        str(Config.IA_MIN_QUALITY),
-        "--workers",
-        "4",
-        "-o",
-        str(output_dir),
-    ]
-    if state.mode == "mini":
-        args.extend(["--max-items", str(limit)])
-
-    logger.info(f"Downloading up to {limit} newspapers from Internet Archive...")
-
-    monitor = ProgressMonitor(output_dir, limit, "newspapers")
-    success = run_tc_command("tc-ia", args, logger, monitor)
-
-    # Count final files
-    if output_dir.exists():
-        files = list(output_dir.rglob("*.txt"))
-        progress.items_completed = len(files)
-        progress.bytes_downloaded = sum(f.stat().st_size for f in files)
-
-    if success:
-        logger.info(
-            f"IA newspapers complete: {progress.items_completed} items, {format_size(progress.bytes_downloaded)}"
-        )
-    else:
-        progress.errors = 1
-        if progress.items_completed > 0:
-            logger.warning(
-                f"IA newspapers failed but got {progress.items_completed} files, {format_size(progress.bytes_downloaded)}"
-            )
-        else:
-            logger.error("IA newspapers collection failed")
-
-    progress.end_time = datetime.now().isoformat()
-    progress.duration_seconds = (
-        datetime.fromisoformat(progress.end_time) - datetime.fromisoformat(progress.start_time)
-    ).total_seconds()
-    return progress
-
-
-def stage_ia_parallel(state: CollectionState, logger: logging.Logger) -> tuple:
-    """Download books and newspapers in parallel. Returns (books_progress, news_progress, success)."""
-    import threading
-
-    books_dir = Config.raw_dir() / "ia" / "books"
-    news_dir = Config.raw_dir() / "ia" / "newspapers"
-
-    # Count BEFORE so we can detect NEW downloads
-    books_before = len(list(books_dir.rglob("*.txt"))) if books_dir.exists() else 0
-    news_before = len(list(news_dir.rglob("*.txt"))) if news_dir.exists() else 0
-
-    logger.info("Starting parallel IA downloads...")
-    logger.info(f"  Books: {books_before} existing files")
-    logger.info(f"  Newspapers: {news_before} existing files")
-
-    # Track new downloads and errors
-    results = {"books_new": 0, "newspapers_new": 0}
-    errors = {"books": None, "newspapers": None}
-    start_time = datetime.now()
-
-    def download_books():
-        try:
-            limit = Config.MINI_IA_BOOKS_LIMIT if state.mode == "mini" else 50000
-            args = [
-                "--year-end",
-                str(Config.CUTOFF_YEAR),
-                "--content-type",
-                "book",
-                "--min-quality",
-                str(Config.IA_MIN_QUALITY),
-                "--workers",
-                "2",
-                "-o",
-                str(books_dir),
-            ]
-            if state.mode == "mini":
-                args.extend(["--max-items", str(limit)])
-            success = run_tc_command("tc-ia", args, logger)
-            if not success:
-                errors["books"] = "tc-ia returned failure"
-            books_after = len(list(books_dir.rglob("*.txt"))) if books_dir.exists() else 0
-            results["books_new"] = books_after - books_before
-        except Exception as e:
-            errors["books"] = str(e)
-
-    def download_newspapers():
-        try:
-            limit = Config.MINI_IA_NEWSPAPERS_LIMIT if state.mode == "mini" else 80000
-            args = [
-                "--year-end",
-                str(Config.CUTOFF_YEAR),
-                "--content-type",
-                "newspaper",
-                "--min-quality",
-                str(Config.IA_MIN_QUALITY),
-                "--workers",
-                "2",
-                "-o",
-                str(news_dir),
-            ]
-            if state.mode == "mini":
-                args.extend(["--max-items", str(limit)])
-            success = run_tc_command("tc-ia", args, logger)
-            if not success:
-                errors["newspapers"] = "tc-ia returned failure"
-            news_after = len(list(news_dir.rglob("*.txt"))) if news_dir.exists() else 0
-            results["newspapers_new"] = news_after - news_before
-        except Exception as e:
-            errors["newspapers"] = str(e)
-
-    books_thread = threading.Thread(target=download_books, name="ia-books")
-    news_thread = threading.Thread(target=download_newspapers, name="ia-newspapers")
-
-    books_thread.start()
-    news_thread.start()
-
-    books_thread.join()
-    news_thread.join()
-
-    end_time = datetime.now()
-    duration = (end_time - start_time).total_seconds()
-
-    # Progress tracks NEW files only
-    books_progress = StageProgress(start_time=start_time.isoformat())
-    books_progress.items_completed = results["books_new"]
-    books_progress.items_total = results["books_new"]
-    books_progress.errors = 1 if errors["books"] else 0
-    books_progress.end_time = end_time.isoformat()
-    books_progress.duration_seconds = duration
-
-    news_progress = StageProgress(start_time=start_time.isoformat())
-    news_progress.items_completed = results["newspapers_new"]
-    news_progress.items_total = results["newspapers_new"]
-    news_progress.errors = 1 if errors["newspapers"] else 0
-    news_progress.end_time = end_time.isoformat()
-    news_progress.duration_seconds = duration
-
-    books_total = books_before + results["books_new"]
-    news_total = news_before + results["newspapers_new"]
-
-    logger.info("Parallel download results:")
-    logger.info(
-        f"  Books: {results['books_new']} new ({books_total} total)"
-        + (f" ERROR: {errors['books']}" if errors["books"] else "")
-    )
-    logger.info(
-        f"  Newspapers: {results['newspapers_new']} new ({news_total} total)"
-        + (f" ERROR: {errors['newspapers']}" if errors["newspapers"] else "")
-    )
-
-    success = not errors["books"] and not errors["newspapers"]
-    return books_progress, news_progress, success
+# Old IA stage functions removed - replaced by three-phase pipeline:
+# - stage_ia_index: Build catalog index
+# - stage_ia_enrich: Add text filenames
+# - stage_ia_download: Download from enriched index
 
 
 def stage_validate(state: CollectionState, logger: logging.Logger) -> StageProgress:
@@ -786,54 +719,57 @@ def stage_ocr_clean(state: CollectionState, logger: logging.Logger) -> StageProg
     progress = StageProgress(start_time=datetime.now().isoformat())
     ia_dir = Config.raw_dir() / "ia"
     cleaned_dir = Config.cleaned_dir() / "ia"
+
+    if not ia_dir.exists():
+        logger.info("No IA files to clean")
+        progress.end_time = datetime.now().isoformat()
+        progress.duration_seconds = 0.1
+        return progress
+
+    source_files = list(ia_dir.rglob("*.txt"))
+    if not source_files:
+        logger.info("No IA text files found, skipping")
+        progress.end_time = datetime.now().isoformat()
+        progress.duration_seconds = 0.1
+        return progress
+
+    # Check for already-cleaned files (incremental mode)
     cleaned_dir.mkdir(parents=True, exist_ok=True)
+    already_cleaned = set()
+    if cleaned_dir.exists():
+        already_cleaned = {f.name for f in cleaned_dir.rglob("*.txt")}
 
-    for subdir in ["books", "newspapers"]:
-        source = ia_dir / subdir
-        target = cleaned_dir / subdir
+    to_clean = [f for f in source_files if f.name not in already_cleaned]
 
-        if not source.exists():
-            continue
+    if not to_clean:
+        logger.info(f"All {len(source_files)} IA files already cleaned, skipping")
+        progress.items_completed = len(source_files)
+        progress.items_total = len(source_files)
+        progress.end_time = datetime.now().isoformat()
+        progress.duration_seconds = 0.1
+        return progress
 
-        source_files = list(source.rglob("*.txt"))
-        if not source_files:
-            logger.info(f"No files in {subdir}, skipping")
-            continue
+    if already_cleaned:
+        logger.info(
+            f"Cleaning {len(to_clean)} new IA files ({len(already_cleaned)} already done)..."
+        )
+    else:
+        logger.info(f"Cleaning OCR in {len(source_files)} IA files...")
 
-        # Check for already-cleaned files (incremental mode)
-        target.mkdir(parents=True, exist_ok=True)
-        already_cleaned = set()
-        if target.exists():
-            already_cleaned = {f.name for f in target.rglob("*.txt")}
+    args = ["batch", str(ia_dir), "-o", str(cleaned_dir)]
+    monitor = ProgressMonitor(cleaned_dir, len(source_files), "files")
+    success = run_tc_command("tc-ocr-clean", args, logger, monitor)
 
-        to_clean = [f for f in source_files if f.name not in already_cleaned]
-
-        if not to_clean:
-            logger.info(f"All {len(source_files)} {subdir} already cleaned, skipping")
-            progress.items_completed += len(source_files)
-            continue
-
-        if already_cleaned:
-            logger.info(
-                f"Cleaning {len(to_clean)} new {subdir} ({len(already_cleaned)} already done)..."
-            )
-        else:
-            logger.info(f"Cleaning OCR in {len(source_files)} {subdir}...")
-
-        args = ["batch", str(source), "-o", str(target)]
-        monitor = ProgressMonitor(target, len(source_files), "files")
-        success = run_tc_command("tc-ocr-clean", args, logger, monitor)
-
-        if success:
-            cleaned_files = list(target.rglob("*.txt"))
-            progress.items_completed += len(cleaned_files)
-            logger.info(f"Cleaned {len(cleaned_files)} {subdir}")
-        else:
-            progress.errors += 1
-            # Still count what we got
-            cleaned_files = list(target.rglob("*.txt"))
-            progress.items_completed += len(cleaned_files)
-            logger.warning(f"OCR cleanup had issues for {subdir}, got {len(cleaned_files)} files")
+    if success:
+        cleaned_files = list(cleaned_dir.rglob("*.txt"))
+        progress.items_completed = len(cleaned_files)
+        logger.info(f"Cleaned {len(cleaned_files)} IA files")
+    else:
+        progress.errors = 1
+        # Still count what we got
+        cleaned_files = list(cleaned_dir.rglob("*.txt"))
+        progress.items_completed = len(cleaned_files)
+        logger.warning(f"OCR cleanup had issues, got {len(cleaned_files)} files")
 
     progress.items_total = progress.items_completed
     progress.end_time = datetime.now().isoformat()
@@ -969,16 +905,16 @@ def stage_dedup(state: CollectionState, logger: logging.Logger) -> StageProgress
             sources.append(str(gutenberg_dir))
             source_counts.append(("Gutenberg", len(files)))
 
-    for subdir in ["books", "newspapers"]:
-        cleaned = Config.cleaned_dir() / "ia" / subdir
-        raw = Config.raw_dir() / "ia" / subdir
+    # Check IA directory (single directory, no books/newspapers split)
+    ia_cleaned = Config.cleaned_dir() / "ia"
+    ia_raw = Config.raw_dir() / "ia"
 
-        use_dir = cleaned if cleaned.exists() and list(cleaned.rglob("*.txt")) else raw
-        if use_dir.exists():
-            files = list(use_dir.rglob("*.txt"))
-            if files:
-                sources.append(str(use_dir))
-                source_counts.append((f"IA {subdir}", len(files)))
+    use_dir = ia_cleaned if ia_cleaned.exists() and list(ia_cleaned.rglob("*.txt")) else ia_raw
+    if use_dir.exists():
+        files = list(use_dir.rglob("*.txt"))
+        if files:
+            sources.append(str(use_dir))
+            source_counts.append(("IA", len(files)))
 
     if not sources:
         logger.warning("No sources found for deduplication")
@@ -1081,8 +1017,9 @@ def stage_finalize(state: CollectionState, logger: logging.Logger) -> StageProgr
 STAGE_HANDLERS = {
     Stage.INIT: stage_init,
     Stage.GUTENBERG: stage_gutenberg,
-    Stage.IA_BOOKS: stage_ia_books,
-    Stage.IA_NEWSPAPERS: stage_ia_newspapers,
+    Stage.IA_INDEX: stage_ia_index,
+    Stage.IA_ENRICH: stage_ia_enrich,
+    Stage.IA_DOWNLOAD: stage_ia_download,
     Stage.VALIDATE: stage_validate,
     Stage.OCR_CLEAN: stage_ocr_clean,
     Stage.VOCAB_EXTRACT: stage_vocab_extract,
@@ -1168,7 +1105,6 @@ def run_single_stage(state: CollectionState, stage: Stage, logger: logging.Logge
 def run_pipeline(
     state: CollectionState,
     logger: logging.Logger,
-    parallel_ia: bool = False,
     retry_failed: bool = False,
     stages_to_run: Optional[list] = None,
 ):
@@ -1205,49 +1141,6 @@ def run_pipeline(
         if stage == Stage.COMPLETE:
             logger.info("Pipeline complete!")
             break
-        # Handle parallel IA download mode
-        if parallel_ia and stage == Stage.IA_BOOKS:
-            if not (
-                state.is_stage_completed(Stage.IA_BOOKS)
-                and state.is_stage_completed(Stage.IA_NEWSPAPERS)
-            ):
-                logger.info(
-                    "Running IA downloads in PARALLEL mode (books + newspapers together)..."
-                )
-                books_progress, news_progress, success = stage_ia_parallel(state, logger)
-
-                # Only mark complete if we actually got files
-                if books_progress.items_completed > 0 and books_progress.errors == 0:
-                    state.mark_stage_completed(Stage.IA_BOOKS, books_progress)
-                    logger.info(f"Books stage completed: {books_progress.items_completed} files")
-                else:
-                    logger.warning(
-                        f"Books stage NOT complete: {books_progress.items_completed} files, {books_progress.errors} errors"
-                    )
-
-                if news_progress.items_completed > 0 and news_progress.errors == 0:
-                    state.mark_stage_completed(Stage.IA_NEWSPAPERS, news_progress)
-                    logger.info(
-                        f"Newspapers stage completed: {news_progress.items_completed} files"
-                    )
-                else:
-                    logger.warning(
-                        f"Newspapers stage NOT complete: {news_progress.items_completed} files, {news_progress.errors} errors"
-                    )
-
-                state.save(Config.state_file())
-
-                if not success:
-                    logger.error(
-                        "Parallel download had errors - stages NOT marked complete. Fix issues and re-run."
-                    )
-                    state.save(Config.state_file())
-                    return  # STOP - don't continue to later stages
-            continue
-
-        if parallel_ia and stage == Stage.IA_NEWSPAPERS:
-            # Already handled in IA_BOOKS parallel mode
-            continue
 
         if state.is_stage_completed(stage):
             logger.info(f"Skipping completed stage: {stage.value}")
@@ -1335,11 +1228,7 @@ Stages: init, gutenberg, ia_books, ia_newspapers, validate, ocr_clean, dedup, fi
     parser.add_argument(
         "--retry-failed", action="store_true", help="Re-run stages that previously failed"
     )
-    parser.add_argument(
-        "--parallel-ia",
-        action="store_true",
-        help="Download IA books and newspapers in parallel (faster)",
-    )
+
     parser.add_argument(
         "--stage", type=str, default=None, help="Run a specific stage only (e.g., ia_books)"
     )
@@ -1407,7 +1296,6 @@ Stages: init, gutenberg, ia_books, ia_newspapers, validate, ocr_clean, dedup, fi
             state,
             logger,
             retry_failed=args.retry_failed,
-            parallel_ia=getattr(args, "parallel_ia", False),
         )
     except KeyboardInterrupt:
         print()
