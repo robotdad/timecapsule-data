@@ -404,16 +404,27 @@ def main():
     # Search
     content_type = args.content_type if args.content_type != 'all' else None
     label = (args.content_type or "all").upper()
-    items = search_items(
-        year_start=args.year_start,
-        year_end=args.year_end,
-        language=args.language,
-        content_type=content_type,
-        min_quality=args.min_quality,
-        max_items=args.max_items,
-        exclude_ids=exclude_ids,
-        label=label,
-    )
+    
+    # Check cache first
+    cache_path = get_cache_path(output_dir, args.content_type or "all", args.year_end)
+    items = None
+    
+    if not args.refresh:
+        items = load_cached_search(cache_path)
+    
+    if items is None:
+        items = search_items(
+            year_start=args.year_start,
+            year_end=args.year_end,
+            language=args.language,
+            content_type=content_type,
+            min_quality=args.min_quality,
+            max_items=args.max_items,
+            exclude_ids=exclude_ids,
+            label=label,
+        )
+        # Cache the results
+        save_search_cache(cache_path, items, f"{args.content_type or 'all'} {args.year_start}-{args.year_end}")
     
     if not items:
         print("No items found matching criteria")
