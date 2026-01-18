@@ -7,17 +7,20 @@ Automated end-to-end pipeline for collecting a temporally-filtered text corpus
 estimation.
 
 Usage:
-    # Mini validation run (recommended first)
+    # Mini validation run (~5-10 minutes)
     uv run python scripts/collect_prewwi_corpus.py --mode mini
     
-    # Full collection
+    # Full collection (~3-5 days)
     uv run python scripts/collect_prewwi_corpus.py --mode full
-    
-    # Custom output directory
-    uv run python scripts/collect_prewwi_corpus.py --mode full --output /path/to/output
     
     # Resume interrupted run
     uv run python scripts/collect_prewwi_corpus.py --resume
+    
+    # Retry failed stages
+    uv run python scripts/collect_prewwi_corpus.py --resume --retry-failed
+    
+    # Run specific stage only
+    uv run python scripts/collect_prewwi_corpus.py --stage ia_books
     
     # Check status
     uv run python scripts/collect_prewwi_corpus.py --status
@@ -45,12 +48,8 @@ from typing import Optional
 # =============================================================================
 
 class Config:
-    # Set by command line, defaults to ./corpus-prewwi
     OUTPUT_BASE: Path = None
-    
-    # Auto-detected: directory containing this script's repo
     REPO_DIR: Path = Path(__file__).parent.parent.resolve()
-    
     CUTOFF_YEAR = 1914
     LANGUAGE = "en"
     IA_MIN_QUALITY = 0.75
@@ -59,7 +58,6 @@ class Config:
     
     @classmethod
     def init(cls, output_dir: Optional[str] = None):
-        """Initialize paths. Must be called before using other methods."""
         if output_dir:
             cls.OUTPUT_BASE = Path(output_dir).resolve()
         else:
@@ -95,7 +93,6 @@ class Config:
 # =============================================================================
 
 def format_duration(seconds: float) -> str:
-    """Format seconds as human-readable duration."""
     if seconds < 60:
         return f"{int(seconds)}s"
     elif seconds < 3600:
@@ -109,7 +106,6 @@ def format_duration(seconds: float) -> str:
 
 
 def format_size(bytes_val: int) -> str:
-    """Format bytes as human-readable size."""
     if bytes_val < 1024:
         return f"{bytes_val} B"
     elif bytes_val < 1024 * 1024:
@@ -154,7 +150,7 @@ STAGE_DESCRIPTIONS = {
 }
 
 STAGE_ESTIMATES_FULL = {
-    Stage.INIT: 0.01, Stage.GUTENBERG: 8.0, Stage.IA_BOOKS: 24.0,
+    Stage.INIT: 0.01, Stage.GUTENBERG: 2.0, Stage.IA_BOOKS: 24.0,
     Stage.IA_NEWSPAPERS: 48.0, Stage.VALIDATE: 2.0, Stage.OCR_CLEAN: 6.0,
     Stage.DEDUP: 4.0, Stage.FINALIZE: 0.5,
 }
@@ -227,6 +223,19 @@ class CollectionState:
         if idx + 1 < len(STAGE_ORDER):
             self.current_stage = STAGE_ORDER[idx + 1].value
     
+    def clear_stage(self, stage: Stage):
+        """Remove a stage from completed so it can be re-run."""
+        if stage.value in self.stages_completed:
+            del self.stages_completed[stage.value]
+    
+    def get_failed_stages(self) -> list:
+        """Return list of stages that completed with errors."""
+        failed = []
+        for stage_name, info in self.stages_completed.items():
+            if info.get('errors', 0) > 0:
+                failed.append(Stage(stage_name))
+        return failed
+    
     def get_current_stage(self) -> Stage:
         return Stage(self.current_stage)
     
@@ -288,12 +297,10 @@ def setup_logging(log_file: Path) -> logging.Logger:
 
 
 # =============================================================================
-# Progress Monitor - watches output directory
+# Progress Monitor
 # =============================================================================
 
 class ProgressMonitor:
-    """Monitor a directory for new files and report progress."""
-    
     def __init__(self, watch_dir: Path, expected_total: int = 0, label: str = "files"):
         self.watch_dir = watch_dir
         self.expected_total = expected_total
@@ -305,7 +312,6 @@ class ProgressMonitor:
         self.start_time = time.time()
     
     def _count_files(self) -> tuple:
-        """Count files and total size."""
         count = 0
         size = 0
         try:
@@ -320,7 +326,6 @@ class ProgressMonitor:
         return count, size
     
     def _monitor_loop(self):
-        """Background monitoring loop."""
         while not self.stop_event.is_set():
             count, size = self._count_files()
             
@@ -344,16 +349,14 @@ class ProgressMonitor:
                 self.last_count = count
                 self.last_size = size
             
-            self.stop_event.wait(3)  # Check every 3 seconds
+            self.stop_event.wait(3)
     
     def start(self):
-        """Start monitoring in background."""
         self.start_time = time.time()
         self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.thread.start()
     
     def stop(self) -> tuple:
-        """Stop monitoring and return final count."""
         self.stop_event.set()
         if self.thread:
             self.thread.join(timeout=1)
@@ -366,16 +369,13 @@ class ProgressMonitor:
 
 def run_tc_command(tool: str, args: list, logger: logging.Logger, 
                    monitor: Optional[ProgressMonitor] = None) -> bool:
-    """Run a timecapsule-data tool with live output."""
     cmd = ["uv", "run", tool] + args
     logger.debug(f"Running: {' '.join(cmd)}")
     
-    # Start progress monitor if provided
     if monitor:
         monitor.start()
     
     try:
-        # Use Popen with unbuffered output
         process = subprocess.Popen(
             cmd,
             cwd=Config.REPO_DIR,
@@ -386,11 +386,9 @@ def run_tc_command(tool: str, args: list, logger: logging.Logger,
             env={**os.environ, 'PYTHONUNBUFFERED': '1'},
         )
         
-        # Stream output
         for line in iter(process.stdout.readline, ''):
             line = line.rstrip()
             if line:
-                # Show on console AND log
                 print(f"    {line}")
                 sys.stdout.flush()
                 logger.debug(f"[{tool}] {line}")
@@ -452,7 +450,6 @@ def stage_gutenberg(state: CollectionState, logger: logging.Logger) -> StageProg
     
     logger.info(f"Downloading up to {limit} texts from Gutenberg...")
     
-    # Monitor the output directory
     monitor = ProgressMonitor(output_dir / "en", limit, "texts")
     success = run_tc_command("tc-gutenberg", args, logger, monitor)
     
@@ -478,6 +475,12 @@ def stage_ia_books(state: CollectionState, logger: logging.Logger) -> StageProgr
     output_dir = Config.raw_dir() / "ia" / "books"
     gutenberg_meta = Config.raw_dir() / "gutenberg" / "metadata.csv"
     
+    # Count existing files for resume
+    existing_files = list(output_dir.rglob("*.txt")) if output_dir.exists() else []
+    existing_count = len(existing_files)
+    if existing_count > 0:
+        logger.info(f"Found {existing_count} existing files, will skip already downloaded")
+    
     limit = Config.MINI_IA_LIMIT if state.mode == "mini" else 50000
     progress.items_total = limit
     
@@ -497,15 +500,20 @@ def stage_ia_books(state: CollectionState, logger: logging.Logger) -> StageProgr
     monitor = ProgressMonitor(output_dir, limit, "books")
     success = run_tc_command("tc-ia", args, logger, monitor)
     
+    # Count final files
+    if output_dir.exists():
+        files = list(output_dir.rglob("*.txt"))
+        progress.items_completed = len(files)
+        progress.bytes_downloaded = sum(f.stat().st_size for f in files)
+    
     if success:
-        if output_dir.exists():
-            files = list(output_dir.rglob("*.txt"))
-            progress.items_completed = len(files)
-            progress.bytes_downloaded = sum(f.stat().st_size for f in files)
         logger.info(f"IA books complete: {progress.items_completed} books, {format_size(progress.bytes_downloaded)}")
     else:
         progress.errors = 1
-        logger.error("IA books collection failed")
+        if progress.items_completed > 0:
+            logger.warning(f"IA books failed but got {progress.items_completed} files, {format_size(progress.bytes_downloaded)}")
+        else:
+            logger.error("IA books collection failed")
     
     progress.end_time = datetime.now().isoformat()
     progress.duration_seconds = (datetime.fromisoformat(progress.end_time) - 
@@ -516,6 +524,12 @@ def stage_ia_books(state: CollectionState, logger: logging.Logger) -> StageProgr
 def stage_ia_newspapers(state: CollectionState, logger: logging.Logger) -> StageProgress:
     progress = StageProgress(start_time=datetime.now().isoformat())
     output_dir = Config.raw_dir() / "ia" / "newspapers"
+    
+    # Count existing files for resume
+    existing_files = list(output_dir.rglob("*.txt")) if output_dir.exists() else []
+    existing_count = len(existing_files)
+    if existing_count > 0:
+        logger.info(f"Found {existing_count} existing files, will skip already downloaded")
     
     limit = Config.MINI_IA_LIMIT if state.mode == "mini" else 80000
     progress.items_total = limit
@@ -534,15 +548,20 @@ def stage_ia_newspapers(state: CollectionState, logger: logging.Logger) -> Stage
     monitor = ProgressMonitor(output_dir, limit, "newspapers")
     success = run_tc_command("tc-ia", args, logger, monitor)
     
+    # Count final files
+    if output_dir.exists():
+        files = list(output_dir.rglob("*.txt"))
+        progress.items_completed = len(files)
+        progress.bytes_downloaded = sum(f.stat().st_size for f in files)
+    
     if success:
-        if output_dir.exists():
-            files = list(output_dir.rglob("*.txt"))
-            progress.items_completed = len(files)
-            progress.bytes_downloaded = sum(f.stat().st_size for f in files)
         logger.info(f"IA newspapers complete: {progress.items_completed} items, {format_size(progress.bytes_downloaded)}")
     else:
         progress.errors = 1
-        logger.error("IA newspapers collection failed")
+        if progress.items_completed > 0:
+            logger.warning(f"IA newspapers failed but got {progress.items_completed} files, {format_size(progress.bytes_downloaded)}")
+        else:
+            logger.error("IA newspapers collection failed")
     
     progress.end_time = datetime.now().isoformat()
     progress.duration_seconds = (datetime.fromisoformat(progress.end_time) - 
@@ -553,7 +572,6 @@ def stage_ia_newspapers(state: CollectionState, logger: logging.Logger) -> Stage
 def stage_validate(state: CollectionState, logger: logging.Logger) -> StageProgress:
     progress = StageProgress(start_time=datetime.now().isoformat())
     
-    # Count files first
     all_files = list(Config.raw_dir().rglob("*.txt"))
     progress.items_total = len(all_files)
     
@@ -593,7 +611,23 @@ def stage_ocr_clean(state: CollectionState, logger: logging.Logger) -> StageProg
             logger.info(f"No files in {subdir}, skipping")
             continue
         
-        logger.info(f"Cleaning OCR in {len(source_files)} {subdir}...")
+        # Check for already-cleaned files (incremental mode)
+        target.mkdir(parents=True, exist_ok=True)
+        already_cleaned = set()
+        if target.exists():
+            already_cleaned = {f.name for f in target.rglob("*.txt")}
+        
+        to_clean = [f for f in source_files if f.name not in already_cleaned]
+        
+        if not to_clean:
+            logger.info(f"All {len(source_files)} {subdir} already cleaned, skipping")
+            progress.items_completed += len(source_files)
+            continue
+        
+        if already_cleaned:
+            logger.info(f"Cleaning {len(to_clean)} new {subdir} ({len(already_cleaned)} already done)...")
+        else:
+            logger.info(f"Cleaning OCR in {len(source_files)} {subdir}...")
         
         args = ["batch", str(source), "-o", str(target)]
         monitor = ProgressMonitor(target, len(source_files), "files")
@@ -605,7 +639,10 @@ def stage_ocr_clean(state: CollectionState, logger: logging.Logger) -> StageProg
             logger.info(f"Cleaned {len(cleaned_files)} {subdir}")
         else:
             progress.errors += 1
-            logger.warning(f"OCR cleanup had issues for {subdir}")
+            # Still count what we got
+            cleaned_files = list(target.rglob("*.txt"))
+            progress.items_completed += len(cleaned_files)
+            logger.warning(f"OCR cleanup had issues for {subdir}, got {len(cleaned_files)} files")
     
     progress.items_total = progress.items_completed
     progress.end_time = datetime.now().isoformat()
@@ -676,7 +713,6 @@ def stage_finalize(state: CollectionState, logger: logging.Logger) -> StageProgr
     total_files = 0
     total_bytes = 0
     
-    # Prefer deduped, fall back to raw
     search_dir = Config.deduped_dir() if list(Config.deduped_dir().rglob("*.txt")) else Config.raw_dir()
     
     for txt_file in search_dir.rglob("*.txt"):
@@ -754,6 +790,12 @@ def print_status(state: CollectionState):
     print(f"Est. remaining: {format_duration(remaining.total_seconds())}")
     print()
     
+    failed = state.get_failed_stages()
+    if failed:
+        print(f"Failed stages: {', '.join(s.value for s in failed)}")
+        print("  (use --retry-failed to re-run these)")
+        print()
+    
     print("Stage Progress:")
     for stage in STAGE_ORDER:
         if stage == Stage.COMPLETE:
@@ -766,7 +808,7 @@ def print_status(state: CollectionState):
             bytes_dl = info.get('bytes_downloaded', 0)
             size_str = f", {format_size(bytes_dl)}" if bytes_dl > 0 else ""
             errors = info.get('errors', 0)
-            err_str = " [ERRORS]" if errors > 0 else ""
+            err_str = " [FAILED]" if errors > 0 else ""
             print(f"  [x] {stage.value}: {items} items in {duration}{size_str}{err_str}")
         elif stage.value == state.current_stage:
             print(f"  [>] {stage.value}: IN PROGRESS")
@@ -778,14 +820,57 @@ def print_status(state: CollectionState):
     print("=" * 60 + "\n")
 
 
-def run_pipeline(state: CollectionState, logger: logging.Logger):
+def run_single_stage(state: CollectionState, stage: Stage, logger: logging.Logger):
+    """Run a single stage (for --stage mode)."""
+    logger.info("=" * 60)
+    logger.info(f"RUNNING STAGE: {stage.value.upper()}")
+    logger.info("=" * 60)
+    
+    # Clear previous completion status so it runs fresh
+    state.clear_stage(stage)
+    state.mark_stage_started(stage)
+    state.save(Config.state_file())
+    
+    handler = STAGE_HANDLERS.get(stage)
+    if handler:
+        try:
+            progress = handler(state, logger)
+            state.mark_stage_completed(stage, progress)
+            state.save(Config.state_file())
+            
+            duration = format_duration(progress.duration_seconds)
+            if progress.errors > 0:
+                logger.warning(f"Stage {stage.value} completed with errors in {duration}")
+            else:
+                logger.info(f"Stage {stage.value} completed in {duration}")
+        except Exception as e:
+            logger.error(f"Stage {stage.value} failed: {e}")
+            state.save(Config.state_file())
+            raise
+
+
+def run_pipeline(state: CollectionState, logger: logging.Logger, 
+                 retry_failed: bool = False, stages_to_run: Optional[list] = None):
     if state.started_at is None:
         state.started_at = datetime.now().isoformat()
     
-    current_stage = state.get_current_stage()
-    start_idx = STAGE_ORDER.index(current_stage)
+    # If retry_failed, clear failed stages
+    if retry_failed:
+        failed = state.get_failed_stages()
+        if failed:
+            logger.info(f"Retrying {len(failed)} failed stages: {', '.join(s.value for s in failed)}")
+            for stage in failed:
+                state.clear_stage(stage)
     
-    for stage in STAGE_ORDER[start_idx:]:
+    # Determine which stages to run
+    if stages_to_run:
+        stages = stages_to_run
+    else:
+        current_stage = state.get_current_stage()
+        start_idx = STAGE_ORDER.index(current_stage)
+        stages = STAGE_ORDER[start_idx:]
+    
+    for stage in stages:
         if stage == Stage.COMPLETE:
             logger.info("Pipeline complete!")
             break
@@ -842,16 +927,22 @@ Examples:
   # Full collection (~3-5 days)
   uv run python scripts/collect_prewwi_corpus.py --mode full
   
-  # Custom output directory
-  uv run python scripts/collect_prewwi_corpus.py --mode full --output /data/corpus
-  
   # Resume interrupted run
   uv run python scripts/collect_prewwi_corpus.py --resume
+  
+  # Retry stages that failed
+  uv run python scripts/collect_prewwi_corpus.py --resume --retry-failed
+  
+  # Run/retry a specific stage
+  uv run python scripts/collect_prewwi_corpus.py --stage ia_books
+  
+  # Custom output directory
+  uv run python scripts/collect_prewwi_corpus.py --mode full --output /data/corpus
   
   # Check status
   uv run python scripts/collect_prewwi_corpus.py --status
 
-Output is written to ./corpus-prewwi/ by default.
+Stages: init, gutenberg, ia_books, ia_newspapers, validate, ocr_clean, dedup, finalize
         """)
     
     parser.add_argument("--mode", choices=["mini", "full"], default="mini",
@@ -860,6 +951,10 @@ Output is written to ./corpus-prewwi/ by default.
                        help="Output directory (default: ./corpus-prewwi)")
     parser.add_argument("--resume", action="store_true",
                        help="Resume from last saved state")
+    parser.add_argument("--retry-failed", action="store_true",
+                       help="Re-run stages that previously failed")
+    parser.add_argument("--stage", type=str, default=None,
+                       help="Run a specific stage only (e.g., ia_books)")
     parser.add_argument("--status", action="store_true",
                        help="Show current status and exit")
     parser.add_argument("--reset", action="store_true",
@@ -867,7 +962,6 @@ Output is written to ./corpus-prewwi/ by default.
     
     args = parser.parse_args()
     
-    # Initialize config with output directory
     Config.init(args.output)
     Config.OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
     
@@ -883,15 +977,35 @@ Output is written to ./corpus-prewwi/ by default.
         print("State reset.")
         return
     
-    if args.resume:
+    logger = setup_logging(Config.log_file())
+    
+    # Handle --stage flag for single stage execution
+    if args.stage:
+        try:
+            stage = Stage(args.stage)
+        except ValueError:
+            print(f"Unknown stage: {args.stage}")
+            print(f"Valid stages: {', '.join(s.value for s in STAGE_ORDER if s != Stage.COMPLETE)}")
+            return
+        
+        logger.info(f"Running single stage: {stage.value}")
+        run_single_stage(state, stage, logger)
+        return
+    
+    if args.resume or args.retry_failed:
         if not Config.state_file().exists():
             print("No saved state. Use --mode to start new collection.")
             return
-        print(f"Resuming from: {state.current_stage}")
+        if args.retry_failed:
+            failed = state.get_failed_stages()
+            if failed:
+                print(f"Will retry failed stages: {', '.join(s.value for s in failed)}")
+            else:
+                print("No failed stages to retry.")
+        else:
+            print(f"Resuming from: {state.current_stage}")
     else:
         state = CollectionState(mode=args.mode)
-    
-    logger = setup_logging(Config.log_file())
     
     print()
     logger.info("=" * 60)
@@ -901,7 +1015,7 @@ Output is written to ./corpus-prewwi/ by default.
     logger.info("=" * 60)
     
     try:
-        run_pipeline(state, logger)
+        run_pipeline(state, logger, retry_failed=args.retry_failed)
     except KeyboardInterrupt:
         print()
         logger.info("Interrupted. State saved. Use --resume to continue.")
