@@ -609,7 +609,7 @@ def stage_ia_parallel(state: CollectionState, logger: logging.Logger) -> tuple:
                 "--year-end", str(Config.CUTOFF_YEAR),
                 "--content-type", "book",
                 "--min-quality", str(Config.IA_MIN_QUALITY),
-                "--workers", "4",
+                "--workers", "2",
                 "-o", str(books_dir),
             ]
             if state.mode == "mini":
@@ -629,7 +629,7 @@ def stage_ia_parallel(state: CollectionState, logger: logging.Logger) -> tuple:
                 "--year-end", str(Config.CUTOFF_YEAR),
                 "--content-type", "newspaper",
                 "--min-quality", str(Config.IA_MIN_QUALITY),
-                "--workers", "8",
+                "--workers", "2",
                 "-o", str(news_dir),
             ]
             if state.mode == "mini":

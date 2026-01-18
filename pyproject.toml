@@ -37,7 +37,7 @@ dev = [
 [project.scripts]
 # Main collectors
 tc-gutenberg = "timecapsule_data.collectors.gutenberg:main"
-tc-ia = "timecapsule_data.collectors.internet_archive_v2:main"
+tc-ia = "timecapsule_data.collectors.internet_archive:main"
 tc-perseus = "timecapsule_data.collectors.perseus:main"
 
 # Utilities
