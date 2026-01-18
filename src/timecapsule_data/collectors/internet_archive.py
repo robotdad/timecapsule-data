@@ -384,6 +384,8 @@ Examples:
         f"date:[{args.year_start} TO {args.year_end}]",
         "mediatype:texts",
         f"language:{args.language}",
+        # Filter to items that have extractable text (DjVu, plain text, or OCR output)
+        '(format:DjVu OR format:Text OR format:"Abbyy GZ")',
     ]
 
     if args.collection:
