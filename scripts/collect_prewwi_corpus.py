@@ -582,11 +582,9 @@ def stage_ia_newspapers(state: CollectionState, logger: logging.Logger) -> Stage
 
 
 
-def stage_ia_parallel(state: CollectionState, logger: logging.Logger) -> StageProgress:
-    """Download books and newspapers in parallel for faster collection."""
+def stage_ia_parallel(state: CollectionState, logger: logging.Logger) -> tuple:
+    """Download books and newspapers in parallel. Returns (books_progress, news_progress, success)."""
     import threading
-    
-    progress = StageProgress(start_time=datetime.now().isoformat())
     
     books_dir = Config.raw_dir() / "ia" / "books"
     news_dir = Config.raw_dir() / "ia" / "newspapers"
@@ -598,8 +596,9 @@ def stage_ia_parallel(state: CollectionState, logger: logging.Logger) -> StagePr
     logger.info(f"  Books: {books_existing} existing files (will skip)")
     logger.info(f"  Newspapers: {news_existing} existing files (will skip)")
     
-    results = {"books": None, "newspapers": None}
+    results = {"books": 0, "newspapers": 0}
     errors = {"books": None, "newspapers": None}
+    start_time = datetime.now()
     
     def download_books():
         try:
@@ -617,6 +616,7 @@ def stage_ia_parallel(state: CollectionState, logger: logging.Logger) -> StagePr
             results["books"] = len(list(books_dir.rglob("*.txt"))) if books_dir.exists() else 0
         except Exception as e:
             errors["books"] = str(e)
+            results["books"] = len(list(books_dir.rglob("*.txt"))) if books_dir.exists() else 0
     
     def download_newspapers():
         try:
@@ -634,6 +634,7 @@ def stage_ia_parallel(state: CollectionState, logger: logging.Logger) -> StagePr
             results["newspapers"] = len(list(news_dir.rglob("*.txt"))) if news_dir.exists() else 0
         except Exception as e:
             errors["newspapers"] = str(e)
+            results["newspapers"] = len(list(news_dir.rglob("*.txt"))) if news_dir.exists() else 0
     
     books_thread = threading.Thread(target=download_books, name="ia-books")
     news_thread = threading.Thread(target=download_newspapers, name="ia-newspapers")
@@ -644,27 +645,30 @@ def stage_ia_parallel(state: CollectionState, logger: logging.Logger) -> StagePr
     books_thread.join()
     news_thread.join()
     
-    total_books = results["books"] or 0
-    total_news = results["newspapers"] or 0
+    end_time = datetime.now()
+    duration = (end_time - start_time).total_seconds()
+    
+    # Create separate progress for each
+    books_progress = StageProgress(start_time=start_time.isoformat())
+    books_progress.items_completed = results["books"]
+    books_progress.items_total = results["books"]
+    books_progress.errors = 1 if errors["books"] else 0
+    books_progress.end_time = end_time.isoformat()
+    books_progress.duration_seconds = duration
+    
+    news_progress = StageProgress(start_time=start_time.isoformat())
+    news_progress.items_completed = results["newspapers"]
+    news_progress.items_total = results["newspapers"]
+    news_progress.errors = 1 if errors["newspapers"] else 0
+    news_progress.end_time = end_time.isoformat()
+    news_progress.duration_seconds = duration
     
     logger.info(f"Parallel download complete:")
-    logger.info(f"  Books: {total_books} files")
-    logger.info(f"  Newspapers: {total_news} files")
+    logger.info(f"  Books: {results['books']} files" + (f" (ERROR: {errors['books']})" if errors["books"] else ""))
+    logger.info(f"  Newspapers: {results['newspapers']} files" + (f" (ERROR: {errors['newspapers']})" if errors["newspapers"] else ""))
     
-    progress.items_total = total_books + total_news
-    progress.items_completed = total_books + total_news
-    
-    if errors["books"]:
-        logger.error(f"Books error: {errors['books']}")
-        progress.errors += 1
-    if errors["newspapers"]:
-        logger.error(f"Newspapers error: {errors['newspapers']}")
-        progress.errors += 1
-    
-    progress.end_time = datetime.now().isoformat()
-    progress.duration_seconds = (datetime.fromisoformat(progress.end_time) - 
-                                  datetime.fromisoformat(progress.start_time)).total_seconds()
-    return progress
+    success = not errors["books"] and not errors["newspapers"]
+    return books_progress, news_progress, success
 
 
 def stage_validate(state: CollectionState, logger: logging.Logger) -> StageProgress:
@@ -1097,10 +1101,25 @@ def run_pipeline(state: CollectionState, logger: logging.Logger,
         if parallel_ia and stage == Stage.IA_BOOKS:
             if not (state.is_stage_completed(Stage.IA_BOOKS) and state.is_stage_completed(Stage.IA_NEWSPAPERS)):
                 logger.info("Running IA downloads in PARALLEL mode (books + newspapers together)...")
-                progress = stage_ia_parallel(state, logger)
-                state.mark_stage_completed(Stage.IA_BOOKS, progress)
-                state.mark_stage_completed(Stage.IA_NEWSPAPERS, progress)
+                books_progress, news_progress, success = stage_ia_parallel(state, logger)
+                
+                # Only mark complete if we actually got files
+                if books_progress.items_completed > 0 and books_progress.errors == 0:
+                    state.mark_stage_completed(Stage.IA_BOOKS, books_progress)
+                    logger.info(f"Books stage completed: {books_progress.items_completed} files")
+                else:
+                    logger.warning(f"Books stage NOT complete: {books_progress.items_completed} files, {books_progress.errors} errors")
+                
+                if news_progress.items_completed > 0 and news_progress.errors == 0:
+                    state.mark_stage_completed(Stage.IA_NEWSPAPERS, news_progress)
+                    logger.info(f"Newspapers stage completed: {news_progress.items_completed} files")
+                else:
+                    logger.warning(f"Newspapers stage NOT complete: {news_progress.items_completed} files, {news_progress.errors} errors")
+                
                 state.save(Config.state_file())
+                
+                if not success:
+                    logger.error("Parallel download had errors - stages NOT marked complete. Fix issues and re-run.")
             continue
         
         if parallel_ia and stage == Stage.IA_NEWSPAPERS:
