@@ -418,7 +418,9 @@ def main():
     parser.add_argument('--max-items', type=int, default=0,
                         help='Maximum items to download (0=unlimited)')
     parser.add_argument('--workers', type=int, default=8,
-                        help='Parallel download workers (default: 12)')
+                        help='Parallel download workers (default: 8)')
+    parser.add_argument('--refresh', action='store_true',
+                        help='Refresh search cache (ignore cached results)')
     parser.add_argument('--delay', type=float, default=0.5,
                         help='Delay between downloads in seconds (default: 0.3)')
     parser.add_argument('--gutenberg-metadata', type=Path,

@@ -1129,6 +1129,8 @@ def run_pipeline(state: CollectionState, logger: logging.Logger,
                 
                 if not success:
                     logger.error("Parallel download had errors - stages NOT marked complete. Fix issues and re-run.")
+                    state.save(Config.state_file())
+                    return  # STOP - don't continue to later stages
             continue
         
         if parallel_ia and stage == Stage.IA_NEWSPAPERS:
