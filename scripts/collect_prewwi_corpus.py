@@ -317,6 +317,7 @@ class ProgressMonitor:
         self.last_count = 0
         self.last_size = 0
         self.start_time = time.time()
+        self.initial_count = 0  # Track starting count for accurate rate calc
     
     def _count_files(self) -> tuple:
         count = 0
@@ -338,15 +339,18 @@ class ProgressMonitor:
             
             if count != self.last_count:
                 elapsed = time.time() - self.start_time
-                rate = count / elapsed if elapsed > 0 else 0
+                # Calculate rate based on NEW files only, not pre-existing
+                new_files = count - self.initial_count
+                rate = new_files / elapsed if elapsed > 0 else 0
                 
                 if self.expected_total > 0:
                     progress = f"{count}/{self.expected_total} {self.label}"
                     pct = count / self.expected_total * 100
-                    if rate > 0:
-                        remaining = (self.expected_total - count) / rate
+                    remaining_files = self.expected_total - count
+                    if rate > 0 and remaining_files > 0:
+                        remaining = remaining_files / rate
                         eta = format_duration(remaining)
-                        print(f"    Progress: {progress} ({pct:.0f}%) - {format_size(size)} - ETA: {eta}")
+                        print(f"    Progress: {progress} ({pct:.0f}%) - {format_size(size)} - ETA: {eta} ({rate:.1f}/s)")
                     else:
                         print(f"    Progress: {progress} ({pct:.0f}%) - {format_size(size)}")
                 else:
@@ -359,6 +363,7 @@ class ProgressMonitor:
             self.stop_event.wait(3)
     
     def start(self):
+        self.initial_count, _ = self._count_files()  # Snapshot existing files
         self.start_time = time.time()
         self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.thread.start()
@@ -569,6 +574,90 @@ def stage_ia_newspapers(state: CollectionState, logger: logging.Logger) -> Stage
             logger.warning(f"IA newspapers failed but got {progress.items_completed} files, {format_size(progress.bytes_downloaded)}")
         else:
             logger.error("IA newspapers collection failed")
+    
+    progress.end_time = datetime.now().isoformat()
+    progress.duration_seconds = (datetime.fromisoformat(progress.end_time) - 
+                                  datetime.fromisoformat(progress.start_time)).total_seconds()
+    return progress
+
+
+
+def stage_ia_parallel(state: CollectionState, logger: logging.Logger) -> StageProgress:
+    """Download books and newspapers in parallel for faster collection."""
+    import threading
+    
+    progress = StageProgress(start_time=datetime.now().isoformat())
+    
+    books_dir = Config.raw_dir() / "ia" / "books"
+    news_dir = Config.raw_dir() / "ia" / "newspapers"
+    
+    books_existing = len(list(books_dir.rglob("*.txt"))) if books_dir.exists() else 0
+    news_existing = len(list(news_dir.rglob("*.txt"))) if news_dir.exists() else 0
+    
+    logger.info(f"Starting parallel IA downloads...")
+    logger.info(f"  Books: {books_existing} existing files (will skip)")
+    logger.info(f"  Newspapers: {news_existing} existing files (will skip)")
+    
+    results = {"books": None, "newspapers": None}
+    errors = {"books": None, "newspapers": None}
+    
+    def download_books():
+        try:
+            limit = Config.MINI_IA_LIMIT if state.mode == "mini" else 50000
+            args = [
+                "--year-end", str(Config.CUTOFF_YEAR),
+                "--content-type", "book",
+                "--min-quality", str(Config.IA_MIN_QUALITY),
+                "-o", str(books_dir),
+            ]
+            if state.mode == "mini":
+                args.extend(["--max-items", str(limit)])
+            run_tc_command("tc-ia", args, logger)
+            results["books"] = len(list(books_dir.rglob("*.txt"))) if books_dir.exists() else 0
+        except Exception as e:
+            errors["books"] = str(e)
+    
+    def download_newspapers():
+        try:
+            limit = Config.MINI_IA_LIMIT if state.mode == "mini" else 80000
+            args = [
+                "--year-end", str(Config.CUTOFF_YEAR),
+                "--content-type", "newspaper",
+                "--min-quality", str(Config.IA_MIN_QUALITY),
+                "-o", str(news_dir),
+            ]
+            if state.mode == "mini":
+                args.extend(["--max-items", str(limit)])
+            run_tc_command("tc-ia", args, logger)
+            results["newspapers"] = len(list(news_dir.rglob("*.txt"))) if news_dir.exists() else 0
+        except Exception as e:
+            errors["newspapers"] = str(e)
+    
+    books_thread = threading.Thread(target=download_books, name="ia-books")
+    news_thread = threading.Thread(target=download_newspapers, name="ia-newspapers")
+    
+    books_thread.start()
+    news_thread.start()
+    
+    books_thread.join()
+    news_thread.join()
+    
+    total_books = results["books"] or 0
+    total_news = results["newspapers"] or 0
+    
+    logger.info(f"Parallel download complete:")
+    logger.info(f"  Books: {total_books} files")
+    logger.info(f"  Newspapers: {total_news} files")
+    
+    progress.items_total = total_books + total_news
+    progress.items_completed = total_books + total_news
+    
+    if errors["books"]:
+        logger.error(f"Books error: {errors['books']}")
+        progress.errors += 1
+    if errors["newspapers"]:
+        logger.error(f"Newspapers error: {errors['newspapers']}")
+        progress.errors += 1
     
     progress.end_time = datetime.now().isoformat()
     progress.duration_seconds = (datetime.fromisoformat(progress.end_time) - 
@@ -988,11 +1077,33 @@ def run_pipeline(state: CollectionState, logger: logging.Logger,
         current_stage = state.get_current_stage()
         start_idx = STAGE_ORDER.index(current_stage)
         stages = STAGE_ORDER[start_idx:]
+        
+        # If retrying failed stages, include them even if before current stage
+        if retry_failed:
+            failed = state.get_failed_stages()
+            for failed_stage in failed:
+                failed_idx = STAGE_ORDER.index(failed_stage)
+                if failed_idx < start_idx:
+                    stages = [failed_stage] + stages
     
     for stage in stages:
         if stage == Stage.COMPLETE:
             logger.info("Pipeline complete!")
             break
+        # Handle parallel IA download mode
+        if parallel_ia and stage == Stage.IA_BOOKS:
+            if not (state.is_stage_completed(Stage.IA_BOOKS) and state.is_stage_completed(Stage.IA_NEWSPAPERS)):
+                logger.info("Running IA downloads in PARALLEL mode (books + newspapers together)...")
+                progress = stage_ia_parallel(state, logger)
+                state.mark_stage_completed(Stage.IA_BOOKS, progress)
+                state.mark_stage_completed(Stage.IA_NEWSPAPERS, progress)
+                state.save(Config.state_file())
+            continue
+        
+        if parallel_ia and stage == Stage.IA_NEWSPAPERS:
+            # Already handled in IA_BOOKS parallel mode
+            continue
+        
         if state.is_stage_completed(stage):
             logger.info(f"Skipping completed stage: {stage.value}")
             continue
@@ -1072,6 +1183,8 @@ Stages: init, gutenberg, ia_books, ia_newspapers, validate, ocr_clean, dedup, fi
                        help="Resume from last saved state")
     parser.add_argument("--retry-failed", action="store_true",
                        help="Re-run stages that previously failed")
+    parser.add_argument("--parallel-ia", action="store_true",
+                       help="Download IA books and newspapers in parallel (faster)")
     parser.add_argument("--stage", type=str, default=None,
                        help="Run a specific stage only (e.g., ia_books)")
     parser.add_argument("--status", action="store_true",
@@ -1134,7 +1247,8 @@ Stages: init, gutenberg, ia_books, ia_newspapers, validate, ocr_clean, dedup, fi
     logger.info("=" * 60)
     
     try:
-        run_pipeline(state, logger, retry_failed=args.retry_failed)
+        run_pipeline(state, logger, retry_failed=args.retry_failed,
+                     parallel_ia=getattr(args, 'parallel_ia', False))
     except KeyboardInterrupt:
         print()
         logger.info("Interrupted. State saved. Use --resume to continue.")
