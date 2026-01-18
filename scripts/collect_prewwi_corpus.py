@@ -1057,7 +1057,8 @@ def run_single_stage(state: CollectionState, stage: Stage, logger: logging.Logge
             raise
 
 
-def run_pipeline(state: CollectionState, logger: logging.Logger, 
+def run_pipeline(state: CollectionState, logger: logging.Logger,
+                 parallel_ia: bool = False, 
                  retry_failed: bool = False, stages_to_run: Optional[list] = None):
     if state.started_at is None:
         state.started_at = datetime.now().isoformat()
