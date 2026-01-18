@@ -719,6 +719,8 @@ Examples:
         query_parts.append("(subject:periodical OR subject:magazine OR title:magazine)")
     elif args.content_type == "government":
         query_parts.append("(subject:government OR collection:us_government)")
+    elif args.content_type == "book":
+        query_parts.append("NOT (subject:newspaper OR subject:magazine OR subject:periodical)")
 
     query = " AND ".join(query_parts)
     print(f"Search query: {query}")
