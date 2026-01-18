@@ -785,14 +785,14 @@ def stage_vocab_extract(state: CollectionState, logger: logging.Logger) -> Stage
 
     # Find cleaned directories
     sources = []
-    cleaned_ia = Config.cleaned_dir() / "ia"
     gutenberg_dir = Config.raw_dir() / "gutenberg" / "en"
 
-    for subdir in ["books", "newspapers"]:
-        cleaned = cleaned_ia / subdir
-        if cleaned.exists() and list(cleaned.rglob("*.txt")):
-            sources.append(cleaned)
+    # Check for cleaned IA files (single directory)
+    cleaned_ia = Config.cleaned_dir() / "ia"
+    if cleaned_ia.exists() and list(cleaned_ia.rglob("*.txt")):
+        sources.append(cleaned_ia)
 
+    # Include Gutenberg
     if gutenberg_dir.exists() and list(gutenberg_dir.glob("*.txt")):
         sources.append(gutenberg_dir)
 

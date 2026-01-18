@@ -34,7 +34,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-
 # Common OCR substitution errors
 # Format: (error_pattern, correction, context_required)
 # context_required: None = always apply, or regex that must match around the word
@@ -43,224 +42,209 @@ OCR_SUBSTITUTIONS = [
     # 'li' -> 'h' confusion (VERY COMMON in newspaper OCR)
     # This is one of the most frequent OCR errors - 'h' gets misread as 'li'
     # ==========================================================================
-
     # 'the' variants (most common English word, most common OCR errors)
-    (r'\btbe\b', 'the', None),
-    (r'\btlie\b', 'the', None),
-    (r'\btiie\b', 'the', None),
-    (r'\btbc\b', 'the', None),
-    (r'\bihe\b', 'the', None),
-    (r'\btne\b', 'the', None),
-    (r'\bthc\b', 'the', None),
+    (r"\btbe\b", "the", None),
+    (r"\btlie\b", "the", None),
+    (r"\btiie\b", "the", None),
+    (r"\btbc\b", "the", None),
+    (r"\bihe\b", "the", None),
+    (r"\btne\b", "the", None),
+    (r"\bthc\b", "the", None),
     # Additional 'the' variants from vocab analysis (13k+ occurrences each)
-    (r'\bllie\b', 'the', None),
-    (r'\bllic\b', 'the', None),
-    (r'\bllio\b', 'the', None),
-
+    (r"\bllie\b", "the", None),
+    (r"\bllic\b", "the", None),
+    (r"\bllio\b", "the", None),
     # 'this' variants (5850+ occurrences of tliis)
-    (r'\btbis\b', 'this', None),
-    (r'\bthia\b', 'this', None),
-    (r'\btliis\b', 'this', None),
-
+    (r"\btbis\b", "this", None),
+    (r"\bthia\b", "this", None),
+    (r"\btliis\b", "this", None),
     # 'that' variants
-    (r'\btbat\b', 'that', None),
-    (r'\btliat\b', 'that', None),
-    (r'\btlmt\b', 'that', None),
-    (r'\bthnt\b', 'that', None),
-
+    (r"\btbat\b", "that", None),
+    (r"\btliat\b", "that", None),
+    (r"\btlmt\b", "that", None),
+    (r"\bthnt\b", "that", None),
     # 'which' variants (4497+ occurrences of wliich)
-    (r'\bwbich\b', 'which', None),
-    (r'\bwhicb\b', 'which', None),
-    (r'\bwliich\b', 'which', None),
-    (r'\bwliicli\b', 'which', None),
-
+    (r"\bwbich\b", "which", None),
+    (r"\bwhicb\b", "which", None),
+    (r"\bwliich\b", "which", None),
+    (r"\bwliicli\b", "which", None),
     # 'what' variants
-    (r'\bwliat\b', 'what', None),
-    (r'\bwlmt\b', 'what', None),
-
+    (r"\bwliat\b", "what", None),
+    (r"\bwlmt\b", "what", None),
     # 'when' variants
-    (r'\bwlien\b', 'when', None),
-    (r'\bwben\b', 'when', None),
-
+    (r"\bwlien\b", "when", None),
+    (r"\bwben\b", "when", None),
     # 'where' variants
-    (r'\bwliere\b', 'where', None),
-    (r'\bwbere\b', 'where', None),
-
+    (r"\bwliere\b", "where", None),
+    (r"\bwbere\b", "where", None),
     # 'while' variants
-    (r'\bwliile\b', 'while', None),
-    (r'\bwbile\b', 'while', None),
-
+    (r"\bwliile\b", "while", None),
+    (r"\bwbile\b", "while", None),
     # 'who' variants
-    (r'\bwlio\b', 'who', None),
-
+    (r"\bwlio\b", "who", None),
     # 'whose' variants
-    (r'\bwliose\b', 'whose', None),
-
+    (r"\bwliose\b", "whose", None),
     # 'him' variants (2863 occurrences of liim)
-    (r'\bliim\b', 'him', None),
-    (r'\bhirn\b', 'him', None),
-
+    (r"\bliim\b", "him", None),
+    (r"\bhirn\b", "him", None),
     # 'his' variants (9347 occurrences of liis)
-    (r'\bliis\b', 'his', None),
-    (r'\bhia\b', 'his', None),
-
+    (r"\bliis\b", "his", None),
+    (r"\bhia\b", "his", None),
     # 'her' variants
-    (r'\blier\b', 'her', None),
-
+    (r"\blier\b", "her", None),
     # 'he' - needs context since 'lie' is a real word
-    (r'\blie\b', 'he', r'\b(and|but|that|when|if|as|so|because)\s+lie\b'),
-
+    (r"\blie\b", "he", r"\b(and|but|that|when|if|as|so|because)\s+lie\b"),
     # 'she' variants
-    (r'\bslie\b', 'she', None),
-
+    (r"\bslie\b", "she", None),
     # 'they' variants
-    (r'\btliey\b', 'they', None),
-    (r'\btbey\b', 'they', None),
-
+    (r"\btliey\b", "they", None),
+    (r"\btbey\b", "they", None),
     # 'their' variants
-    (r'\btbeir\b', 'their', None),
-    (r'\btlieir\b', 'their', None),
-
+    (r"\btbeir\b", "their", None),
+    (r"\btlieir\b", "their", None),
     # 'them' variants
-    (r'\btbem\b', 'them', None),
-    (r'\btliem\b', 'them', None),
-
+    (r"\btbem\b", "them", None),
+    (r"\btliem\b", "them", None),
     # 'then' variants
-    (r'\btben\b', 'then', None),
-    (r'\btlien\b', 'then', None),
-
+    (r"\btben\b", "then", None),
+    (r"\btlien\b", "then", None),
     # 'there' variants
-    (r'\btbere\b', 'there', None),
-    (r'\btliere\b', 'there', None),
-
+    (r"\btbere\b", "there", None),
+    (r"\btliere\b", "there", None),
     # 'these' variants
-    (r'\btbese\b', 'these', None),
-    (r'\btliese\b', 'these', None),
-
+    (r"\btbese\b", "these", None),
+    (r"\btliese\b", "these", None),
     # 'those' variants
-    (r'\btbose\b', 'those', None),
-    (r'\btliose\b', 'those', None),
-
+    (r"\btbose\b", "those", None),
+    (r"\btliose\b", "those", None),
     # 'other' variants
-    (r'\botber\b', 'other', None),
-    (r'\botlier\b', 'other', None),
-
+    (r"\botber\b", "other", None),
+    (r"\botlier\b", "other", None),
     # ==========================================================================
     # Other common OCR substitution errors
     # ==========================================================================
-
     # 'and' variants
-    (r'\barid\b', 'and', None),
-    (r'\baud\b', 'and', None),
-    (r'\bnnd\b', 'and', None),
-    (r'\baiid\b', 'and', None),
-
+    (r"\barid\b", "and", None),
+    (r"\baud\b", "and", None),
+    (r"\bnnd\b", "and", None),
+    (r"\baiid\b", "and", None),
     # 'with' variants
-    (r'\bwitb\b', 'with', None),
-    (r'\bwitli\b', 'with', None),
-
+    (r"\bwitb\b", "with", None),
+    (r"\bwitli\b", "with", None),
     # 'have' variants
-    (r'\bhavo\b', 'have', None),
-    (r'\bbave\b', 'have', None),
-    (r'\bliave\b', 'have', None),
-
+    (r"\bhavo\b", "have", None),
+    (r"\bbave\b", "have", None),
+    (r"\bliave\b", "have", None),
     # 'been' variants
-    (r'\bboen\b', 'been', None),
-
+    (r"\bboen\b", "been", None),
     # 'from' variants
-    (r'\bfrorn\b', 'from', None),
-
+    (r"\bfrorn\b", "from", None),
     # 'were' variants
-    (r'\bwero\b', 'were', None),
-
+    (r"\bwero\b", "were", None),
     # 'would' variants
-    (r'\bwonld\b', 'would', None),
-    (r'\bwouid\b', 'would', None),
-
+    (r"\bwonld\b", "would", None),
+    (r"\bwouid\b", "would", None),
     # 'could' variants
-    (r'\bconld\b', 'could', None),
-    (r'\bcouid\b', 'could', None),
-
+    (r"\bconld\b", "could", None),
+    (r"\bcouid\b", "could", None),
     # 'should' variants
-    (r'\bsbould\b', 'should', None),
-    (r'\bshouid\b', 'should', None),
-
+    (r"\bsbould\b", "should", None),
+    (r"\bshouid\b", "should", None),
     # 'being' variants
-    (r'\bbeiug\b', 'being', None),
-
+    (r"\bbeiug\b", "being", None),
     # 'made' variants
-    (r'\bmado\b', 'made', None),
-
+    (r"\bmado\b", "made", None),
     # 'upon' variants
-    (r'\bnpon\b', 'upon', None),
-
+    (r"\bnpon\b", "upon", None),
     # 'such' variants
-    (r'\bsucb\b', 'such', None),
-    (r'\bsucli\b', 'such', None),
-
+    (r"\bsucb\b", "such", None),
+    (r"\bsucli\b", "such", None),
     # 'some' variants
-    (r'\bsomo\b', 'some', None),
-
+    (r"\bsomo\b", "some", None),
     # 'very' variants
-    (r'\bverv\b', 'very', None),
-
+    (r"\bverv\b", "very", None),
     # 'first' variants (2490 occurrences of llrst)
-    (r'\bllrst\b', 'first', None),
-    (r'\bfirst\b', 'first', None),
-
+    (r"\bllrst\b", "first", None),
+    (r"\bfirst\b", "first", None),
     # 'still' variants (3097 occurrences - long s confusion)
-    (r'\bftill\b', 'still', None),
-
+    (r"\bftill\b", "still", None),
     # ==========================================================================
     # Long s (ſ) -> s (common in pre-1800 texts)
     # ==========================================================================
-    (r'ſ', 's', None),
-
+    (r"ſ", "s", None),
     # ==========================================================================
     # Common 'rn' <-> 'm' confusion
     # ==========================================================================
-    (r'\brnay\b', 'may', None),
-    (r'\brnuch\b', 'much', None),
-    (r'\brnore\b', 'more', None),
-    (r'\bsarne\b', 'same', None),
-    (r'\btirne\b', 'time', None),
-    (r'\bnarne\b', 'name', None),
-    (r'\bcorne\b', 'come', None),
-    (r'\bhorne\b', 'home', None),
-
+    (r"\brnay\b", "may", None),
+    (r"\brnuch\b", "much", None),
+    (r"\brnore\b", "more", None),
+    (r"\bsarne\b", "same", None),
+    (r"\btirne\b", "time", None),
+    (r"\bnarne\b", "name", None),
+    (r"\bcorne\b", "come", None),
+    (r"\bhorne\b", "home", None),
     # ==========================================================================
     # 'ii' -> 'n' confusion
     # ==========================================================================
-    (r'\bkiiow\b', 'know', None),
-    (r'\bkiiown\b', 'known', None),
-
+    (r"\bkiiow\b", "know", None),
+    (r"\bkiiown\b", "known", None),
     # ==========================================================================
     # Common 'cl' -> 'd' confusion
     # ==========================================================================
-    (r'\bclo\b', 'do', r'\b(to|not|can|will|shall|would|could)\s+clo\b'),
-
+    (r"\bclo\b", "do", r"\b(to|not|can|will|shall|would|could)\s+clo\b"),
     # ==========================================================================
     # Fix broken ligatures (fi, fl, ff, ffi, ffl)
     # ==========================================================================
-    (r'ﬁ', 'fi', None),
-    (r'ﬂ', 'fl', None),
-    (r'ﬀ', 'ff', None),
-    (r'ﬃ', 'ffi', None),
-    (r'ﬄ', 'ffl', None),
+    (r"ﬁ", "fi", None),
+    (r"ﬂ", "fl", None),
+    (r"ﬀ", "ff", None),
+    (r"ﬃ", "ffi", None),
+    (r"ﬄ", "ffl", None),
+    # ==========================================================================
+    # Google digitization watermark artifacts (anachronistic, safe to remove)
+    # These appear in Google Books scans and are never legitimate pre-WWI content
+    # ==========================================================================
+    (r"VjOOQIC", "", None),
+    (r"VjOOQLC", "", None),
+    (r"LjOOQIC", "", None),
+    (r"LiOOQLC", "", None),
+    (r"CjOOQIC", "", None),
+    (r"CjOOQlC", "", None),
+    (r"byVjOOQlC", "", None),
+    (r"byVrrOOQlC", "", None),
+    (r"byCjOOQlC", "", None),
+    (r"hyGoogIc", "", None),
+    (r"GoOglc", "", None),
+    (r"GoogXt", "", None),
+    (r"DigiLizedbyGoOglc", "", None),
+    (r"Digitized\s+by\s+[VLC]j?OOQ(?:IC|LC|lC)", "", None),
+    # ==========================================================================
+    # Repeated letter OCR artifacts (never legitimate words)
+    # Examples: EEE, OOO, NNN, WWW, AAA, BBB, DDD, FFF (3+ same letter)
+    # Excludes I, X, C, M, L, V which are Roman numeral components
+    # ==========================================================================
+    (r"\b([ABENODFGHJKPQRSTUWYZ])\1{2,}\b", "", None),
+    # ==========================================================================
+    # Clear 2-3 letter OCR noise (high frequency, never words)
+    # Only the most obvious patterns with 10k+ occurrences
+    # ==========================================================================
+    (r"[I1]A", "", None),  # 94,675 occurrences in newspaper corpus
+    (r"[I1]H", "", None),  # 65,786 occurrences in newspaper corpus
 ]
 
 # Patterns that indicate garbage OCR (not fixable, flag for review)
 GARBAGE_PATTERNS = [
-    r'[^\x00-\x7F]{10,}',  # Long runs of non-ASCII
-    r'[bcdfghjklmnpqrstvwxz]{6,}',  # Long consonant runs
-    r'\d{2,}[a-z]+\d{2,}',  # Numbers mixed into words oddly
-    r'[|l1I]{5,}',  # Pipe/l/1/I confusion runs
+    r"[^\x00-\x7F]{10,}",  # Long runs of non-ASCII
+    r"[bcdfghjklmnpqrstvwxz]{6,}",  # Long consonant runs
+    r"\d{2,}[a-z]+\d{2,}",  # Numbers mixed into words oddly
+    r"[|l1I]{5,}",  # Pipe/l/1/I confusion runs
 ]
 
 
 @dataclass
 class CleanupStats:
     """Track cleanup statistics."""
+
     total_files: int = 0
     files_modified: int = 0
     files_flagged: int = 0
@@ -270,12 +254,12 @@ class CleanupStats:
 
     def to_dict(self):
         return {
-            'total_files': self.total_files,
-            'files_modified': self.files_modified,
-            'files_flagged': self.files_flagged,
-            'total_substitutions': self.total_substitutions,
-            'top_substitutions': self.substitution_counts.most_common(50),
-            'flagged_files': self.flagged_files[:100],
+            "total_files": self.total_files,
+            "files_modified": self.files_modified,
+            "files_flagged": self.files_flagged,
+            "total_substitutions": self.total_substitutions,
+            "top_substitutions": self.substitution_counts.most_common(50),
+            "flagged_files": self.flagged_files[:100],
         }
 
 
@@ -299,6 +283,7 @@ def clean_text(text: str, stats: Optional[CleanupStats] = None) -> tuple[str, in
 
     for pattern, replacement, context in OCR_SUBSTITUTIONS:
         if context:
+
             def contextual_replace(match):
                 nonlocal total_subs
                 result = re.sub(pattern, replacement, match.group(0), flags=re.IGNORECASE)
@@ -307,6 +292,7 @@ def clean_text(text: str, stats: Optional[CleanupStats] = None) -> tuple[str, in
                     if stats:
                         stats.substitution_counts[f"{pattern} -> {replacement}"] += 1
                 return result
+
             text = re.sub(context, contextual_replace, text, flags=re.IGNORECASE)
         else:
             count_before = len(re.findall(pattern, text, re.IGNORECASE))
@@ -330,7 +316,7 @@ def clean_file(
     Returns: (was_modified, substitution_count, garbage_issues)
     """
     try:
-        with open(input_path, 'r', encoding='utf-8', errors='replace') as f:
+        with open(input_path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
     except Exception as e:
         print(f"  Error reading {input_path}: {e}")
@@ -342,11 +328,11 @@ def clean_file(
 
     if output_path and was_modified:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, 'w', encoding='utf-8') as f:
+        with open(output_path, "w", encoding="utf-8") as f:
             f.write(cleaned)
     elif output_path and not was_modified:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, 'w', encoding='utf-8') as f:
+        with open(output_path, "w", encoding="utf-8") as f:
             f.write(content)
 
     return was_modified, sub_count, garbage_issues
@@ -383,10 +369,12 @@ def clean_batch(
 
         if garbage:
             stats.files_flagged += 1
-            stats.flagged_files.append({
-                'file': str(input_path),
-                'issues': garbage,
-            })
+            stats.flagged_files.append(
+                {
+                    "file": str(input_path),
+                    "issues": garbage,
+                }
+            )
 
     return stats
 
@@ -400,6 +388,7 @@ def analyze_corpus(corpus_dir: Path, sample_size: int = 1000) -> dict:
     files = list(corpus_dir.glob("**/*.txt"))
     if len(files) > sample_size:
         import random
+
         files = random.sample(files, sample_size)
 
     error_counts = Counter()
@@ -410,7 +399,7 @@ def analyze_corpus(corpus_dir: Path, sample_size: int = 1000) -> dict:
 
     for filepath in files:
         try:
-            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
         except Exception:
             continue
@@ -428,17 +417,17 @@ def analyze_corpus(corpus_dir: Path, sample_size: int = 1000) -> dict:
             garbage_files.append(str(filepath))
 
     return {
-        'files_analyzed': len(files),
-        'total_words': total_words,
-        'potential_errors': error_counts.most_common(50),
-        'garbage_files': garbage_files[:50],
-        'estimated_error_rate': sum(error_counts.values()) / total_words if total_words > 0 else 0,
+        "files_analyzed": len(files),
+        "total_words": total_words,
+        "potential_errors": error_counts.most_common(50),
+        "garbage_files": garbage_files[:50],
+        "estimated_error_rate": sum(error_counts.values()) / total_words if total_words > 0 else 0,
     }
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Clean OCR errors in historical texts',
+        description="Clean OCR errors in historical texts",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
@@ -450,31 +439,32 @@ Examples:
   tc-ocr-clean clean input.txt -o output.txt
   tc-ocr-clean batch ./corpus_raw -o ./corpus_clean
   tc-ocr-clean analyze ./corpus --report analysis.json
-        """)
+        """,
+    )
 
-    subparsers = parser.add_subparsers(dest='command', required=True)
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
     # Clean single file
-    clean_parser = subparsers.add_parser('clean', help='Clean a single file')
-    clean_parser.add_argument('input', type=Path, help='Input file')
-    clean_parser.add_argument('-o', '--output', type=Path, help='Output file (default: stdout)')
+    clean_parser = subparsers.add_parser("clean", help="Clean a single file")
+    clean_parser.add_argument("input", type=Path, help="Input file")
+    clean_parser.add_argument("-o", "--output", type=Path, help="Output file (default: stdout)")
 
     # Batch clean
-    batch_parser = subparsers.add_parser('batch', help='Clean all files in directory')
-    batch_parser.add_argument('input_dir', type=Path, help='Input directory')
-    batch_parser.add_argument('-o', '--output-dir', type=Path, help='Output directory')
-    batch_parser.add_argument('--pattern', default='*.txt', help='File pattern (default: *.txt)')
-    batch_parser.add_argument('--report', type=Path, help='Save stats report to JSON')
+    batch_parser = subparsers.add_parser("batch", help="Clean all files in directory")
+    batch_parser.add_argument("input_dir", type=Path, help="Input directory")
+    batch_parser.add_argument("-o", "--output-dir", type=Path, help="Output directory")
+    batch_parser.add_argument("--pattern", default="*.txt", help="File pattern (default: *.txt)")
+    batch_parser.add_argument("--report", type=Path, help="Save stats report to JSON")
 
     # Analyze
-    analyze_parser = subparsers.add_parser('analyze', help='Analyze corpus for OCR errors')
-    analyze_parser.add_argument('corpus_dir', type=Path, help='Corpus directory')
-    analyze_parser.add_argument('--sample', type=int, default=1000, help='Sample size')
-    analyze_parser.add_argument('--report', type=Path, help='Save report to JSON')
+    analyze_parser = subparsers.add_parser("analyze", help="Analyze corpus for OCR errors")
+    analyze_parser.add_argument("corpus_dir", type=Path, help="Corpus directory")
+    analyze_parser.add_argument("--sample", type=int, default=1000, help="Sample size")
+    analyze_parser.add_argument("--report", type=Path, help="Save report to JSON")
 
     args = parser.parse_args()
 
-    if args.command == 'clean':
+    if args.command == "clean":
         was_modified, sub_count, garbage = clean_file(args.input, args.output)
 
         if args.output:
@@ -483,17 +473,17 @@ Examples:
             if garbage:
                 print(f"  Warning: {len(garbage)} garbage patterns detected")
         else:
-            with open(args.input, 'r', encoding='utf-8', errors='replace') as f:
+            with open(args.input, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
             cleaned, _ = clean_text(content)
             print(cleaned)
 
-    elif args.command == 'batch':
+    elif args.command == "batch":
         stats = clean_batch(args.input_dir, args.output_dir, args.pattern)
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("Batch cleanup complete")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(f"  Total files: {stats.total_files}")
         print(f"  Files modified: {stats.files_modified}")
         print(f"  Files flagged (garbage): {stats.files_flagged}")
@@ -505,31 +495,31 @@ Examples:
                 print(f"  {pattern}: {count}")
 
         if args.report:
-            with open(args.report, 'w') as f:
+            with open(args.report, "w") as f:
                 json.dump(stats.to_dict(), f, indent=2)
             print(f"\nReport saved to {args.report}")
 
-    elif args.command == 'analyze':
+    elif args.command == "analyze":
         report = analyze_corpus(args.corpus_dir, args.sample)
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("Corpus Analysis")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(f"  Files analyzed: {report['files_analyzed']}")
         print(f"  Total words: {report['total_words']:,}")
         print(f"  Estimated error rate: {report['estimated_error_rate']:.4%}")
         print(f"  Files with garbage patterns: {len(report['garbage_files'])}")
 
-        if report['potential_errors']:
+        if report["potential_errors"]:
             print("\nTop potential errors:")
-            for pattern, count in report['potential_errors'][:15]:
+            for pattern, count in report["potential_errors"][:15]:
                 print(f"  {pattern}: {count}")
 
         if args.report:
-            with open(args.report, 'w') as f:
+            with open(args.report, "w") as f:
                 json.dump(report, f, indent=2)
             print(f"\nReport saved to {args.report}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

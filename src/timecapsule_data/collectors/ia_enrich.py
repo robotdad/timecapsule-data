@@ -366,7 +366,8 @@ Notes:
                     rate = (
                         new_items / elapsed if elapsed > 0.1 else 0
                     )  # Avoid division by tiny numbers
-                    pct = enriched / self.total_to_enrich * 100 if self.total_to_enrich > 0 else 0
+                    # Progress: new items this run / total to enrich this run
+                    pct = new_items / self.total_to_enrich * 100 if self.total_to_enrich > 0 else 0
 
                     # Calculate ETA
                     remaining = self.total_to_enrich - enriched
@@ -382,7 +383,7 @@ Notes:
                     )
 
                     print(
-                        f"  Progress: {enriched:,}/{self.total_to_enrich:,} ({pct:.1f}%) - "
+                        f"  Progress: {new_items:,}/{self.total_to_enrich:,} ({pct:.1f}%) - "
                         f"{with_text:,} with text - "
                         f"{rate:.1f} items/sec - "
                         f"ETA: {eta_min:.1f}m"
