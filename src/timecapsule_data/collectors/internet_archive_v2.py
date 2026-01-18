@@ -89,6 +89,40 @@ def parse_year(date_str: str) -> Optional[int]:
     return None
 
 
+def get_cache_path(output_dir: Path, content_type: str, year_end: int) -> Path:
+    """Get path for cached search results."""
+    cache_dir = output_dir / ".cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"search_{content_type}_{year_end}.json"
+
+def load_cached_search(cache_path: Path) -> Optional[list[IAItem]]:
+    """Load cached search results if they exist."""
+    if not cache_path.exists():
+        return None
+    try:
+        with open(cache_path) as f:
+            data = json.load(f)
+        items = [IAItem(**item) for item in data["items"]]
+        print(f"Loaded {len(items)} items from cache ({cache_path.name})")
+        return items
+    except Exception as e:
+        print(f"Cache load failed: {e}")
+        return None
+
+def save_search_cache(cache_path: Path, items: list[IAItem], query: str):
+    """Save search results to cache."""
+    data = {
+        "cached_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "query": query,
+        "count": len(items),
+        "items": [{"identifier": i.identifier, "title": i.title, "year": i.year, 
+                   "creator": i.creator, "subjects": i.subjects} for i in items]
+    }
+    with open(cache_path, 'w') as f:
+        json.dump(data, f)
+    print(f"Cached {len(items)} items to {cache_path.name}")
+
+
 def search_items(
     year_start: int = 1500,
     year_end: int = 1914,
