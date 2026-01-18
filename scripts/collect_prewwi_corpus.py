@@ -589,14 +589,16 @@ def stage_ia_parallel(state: CollectionState, logger: logging.Logger) -> tuple:
     books_dir = Config.raw_dir() / "ia" / "books"
     news_dir = Config.raw_dir() / "ia" / "newspapers"
     
-    books_existing = len(list(books_dir.rglob("*.txt"))) if books_dir.exists() else 0
-    news_existing = len(list(news_dir.rglob("*.txt"))) if news_dir.exists() else 0
+    # Count BEFORE so we can detect NEW downloads
+    books_before = len(list(books_dir.rglob("*.txt"))) if books_dir.exists() else 0
+    news_before = len(list(news_dir.rglob("*.txt"))) if news_dir.exists() else 0
     
     logger.info(f"Starting parallel IA downloads...")
-    logger.info(f"  Books: {books_existing} existing files (will skip)")
-    logger.info(f"  Newspapers: {news_existing} existing files (will skip)")
+    logger.info(f"  Books: {books_before} existing files")
+    logger.info(f"  Newspapers: {news_before} existing files")
     
-    results = {"books": 0, "newspapers": 0}
+    # Track new downloads and errors
+    results = {"books_new": 0, "newspapers_new": 0}
     errors = {"books": None, "newspapers": None}
     start_time = datetime.now()
     
@@ -612,11 +614,13 @@ def stage_ia_parallel(state: CollectionState, logger: logging.Logger) -> tuple:
             ]
             if state.mode == "mini":
                 args.extend(["--max-items", str(limit)])
-            run_tc_command("tc-ia", args, logger)
-            results["books"] = len(list(books_dir.rglob("*.txt"))) if books_dir.exists() else 0
+            success = run_tc_command("tc-ia", args, logger)
+            if not success:
+                errors["books"] = "tc-ia returned failure"
+            books_after = len(list(books_dir.rglob("*.txt"))) if books_dir.exists() else 0
+            results["books_new"] = books_after - books_before
         except Exception as e:
             errors["books"] = str(e)
-            results["books"] = len(list(books_dir.rglob("*.txt"))) if books_dir.exists() else 0
     
     def download_newspapers():
         try:
@@ -630,11 +634,13 @@ def stage_ia_parallel(state: CollectionState, logger: logging.Logger) -> tuple:
             ]
             if state.mode == "mini":
                 args.extend(["--max-items", str(limit)])
-            run_tc_command("tc-ia", args, logger)
-            results["newspapers"] = len(list(news_dir.rglob("*.txt"))) if news_dir.exists() else 0
+            success = run_tc_command("tc-ia", args, logger)
+            if not success:
+                errors["newspapers"] = "tc-ia returned failure"
+            news_after = len(list(news_dir.rglob("*.txt"))) if news_dir.exists() else 0
+            results["newspapers_new"] = news_after - news_before
         except Exception as e:
             errors["newspapers"] = str(e)
-            results["newspapers"] = len(list(news_dir.rglob("*.txt"))) if news_dir.exists() else 0
     
     books_thread = threading.Thread(target=download_books, name="ia-books")
     news_thread = threading.Thread(target=download_newspapers, name="ia-newspapers")
@@ -648,24 +654,27 @@ def stage_ia_parallel(state: CollectionState, logger: logging.Logger) -> tuple:
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
     
-    # Create separate progress for each
+    # Progress tracks NEW files only
     books_progress = StageProgress(start_time=start_time.isoformat())
-    books_progress.items_completed = results["books"]
-    books_progress.items_total = results["books"]
+    books_progress.items_completed = results["books_new"]
+    books_progress.items_total = results["books_new"]
     books_progress.errors = 1 if errors["books"] else 0
     books_progress.end_time = end_time.isoformat()
     books_progress.duration_seconds = duration
     
     news_progress = StageProgress(start_time=start_time.isoformat())
-    news_progress.items_completed = results["newspapers"]
-    news_progress.items_total = results["newspapers"]
+    news_progress.items_completed = results["newspapers_new"]
+    news_progress.items_total = results["newspapers_new"]
     news_progress.errors = 1 if errors["newspapers"] else 0
     news_progress.end_time = end_time.isoformat()
     news_progress.duration_seconds = duration
     
-    logger.info(f"Parallel download complete:")
-    logger.info(f"  Books: {results['books']} files" + (f" (ERROR: {errors['books']})" if errors["books"] else ""))
-    logger.info(f"  Newspapers: {results['newspapers']} files" + (f" (ERROR: {errors['newspapers']})" if errors["newspapers"] else ""))
+    books_total = books_before + results["books_new"]
+    news_total = news_before + results["newspapers_new"]
+    
+    logger.info(f"Parallel download results:")
+    logger.info(f"  Books: {results['books_new']} new ({books_total} total)" + (f" ERROR: {errors['books']}" if errors["books"] else ""))
+    logger.info(f"  Newspapers: {results['newspapers_new']} new ({news_total} total)" + (f" ERROR: {errors['newspapers']}" if errors["newspapers"] else ""))
     
     success = not errors["books"] and not errors["newspapers"]
     return books_progress, news_progress, success
