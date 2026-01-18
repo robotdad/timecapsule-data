@@ -84,29 +84,62 @@ tc-perseus --languages grc,lat,eng -o ./perseus-with-translations
 tc-perseus --list-only
 ```
 
-### Internet Archive (`tc-ia`)
+### Internet Archive (Three-Phase Pipeline)
 
 **Quality**: ⭐⭐⭐ Variable - OCR with quality filtering
 
-Massive collection with variable quality. The collector includes:
-- Pre-download deduplication against Gutenberg
-- OCR quality estimation and filtering
-- Collection-based quality scoring
-- Content type inference (newspaper, magazine, book, etc.)
+Massive collection (2.3M+ items for year 0-1914) with variable quality. Uses a redesigned three-phase approach to handle IA's pagination limits and improve reliability.
+
+#### Phase 1: Build Index (`tc-ia-index`)
+
+Build a complete catalog of all IA items in your date range:
 
 ```bash
-# Pre-1914 newspapers
-tc-ia --year-end 1914 --content-type newspaper -o ./ia-news
+# Build index for year 0-1914 (all available pre-WWI content)
+tc-ia-index --year-start 0 --year-end 1914 -o ./corpus
 
-# High-quality books from known-good collections
-tc-ia --year-end 1900 --collection americana --min-quality 0.85 -o ./ia-americana
-
-# Dedupe against existing Gutenberg corpus
-tc-ia --gutenberg-metadata ./gutenberg/metadata.csv --year-end 1914 -o ./ia
-
-# Dry run to see what's available
-tc-ia --year-end 1914 --dry-run --max-items 100
+# Creates: corpus/metadata/ia_index_0_1914.json (~2.3M items, 2GB file)
+# Time: ~15-20 minutes
+# Uses: Scraping API with cursor-based pagination (no 10k limit)
 ```
+
+#### Phase 2: Enrich Index (`tc-ia-enrich`)
+
+Add text filenames to index (selective, based on quality threshold):
+
+```bash
+# Enrich items with quality >= 0.65 (includes newspapers and general books)
+tc-ia-enrich --index corpus/metadata/ia_index_0_1914.json \
+  --min-quality 0.65 --workers 4
+
+# Time: ~12 hours for ~1.5M items at 0.65 threshold
+# Resumable: Ctrl+C anytime, run same command to continue
+# Saves: Every 100 items (~75 seconds max loss on interrupt)
+```
+
+#### Phase 3: Download (`tc-ia-download`)
+
+Download text files from enriched index:
+
+```bash
+# Download up to 100,000 items
+tc-ia-download --index corpus/metadata/ia_index_0_1914.json \
+  --max-items 100000 --workers 4 \
+  --gutenberg-metadata ./corpus/gutenberg/metadata.csv \
+  -o ./corpus/ia
+
+# Time: ~48 hours for 100k items (depends on workers)
+# Resume support: Automatic via download_state.json
+# Deduplication: Against Gutenberg if metadata provided
+```
+
+**Benefits of three-phase approach:**
+- ✅ Bypasses IA's 10,000 result pagination limit (uses Scraping API)
+- ✅ One-time index build captures all 2.3M+ items
+- ✅ Selective enrichment saves API calls (don't enrich low-quality items)
+- ✅ 100% filename accuracy (no guessing, uses metadata API)
+- ✅ Full metadata traceability (text file → index → IA)
+- ✅ Resume support at all phases
 
 ## Utilities
 
@@ -230,12 +263,15 @@ uv run python scripts/collect_prewwi_corpus.py --resume
 
 The script handles the complete pipeline:
 1. **Gutenberg** - ~17k high-quality proofread texts
-2. **Internet Archive Books** - ~50k books with Gutenberg deduplication
-3. **Internet Archive Newspapers** - ~80k newspaper issues
-4. **Validation** - Temporal purity check
-5. **OCR Cleanup** - Fix common OCR errors in IA texts
-6. **Deduplication** - Merge sources, prefer Gutenberg quality
-7. **Summary** - Generate metadata and statistics
+2. **IA Index** - Build complete IA catalog (year 0-1914)
+3. **IA Enrich** - Add text filenames to index (quality >= 0.65)
+4. **IA Download** - Download texts from enriched index
+5. **Validation** - Temporal purity check
+6. **OCR Cleanup** - Fix common OCR errors in IA texts
+7. **Vocabulary Extract** - Extract OCR error candidates for review
+8. **Vocabulary Review** - Human checkpoint for vocab approval
+9. **Deduplication** - Merge sources, prefer Gutenberg quality
+10. **Summary** - Generate metadata and statistics
 
 Features:
 - **Resume support** - Ctrl+C anytime, `--resume` to continue
