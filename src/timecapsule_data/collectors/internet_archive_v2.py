@@ -233,7 +233,7 @@ def get_text_file(identifier: str) -> Optional[str]:
         return None
 
 
-def download_item(item: IAItem, output_dir: Path, delay: float = 0.3) -> Optional[dict]:
+def download_item(item: IAItem, output_dir: Path, delay: float = 0.5) -> Optional[dict]:
     """
     Download text content for an item.
     
@@ -305,8 +305,8 @@ def download_item(item: IAItem, output_dir: Path, delay: float = 0.3) -> Optiona
 def download_parallel(
     items: list[IAItem],
     output_dir: Path,
-    workers: int = 16,
-    delay: float = 0.3,
+    workers: int = 8,
+    delay: float = 0.5,
     label: str = "",
 ) -> list[dict]:
     """Download multiple items in parallel."""
@@ -383,9 +383,9 @@ def main():
                         help='Minimum quality score (default: 0.6)')
     parser.add_argument('--max-items', type=int, default=0,
                         help='Maximum items to download (0=unlimited)')
-    parser.add_argument('--workers', type=int, default=16,
+    parser.add_argument('--workers', type=int, default=8,
                         help='Parallel download workers (default: 12)')
-    parser.add_argument('--delay', type=float, default=0.3,
+    parser.add_argument('--delay', type=float, default=0.5,
                         help='Delay between downloads in seconds (default: 0.3)')
     parser.add_argument('--gutenberg-metadata', type=Path,
                         help='Path to Gutenberg metadata.csv to exclude duplicates')
@@ -433,12 +433,20 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Download
-    results = download_parallel(
+    results, failed_items = download_parallel(
         items, output_dir,
         workers=args.workers,
         delay=args.delay,
         label=label,
     )
+    
+    # Save failed items for retry
+    if failed_items:
+        retry_file = output_dir / "retry_items.json"
+        retry_data = [{"identifier": item.identifier, "title": item.title} for item in failed_items]
+        with open(retry_file, 'w') as f:
+            json.dump(retry_data, f, indent=2)
+        print(f"{label}: {len(failed_items)} failed items saved to {retry_file}")
     
     # Save metadata
     if results:
