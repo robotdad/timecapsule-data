@@ -399,7 +399,11 @@ Examples:
     elif args.content_type == "government":
         query_parts.append("(subject:government OR collection:us_government)")
     elif args.content_type == "book":
-        query_parts.append("NOT (subject:newspaper OR subject:magazine OR subject:periodical)")
+        # Use minus syntax instead of AND NOT - it actually works
+        query_parts.append("-subject:newspaper")
+        query_parts.append("-subject:magazine")
+        query_parts.append("-subject:periodical")
+        query_parts.append("-subject:serial")
 
     query = " AND ".join(query_parts)
     print(f"Search query: {query}")
