@@ -97,6 +97,7 @@ def search_items(
     min_quality: float = 0.6,
     max_items: int = 0,
     exclude_ids: Optional[set] = None,
+    label: str = "",
 ) -> list[IAItem]:
     """
     Search Internet Archive for items matching criteria.
@@ -126,7 +127,8 @@ def search_items(
             query_parts.append("NOT (subject:newspaper OR subject:magazine OR subject:periodical)")
     
     query = " AND ".join(query_parts)
-    print(f"Search query: {query}")
+    prefix = f"[{label}] " if label else ""
+    print(f"{prefix}Search: {query[:80]}...")
     
     # Use official library search
     search = ia.search_items(query, fields=[
@@ -137,7 +139,7 @@ def search_items(
     items = []
     seen = 0
     
-    print(f"\nSearching Internet Archive...")
+    print(f"{prefix}Searching...")
     
     for result in search:
         seen += 1
@@ -195,13 +197,13 @@ def search_items(
         
         items.append(item)
         
-        if seen % 100 == 0:
-            print(f"  Scanned {seen} items, {len(items)} passed filters...")
+        if seen % 500 == 0:
+            print(f"{prefix}  Scanned {seen}, {len(items)} matched...")
         
         if max_items > 0 and len(items) >= max_items:
             break
     
-    print(f"\nFound {len(items)} items matching criteria (scanned {seen})")
+    print(f"{prefix}Found {len(items)} items (scanned {seen})")
     return items
 
 
@@ -305,13 +307,15 @@ def download_parallel(
     output_dir: Path,
     workers: int = 16,
     delay: float = 0.3,
+    label: str = "",
 ) -> list[dict]:
     """Download multiple items in parallel."""
     results = []
     failed = 0
     skipped = 0
     
-    print(f"\nDownloading {len(items)} items with {workers} workers...")
+    prefix = f"[{label}] " if label else ""
+    print(f"{prefix}Downloading {len(items)} items ({workers} workers)...")
     
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
@@ -327,10 +331,10 @@ def download_parallel(
                     results.append(result)
                     if result.get('skipped'):
                         skipped += 1
-                        if skipped <= 5 or skipped % 100 == 0:
-                            print(f"  [{i}/{len(items)}] ⏭ {item.title[:50]}... (exists)")
                     else:
-                        print(f"  [{i}/{len(items)}] ✓ {item.title[:50]}...")
+                        new_count = len(results) - skipped
+                        if new_count <= 3 or new_count % 50 == 0:
+                            print(f"{prefix}  [{i}/{len(items)}] ✓ {item.title[:40]}...")
                 else:
                     failed += 1
                     if failed <= 10:
@@ -341,7 +345,7 @@ def download_parallel(
                     print(f"  [{i}/{len(items)}] ✗ {item.title[:50]}: {e}")
     
     new_downloads = len(results) - skipped
-    print(f"\nComplete: {new_downloads} new, {skipped} skipped, {failed} failed")
+    print(f"{prefix}Done: {new_downloads} new, {skipped} skipped, {failed} failed")
     return results
 
 
@@ -399,6 +403,7 @@ def main():
     
     # Search
     content_type = args.content_type if args.content_type != 'all' else None
+    label = (args.content_type or "all").upper()
     items = search_items(
         year_start=args.year_start,
         year_end=args.year_end,
@@ -407,6 +412,7 @@ def main():
         min_quality=args.min_quality,
         max_items=args.max_items,
         exclude_ids=exclude_ids,
+        label=label,
     )
     
     if not items:
@@ -431,6 +437,7 @@ def main():
         items, output_dir,
         workers=args.workers,
         delay=args.delay,
+        label=label,
     )
     
     # Save metadata
