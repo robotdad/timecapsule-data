@@ -38,6 +38,9 @@ dev = [
 # Main collectors
 tc-gutenberg = "timecapsule_data.collectors.gutenberg:main"
 tc-ia = "timecapsule_data.collectors.internet_archive:main"
+tc-ia-index = "timecapsule_data.collectors.ia_index:main"
+tc-ia-enrich = "timecapsule_data.collectors.ia_enrich:main"
+tc-ia-download = "timecapsule_data.collectors.ia_download:main"
 tc-perseus = "timecapsule_data.collectors.perseus:main"
 
 # Utilities
@@ -48,6 +51,7 @@ tc-ocr-clean = "timecapsule_data.utils.ocr_cleanup:main"
 tc-ocr-score = "timecapsule_data.utils.ocr_score:main"
 tc-ocr-symspell = "timecapsule_data.utils.ocr_symspell:main"
 tc-ocr-vocab = "timecapsule_data.utils.ocr_vocab:main"
+tc-anachronistic-filter = "timecapsule_data.utils.anachronistic_filter:main"
 tc-quality = "timecapsule_data.utils.quality:main"
 
 [project.urls]

@@ -52,7 +52,7 @@ class Config:
     REPO_DIR: Path = Path(__file__).parent.parent.resolve()
     CUTOFF_YEAR = 1914
     LANGUAGE = "en"
-    IA_MIN_QUALITY = 0.75
+    IA_MIN_QUALITY = 0.65  # Include newspapers and general book collections
     MINI_GUTENBERG_LIMIT = 100
     MINI_IA_BOOKS_LIMIT = 1000
     MINI_IA_NEWSPAPERS_LIMIT = 1000

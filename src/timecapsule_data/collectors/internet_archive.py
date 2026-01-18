@@ -355,7 +355,7 @@ Examples:
         default="any",
         help="Filter by content type",
     )
-    parser.add_argument("--min-quality", type=float, default=0.75)
+    parser.add_argument("--min-quality", type=float, default=0.65)
     parser.add_argument("--min-length", type=int, default=10000)
     parser.add_argument("--max-items", type=int, default=500)
     parser.add_argument(
