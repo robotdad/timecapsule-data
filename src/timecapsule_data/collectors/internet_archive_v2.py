@@ -303,7 +303,7 @@ def download_item(item: IAItem, output_dir: Path, delay: float = 0.3) -> Optiona
 def download_parallel(
     items: list[IAItem],
     output_dir: Path,
-    workers: int = 12,
+    workers: int = 16,
     delay: float = 0.3,
 ) -> list[dict]:
     """Download multiple items in parallel."""
@@ -379,7 +379,7 @@ def main():
                         help='Minimum quality score (default: 0.6)')
     parser.add_argument('--max-items', type=int, default=0,
                         help='Maximum items to download (0=unlimited)')
-    parser.add_argument('--workers', type=int, default=12,
+    parser.add_argument('--workers', type=int, default=16,
                         help='Parallel download workers (default: 12)')
     parser.add_argument('--delay', type=float, default=0.3,
                         help='Delay between downloads in seconds (default: 0.3)')
