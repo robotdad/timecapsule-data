@@ -45,6 +45,8 @@ tc-analyze = "timecapsule_data.utils.analyze:main"
 tc-validate = "timecapsule_data.utils.validate:main"
 tc-dedup = "timecapsule_data.utils.dedup_v2:main"
 tc-ocr-clean = "timecapsule_data.utils.ocr_cleanup:main"
+tc-ocr-score = "timecapsule_data.utils.ocr_score:main"
+tc-ocr-symspell = "timecapsule_data.utils.ocr_symspell:main"
 tc-quality = "timecapsule_data.utils.quality:main"
 
 [project.urls]
