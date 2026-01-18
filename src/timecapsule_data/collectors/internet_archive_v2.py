@@ -233,7 +233,7 @@ def get_text_file(identifier: str) -> Optional[str]:
         return None
 
 
-def download_item(item: IAItem, output_dir: Path, delay: float = 0.5) -> Optional[dict]:
+def download_item(item: IAItem, output_dir: Path, ) -> Optional[dict]:
     """
     Download text content for an item.
     
@@ -281,7 +281,7 @@ def download_item(item: IAItem, output_dir: Path, delay: float = 0.5) -> Optiona
         out_path.write_text(text, encoding='utf-8')
         
         # Small delay between items (library handles rate limits, but be polite)
-        time.sleep(delay)
+        
         
         return {
             'identifier': item.identifier,
@@ -306,7 +306,7 @@ def download_parallel(
     items: list[IAItem],
     output_dir: Path,
     workers: int = 8,
-    delay: float = 0.5,
+    
     label: str = "",
 ) -> list[dict]:
     """Download multiple items in parallel."""
@@ -319,7 +319,7 @@ def download_parallel(
     
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(download_item, item, output_dir, delay): item
+            executor.submit(download_item, item, output_dir): item
             for item in items
         }
         
@@ -436,7 +436,7 @@ def main():
     results, failed_items = download_parallel(
         items, output_dir,
         workers=args.workers,
-        delay=args.delay,
+
         label=label,
     )
     
