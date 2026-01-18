@@ -435,6 +435,10 @@ def main():
         if exclude_ids:
             print(f"Loaded {len(exclude_ids)} Gutenberg IDs to exclude")
     
+    # Output directory
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
     # Search
     content_type = args.content_type if args.content_type != 'all' else None
     label = (args.content_type or "all").upper()
