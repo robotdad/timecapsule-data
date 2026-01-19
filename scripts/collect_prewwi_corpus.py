@@ -37,7 +37,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -58,7 +58,7 @@ current_subprocess = None
 
 
 class Config:
-    OUTPUT_BASE: Path = None
+    OUTPUT_BASE: Optional[Path] = None
     REPO_DIR: Path = Path(__file__).parent.parent.resolve()
     YEAR_START = 0  # Start from year 0 (earliest available data)
     CUTOFF_YEAR = 1914  # Pre-WWI cutoff
@@ -76,26 +76,32 @@ class Config:
 
     @classmethod
     def raw_dir(cls) -> Path:
+        assert cls.OUTPUT_BASE is not None
         return cls.OUTPUT_BASE / "raw"
 
     @classmethod
     def cleaned_dir(cls) -> Path:
+        assert cls.OUTPUT_BASE is not None
         return cls.OUTPUT_BASE / "cleaned"
 
     @classmethod
     def deduped_dir(cls) -> Path:
+        assert cls.OUTPUT_BASE is not None
         return cls.OUTPUT_BASE / "deduped"
 
     @classmethod
     def metadata_dir(cls) -> Path:
+        assert cls.OUTPUT_BASE is not None
         return cls.OUTPUT_BASE / "metadata"
 
     @classmethod
     def state_file(cls) -> Path:
+        assert cls.OUTPUT_BASE is not None
         return cls.OUTPUT_BASE / ".collection_state.json"
 
     @classmethod
     def log_file(cls) -> Path:
+        assert cls.OUTPUT_BASE is not None
         return cls.OUTPUT_BASE / "collection.log"
 
 
@@ -228,16 +234,10 @@ class CollectionState:
     current_stage: str = Stage.INIT.value
     started_at: Optional[str] = None
     updated_at: Optional[str] = None
-    stages_completed: dict = None
-    stages_in_progress: dict = None
+    stages_completed: dict = field(default_factory=dict)
+    stages_in_progress: dict = field(default_factory=dict)
     total_files: int = 0
     total_bytes: int = 0
-
-    def __post_init__(self):
-        if self.stages_completed is None:
-            self.stages_completed = {}
-        if self.stages_in_progress is None:
-            self.stages_in_progress = {}
 
     def save(self, path: Path):
         self.updated_at = datetime.now().isoformat()
@@ -512,6 +512,7 @@ def run_tc_command(
         # Store subprocess globally so signal handler can access it
         current_subprocess = process
 
+        assert process.stdout is not None  # We set stdout=subprocess.PIPE
         for line in iter(process.stdout.readline, ""):
             # Check for cancellation
             if cancellation_event.is_set():
@@ -575,6 +576,8 @@ def stage_init(state: CollectionState, logger: logging.Logger) -> StageProgress:
         progress.items_completed += 1
     progress.items_total = len(dirs)
     progress.end_time = datetime.now().isoformat()
+    assert progress.start_time is not None
+    assert progress.end_time is not None
     progress.duration_seconds = (
         datetime.fromisoformat(progress.end_time) - datetime.fromisoformat(progress.start_time)
     ).total_seconds()
@@ -619,6 +622,8 @@ def stage_gutenberg(state: CollectionState, logger: logging.Logger) -> StageProg
         logger.error("Gutenberg collection failed")
 
     progress.end_time = datetime.now().isoformat()
+    assert progress.start_time is not None
+    assert progress.end_time is not None
     progress.duration_seconds = (
         datetime.fromisoformat(progress.end_time) - datetime.fromisoformat(progress.start_time)
     ).total_seconds()
@@ -662,6 +667,8 @@ def stage_ia_index(state: CollectionState, logger: logging.Logger) -> StageProgr
         logger.error("IA index build failed")
 
     progress.end_time = datetime.now().isoformat()
+    assert progress.start_time is not None
+    assert progress.end_time is not None
     progress.duration_seconds = (
         datetime.fromisoformat(progress.end_time) - datetime.fromisoformat(progress.start_time)
     ).total_seconds()
@@ -712,6 +719,8 @@ def stage_ia_enrich(state: CollectionState, logger: logging.Logger) -> StageProg
         logger.error("IA enrichment failed")
 
     progress.end_time = datetime.now().isoformat()
+    assert progress.start_time is not None
+    assert progress.end_time is not None
     progress.duration_seconds = (
         datetime.fromisoformat(progress.end_time) - datetime.fromisoformat(progress.start_time)
     ).total_seconds()
@@ -786,6 +795,8 @@ def stage_ia_download(state: CollectionState, logger: logging.Logger) -> StagePr
             logger.error("IA download failed")
 
     progress.end_time = datetime.now().isoformat()
+    assert progress.start_time is not None
+    assert progress.end_time is not None
     progress.duration_seconds = (
         datetime.fromisoformat(progress.end_time) - datetime.fromisoformat(progress.start_time)
     ).total_seconds()
@@ -817,6 +828,8 @@ def stage_validate(state: CollectionState, logger: logging.Logger) -> StageProgr
         logger.info(f"Validation complete: {progress.items_completed} files checked")
 
     progress.end_time = datetime.now().isoformat()
+    assert progress.start_time is not None
+    assert progress.end_time is not None
     progress.duration_seconds = (
         datetime.fromisoformat(progress.end_time) - datetime.fromisoformat(progress.start_time)
     ).total_seconds()
@@ -881,6 +894,8 @@ def stage_ocr_clean(state: CollectionState, logger: logging.Logger) -> StageProg
 
     progress.items_total = progress.items_completed
     progress.end_time = datetime.now().isoformat()
+    assert progress.start_time is not None
+    assert progress.end_time is not None
     progress.duration_seconds = (
         datetime.fromisoformat(progress.end_time) - datetime.fromisoformat(progress.start_time)
     ).total_seconds()
@@ -914,6 +929,7 @@ def stage_vocab_extract(state: CollectionState, logger: logging.Logger) -> Stage
     total_files = sum(len(list(s.rglob("*.txt"))) for s in sources)
     progress.items_total = total_files
 
+    assert Config.OUTPUT_BASE is not None
     vocab_dir = Config.OUTPUT_BASE / "vocab_review"
     vocab_dir.mkdir(parents=True, exist_ok=True)
     vocab_file = vocab_dir / "vocabulary_candidates.json"
@@ -947,6 +963,8 @@ def stage_vocab_extract(state: CollectionState, logger: logging.Logger) -> Stage
         logger.info(f"Review file: {vocab_file}")
 
     progress.end_time = datetime.now().isoformat()
+    assert progress.start_time is not None
+    assert progress.end_time is not None
     progress.duration_seconds = (
         datetime.fromisoformat(progress.end_time) - datetime.fromisoformat(progress.start_time)
     ).total_seconds()
@@ -957,6 +975,7 @@ def stage_vocab_review(state: CollectionState, logger: logging.Logger) -> StageP
     """Human review checkpoint - pipeline stops here until manually resumed."""
     progress = StageProgress(start_time=datetime.now().isoformat())
 
+    assert Config.OUTPUT_BASE is not None
     vocab_dir = Config.OUTPUT_BASE / "vocab_review"
     vocab_file = vocab_dir / "vocabulary_candidates.json"
     approved_file = vocab_dir / "approved_vocabulary.json"
@@ -995,6 +1014,8 @@ def stage_vocab_review(state: CollectionState, logger: logging.Logger) -> StageP
 
     progress.items_total = 1
     progress.end_time = datetime.now().isoformat()
+    assert progress.start_time is not None
+    assert progress.end_time is not None
     progress.duration_seconds = (
         datetime.fromisoformat(progress.end_time) - datetime.fromisoformat(progress.start_time)
     ).total_seconds()
@@ -1055,6 +1076,8 @@ def stage_dedup(state: CollectionState, logger: logging.Logger) -> StageProgress
         logger.error("Deduplication failed")
 
     progress.end_time = datetime.now().isoformat()
+    assert progress.start_time is not None
+    assert progress.end_time is not None
     progress.duration_seconds = (
         datetime.fromisoformat(progress.end_time) - datetime.fromisoformat(progress.start_time)
     ).total_seconds()
@@ -1110,6 +1133,8 @@ def stage_finalize(state: CollectionState, logger: logging.Logger) -> StageProgr
     progress.items_total = 1
     progress.items_completed = 1
     progress.end_time = datetime.now().isoformat()
+    assert progress.start_time is not None
+    assert progress.end_time is not None
     progress.duration_seconds = (
         datetime.fromisoformat(progress.end_time) - datetime.fromisoformat(progress.start_time)
     ).total_seconds()
@@ -1369,6 +1394,7 @@ Stages: init, gutenberg, ia_index, ia_enrich, ia_download, validate, ocr_clean, 
     args = parser.parse_args()
 
     Config.init(args.output)
+    assert Config.OUTPUT_BASE is not None
     Config.OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 
     state = CollectionState.load(Config.state_file())
