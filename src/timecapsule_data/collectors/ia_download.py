@@ -496,6 +496,9 @@ Notes:
     else:
         exclusion_params = ()
 
+    # Build LIMIT clause conditionally
+    limit_clause = "LIMIT ?" if args.max_items else ""
+
     query = f"""
         SELECT identifier, text_filename FROM items
         WHERE quality_score >= ?
@@ -503,10 +506,12 @@ Notes:
         AND downloaded_at IS NULL
         {exclusion_clause}
         ORDER BY year ASC, identifier ASC
-        LIMIT ?
+        {limit_clause}
     """
 
-    params = (args.min_quality, args.min_imagecount) + exclusion_params + (args.max_items,)
+    params = (args.min_quality, args.min_imagecount) + exclusion_params
+    if args.max_items:
+        params = params + (args.max_items,)
     cursor.execute(query, params)
     items_to_download = cursor.fetchall()
 
