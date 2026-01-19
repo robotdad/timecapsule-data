@@ -36,7 +36,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Set
@@ -76,24 +76,35 @@ class RateLimiter:
     success_speedup: float = 0.9
     consecutive_successes: int = 0
     consecutive_errors: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def wait(self):
-        time.sleep(self.current_delay)
+        with self._lock:
+            delay = self.current_delay
+        time.sleep(delay)
 
     def record_success(self):
-        self.consecutive_successes += 1
-        self.consecutive_errors = 0
-        if self.consecutive_successes >= 10:
-            self.current_delay = max(self.min_delay, self.current_delay * self.success_speedup)
-            self.consecutive_successes = 0
+        with self._lock:
+            self.consecutive_successes += 1
+            self.consecutive_errors = 0
+            if self.consecutive_successes >= 10:
+                self.current_delay = max(self.min_delay, self.current_delay * self.success_speedup)
+                self.consecutive_successes = 0
 
     def record_error(self, is_rate_limit: bool = False):
-        self.consecutive_errors += 1
-        self.consecutive_successes = 0
-        if is_rate_limit:
-            self.current_delay = min(self.max_delay, self.current_delay * self.backoff_factor * 2)
-        else:
-            self.current_delay = min(self.max_delay, self.current_delay * self.backoff_factor)
+        with self._lock:
+            self.consecutive_errors += 1
+            self.consecutive_successes = 0
+            if is_rate_limit:
+                self.current_delay = min(
+                    self.max_delay, self.current_delay * self.backoff_factor * 2
+                )
+            else:
+                self.current_delay = min(self.max_delay, self.current_delay * self.backoff_factor)
+
+
+# Global shared rate limiter for all workers (prevents IP bans)
+global_rate_limiter = RateLimiter(base_delay=2.0)
 
 
 @dataclass
@@ -383,7 +394,7 @@ def download_worker(
     worker_id: int,
 ) -> dict:
     """Worker function for parallel downloads with discovery."""
-    rate_limiter = RateLimiter(base_delay=2.0)
+    # Use global shared rate limiter (removed local instance)
     stats = {
         "downloaded": 0,
         "failed": 0,
@@ -397,7 +408,7 @@ def download_worker(
             break
 
         success, reason, discovered_filename = download_with_discovery(
-            identifier, known_filename, output_dir, db_path, rate_limiter
+            identifier, known_filename, output_dir, db_path, global_rate_limiter
         )
 
         if success:
