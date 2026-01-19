@@ -46,3 +46,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Private notes and local data (not for public repo)
+.private/
