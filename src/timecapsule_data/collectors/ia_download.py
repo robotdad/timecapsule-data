@@ -393,7 +393,9 @@ Notes:
     parser.add_argument("--index", required=True, help="Path to SQLite index (.db)")
     parser.add_argument("-o", "--output", required=True, help="Output directory")
     parser.add_argument("--gutenberg-metadata", help="Gutenberg metadata CSV for dedup")
-    parser.add_argument("--max-items", type=int, default=50000, help="Max items to download")
+    parser.add_argument(
+        "--max-items", type=int, default=None, help="Max items to download (default: all)"
+    )
     parser.add_argument("--workers", type=int, default=4, help="Parallel download workers")
     parser.add_argument("--min-quality", type=float, default=0.65, help="Min quality threshold")
     parser.add_argument(
