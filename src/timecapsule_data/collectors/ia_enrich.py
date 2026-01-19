@@ -226,11 +226,13 @@ class ProgressMonitor:
         self.start_time = time.time()
         self.last_count = 0
 
-        # Get starting count
+        # Get starting counts
         conn = sqlite3.Connection(db_path)
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM items WHERE enriched_at IS NOT NULL")
         self.starting_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM items WHERE text_filename IS NOT NULL")
+        self.starting_with_text = cursor.fetchone()[0]
         conn.close()
 
     def _monitor_loop(self):
@@ -242,30 +244,45 @@ class ProgressMonitor:
             cursor.execute("SELECT COUNT(*) FROM items WHERE enriched_at IS NOT NULL")
             enriched = cursor.fetchone()[0]
 
-            # Print progress update
-            if enriched != self.last_count:
+            # Print progress update (only if significant change or time passed)
+            if enriched != self.last_count and enriched - self.last_count >= 100:
                 elapsed = time.time() - self.start_time
                 # Calculate rate based on NEW items only
                 new_items = enriched - self.starting_count
                 rate = new_items / elapsed if elapsed > 0.1 else 0
                 pct = new_items / self.total_to_enrich * 100 if self.total_to_enrich > 0 else 0
 
-                # Calculate ETA
+                # Calculate ETA with human-friendly format
                 remaining = self.total_to_enrich - new_items
                 eta_sec = remaining / rate if rate > 0 else 0
-                eta_min = eta_sec / 60
 
-                # Count successes vs failures
+                # Format ETA
+                if eta_sec < 3600:
+                    eta_str = f"{eta_sec / 60:.0f}m"
+                else:
+                    hours = int(eta_sec // 3600)
+                    mins = int((eta_sec % 3600) // 60)
+                    eta_str = f"{hours}h {mins}m"
+
+                # Count successes vs failures (NEW items only)
                 cursor.execute(
                     "SELECT COUNT(*) FROM items WHERE text_filename IS NOT NULL AND enriched_at IS NOT NULL"
                 )
-                with_text = cursor.fetchone()[0]
+                total_with_text = cursor.fetchone()[0]
+                new_with_text = total_with_text - self.starting_with_text
+                success_rate = (new_with_text / new_items * 100) if new_items > 0 else 0
+
+                # Use items/min or items/hour based on rate
+                if rate < 1:
+                    rate_str = f"{rate * 60:.1f} items/min"
+                else:
+                    rate_str = f"{rate:.1f} items/sec"
 
                 print(
                     f"  Progress: {new_items:,}/{self.total_to_enrich:,} ({pct:.1f}%) - "
-                    f"{with_text:,} with text - "
-                    f"{rate:.1f} items/sec - "
-                    f"ETA: {eta_min:.1f}m"
+                    f"{new_with_text:,} with text ({success_rate:.1f}%) - "
+                    f"{rate_str} - "
+                    f"ETA: {eta_str}"
                 )
 
                 self.last_count = enriched
@@ -397,14 +414,21 @@ Notes:
     )
     identifiers_to_enrich = [row[0] for row in cursor.fetchall()]
 
+    # Format estimated time
+    est_seconds = len(identifiers_to_enrich) / (args.workers * 0.3)
+    if est_seconds < 3600:
+        est_str = f"{est_seconds / 60:.0f} minutes"
+    else:
+        hours = int(est_seconds // 3600)
+        mins = int((est_seconds % 3600) // 60)
+        est_str = f"{hours}h {mins}m"
+
     print()
     print("Enrichment plan:")
     print(f"  Quality range: {args.min_quality} - {args.max_quality}")
     print(f"  Items to enrich: {len(identifiers_to_enrich):,}")
     print(f"  Workers: {args.workers}")
-    print(
-        f"  Estimated time: {len(identifiers_to_enrich) / (args.workers * 0.3):.0f} seconds ({len(identifiers_to_enrich) / (args.workers * 0.3) / 60:.1f} minutes)"
-    )
+    print(f"  Estimated time: {est_str}")
     print()
 
     if not identifiers_to_enrich:

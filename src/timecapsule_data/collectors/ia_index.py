@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Internet Archive Index Builder (SQLite)
+Internet Archive Index Builder (SQLite with Time Chunking)
 
-Builds a complete catalog of all IA items in a date range using the Scraping API.
-Stores directly to SQLite database for efficient querying and updates.
+Builds a complete catalog of all IA items in a date range using adaptive time chunking.
+Splits large date ranges into manageable chunks (~100k items each) for robust resume support.
 
-The Scraping API uses cursor-based pagination with NO result limits, allowing us
-to retrieve all 2.3M+ items without hitting the 10k pagination wall.
+The Scraping API uses cursor-based pagination within each chunk. If interrupted, resume
+starts from the next incomplete chunk without re-scanning completed time periods.
 
 Usage:
     tc-ia-index --year-start 1800 --year-end 1914 -o /path/to/corpus/
@@ -14,10 +14,10 @@ Usage:
 Creates: corpus/metadata/ia_index_1800_1914.db
 
 Features:
-- Direct SQLite storage (no intermediate JSON)
-- Resume support (continues from last cursor)
-- Instant commits after each batch
-- ~75% smaller than JSON
+- Adaptive time chunking (adjusts granularity based on data density)
+- Robust resume (continues from incomplete chunks only)
+- Safe to interrupt (atomic commits per chunk)
+- No duplicate scanning on resume
 """
 
 import argparse
@@ -33,7 +33,7 @@ from urllib.request import Request, urlopen
 
 
 def create_schema(conn: sqlite3.Connection):
-    """Create the SQLite schema for IA items."""
+    """Create the SQLite schema for IA items with chunking support."""
     cursor = conn.cursor()
 
     # Main items table
@@ -63,17 +63,16 @@ def create_schema(conn: sqlite3.Connection):
             collection TEXT,
             quality_score REAL,
             text_filename TEXT,
-            enriched_at TEXT
+            enriched_at TEXT,
+            downloaded_at TEXT,
+            download_failed_at TEXT
         )
     """)
 
-    # Indexes for common queries
+    # Indexes
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_quality ON items(quality_score)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_year ON items(year)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_enriched ON items(enriched_at)")
-    cursor.execute(
-        "CREATE INDEX IF NOT EXISTS idx_text_filename ON items(text_filename) WHERE text_filename IS NOT NULL"
-    )
 
     # Metadata table
     cursor.execute("""
@@ -83,12 +82,18 @@ def create_schema(conn: sqlite3.Connection):
         )
     """)
 
-    # Resume state table
+    # Time chunks tracking table
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS resume_state (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            cursor TEXT,
-            last_batch_at TEXT
+        CREATE TABLE IF NOT EXISTS time_chunks (
+            chunk_id TEXT PRIMARY KEY,
+            year_start INTEGER,
+            year_end INTEGER,
+            month_start INTEGER,
+            month_end INTEGER,
+            expected_items INTEGER,
+            actual_items INTEGER,
+            completed_at TEXT,
+            last_attempted_at TEXT
         )
     """)
 
@@ -108,7 +113,7 @@ def serialize_field(value):
 
 def scrape_batch(query, fields, cursor=None, count=10000, timeout=300):
     """
-    Fetch a batch using IA's Scraping API (cursor-based, no 10k limit).
+    Fetch a batch using IA's Scraping API.
 
     Returns:
         dict with 'items', 'total', 'count', 'cursor' (or None on error)
@@ -123,7 +128,7 @@ def scrape_batch(query, fields, cursor=None, count=10000, timeout=300):
 
     url = f"https://archive.org/services/search/v1/scrape?{urlencode(params)}"
 
-    time.sleep(2)  # Rate limit
+    time.sleep(2)
 
     try:
         req = Request(url, headers={"User-Agent": "TimeCapsuleLLM-Research/1.0"})
@@ -135,7 +140,6 @@ def scrape_batch(query, fields, cursor=None, count=10000, timeout=300):
         return None
 
 
-# Quality collections (same as enrichment)
 QUALITY_COLLECTIONS = {
     "americana": 0.9,
     "library_of_congress": 0.9,
@@ -174,209 +178,205 @@ def calculate_quality_score(collections):
     return best_score
 
 
-def build_index(year_start, year_end, output_dir, batch_size=10000):
+def build_base_query():
+    """Build base query without date range."""
+    return 'mediatype:texts AND language:eng AND (format:DjVu OR format:Text OR format:"Abbyy GZ")'
+
+
+def query_count(year_start, year_end, month_start=None, month_end=None):
     """
-    Build complete IA index for date range using cursor-based scraping.
-    Stores directly to SQLite with resume support.
+    Query IA for item count in a time range.
+
+    Returns:
+        (count, error_message) - count is None on error
     """
-    # Build query
-    query = (
-        f"date:[{year_start} TO {year_end}] "
-        f"AND mediatype:texts "
-        f"AND language:eng "
-        f'AND (format:DjVu OR format:Text OR format:"Abbyy GZ")'
-    )
+    base = build_base_query()
 
-    # Request fields
-    fields = ",".join(
-        [
-            "identifier",
-            "title",
-            "date",
-            "year",
-            "creator",
-            "publisher",
-            "subject",
-            "collection",
-            "description",
-            "format",
-            "imagecount",
-            "downloads",
-            "contributor",
-            "scanner",
-            "rights",
-            "licenseurl",
-            "call_number",
-            "isbn",
-            "issn",
-            "lccn",
-            "publicdate",
-            "addeddate",
-        ]
-    )
+    if month_start and month_end:
+        # Month-level query
+        date_query = f"date:[{year_start:04d}-{month_start:02d} TO {year_end:04d}-{month_end:02d}]"
+    else:
+        # Year-level query
+        date_query = f"date:[{year_start} TO {year_end}]"
 
-    start_time = datetime.now()
+    query = f"{date_query} AND {base}"
 
+    # Use scrape with count=0 to just get total
+    result = scrape_batch(query, "identifier", cursor=None, count=1)
+
+    if not result:
+        return None, "API request failed"
+
+    return result.get("total", 0), None
+
+
+def plan_chunks(year_start, year_end, target_size=100000):
+    """
+    Plan time chunks adaptively based on data density.
+
+    Returns:
+        List of chunk specifications: [{"chunk_id": "...", "year_start": ..., ...}, ...]
+    """
+    print()
     print("=" * 80)
-    print("INTERNET ARCHIVE INDEX BUILDER (SQLite)")
+    print("PLANNING TIME CHUNKS (targeting ~100k items per chunk)")
     print("=" * 80)
-    print(f"Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Date range: {year_start}-{year_end}")
-    print(f"Query: {query}")
     print()
 
-    # Prepare database path
-    index_dir = Path(output_dir) / "metadata"
-    index_dir.mkdir(parents=True, exist_ok=True)
-    db_path = index_dir / f"ia_index_{year_start}_{year_end}.db"
+    chunks = []
+    current_year = year_start
 
-    print(f"Database: {db_path}")
+    while current_year <= year_end:
+        # Try increasingly larger ranges until we hit target or year_end
+        for span in [50, 25, 10, 5, 1]:
+            test_end = min(current_year + span - 1, year_end)
+
+            print(f"  Testing range {current_year}-{test_end}...", end="", flush=True)
+            count, error = query_count(current_year, test_end)
+
+            if error:
+                print(f" ERROR: {error}")
+                continue
+
+            print(f" {count:,} items")
+
+            # If we found a good chunk or hit year_end
+            if count is not None and (count <= target_size or test_end == year_end):
+                chunk = {
+                    "chunk_id": f"{current_year}-{test_end}",
+                    "year_start": current_year,
+                    "year_end": test_end,
+                    "month_start": None,
+                    "month_end": None,
+                    "expected_items": count,
+                }
+                chunks.append(chunk)
+                current_year = test_end + 1
+                break
+
+            # If still too big and span is 1 year, split by month
+            if span == 1 and count is not None and count > target_size:
+                print(f"    Year {current_year} has {count:,} items - splitting by month")
+                # Add monthly chunks for this year
+                for month in range(1, 13):
+                    month_end = month
+                    chunk = {
+                        "chunk_id": f"{current_year}-{month:02d}",
+                        "year_start": current_year,
+                        "year_end": current_year,
+                        "month_start": month,
+                        "month_end": month_end,
+                        "expected_items": None,  # Don't pre-query monthly (too many API calls)
+                    }
+                    chunks.append(chunk)
+                current_year += 1
+                break
+
+    print()
+    print(f"Plan complete: {len(chunks)} chunks")
+    total_expected = sum(c["expected_items"] or 0 for c in chunks)
+    print(f"Expected total: {total_expected:,} items")
     print()
 
-    # Connect to database
-    conn = sqlite3.Connection(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA cache_size=-64000")
+    return chunks
 
-    create_schema(conn)
+
+def infer_completed_chunks(conn: sqlite3.Connection, chunks: list):
+    """
+    Infer which chunks are complete based on existing items in database.
+
+    For chunks with expected_items, mark complete if actual >= 90% of expected.
+    For monthly chunks (no expected), mark complete if count > 0.
+    """
     cursor = conn.cursor()
 
-    # Check for existing data (resume support)
-    cursor.execute("SELECT COUNT(*) FROM items")
-    existing_count = cursor.fetchone()[0]
+    print("Checking existing items against chunk plan...")
+    marked_complete = 0
 
-    cursor.execute("SELECT cursor, last_batch_at FROM resume_state WHERE id = 1")
-    resume_row = cursor.fetchone()
-    resume_cursor = resume_row[0] if resume_row else None
+    for chunk in chunks:
+        year_start = chunk["year_start"]
+        year_end = chunk["year_end"]
+        month_start = chunk.get("month_start")
+        month_end = chunk.get("month_end")
 
-    if existing_count > 0:
-        print(f"RESUMING: Found {existing_count:,} existing items")
-        if resume_cursor:
-            print(f"  Last cursor: {resume_cursor[:50]}...")
-            print(f"  Last batch: {resume_row[1]}")
-        print()
+        # Query actual count
+        if month_start:
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM items
+                WHERE year BETWEEN ? AND ?
+                AND CAST(substr(date, 6, 2) AS INTEGER) BETWEEN ? AND ?
+            """,
+                (year_start, year_end, month_start, month_end),
+            )
+        else:
+            cursor.execute(
+                "SELECT COUNT(*) FROM items WHERE year BETWEEN ? AND ?", (year_start, year_end)
+            )
+
+        actual = cursor.fetchone()[0]
+        expected = chunk.get("expected_items") or 0
+
+        # Mark complete if we have substantial data
+        if expected > 0:
+            threshold = int(expected * 0.9)
+            is_complete = actual >= threshold
+        else:
+            # Monthly chunk with no expected count - assume complete if has any data
+            is_complete = actual > 0
+
+        if is_complete:
+            chunk["completed_at"] = datetime.now().isoformat()
+            chunk["actual_items"] = actual
+            marked_complete += 1
+
+    print(f"  Marked {marked_complete}/{len(chunks)} chunks as complete based on existing data")
+    print()
+    return chunks
+
+
+def scrape_chunk(chunk, conn, fields, batch_size=10000):
+    """
+    Scrape all items for a single time chunk.
+
+    Returns:
+        (items_added, error) - error is None on success
+    """
+    year_start = chunk["year_start"]
+    year_end = chunk["year_end"]
+    month_start = chunk.get("month_start")
+    month_end = chunk.get("month_end")
+
+    # Build query for this chunk
+    base = build_base_query()
+
+    if month_start and month_end:
+        date_query = f"date:[{year_start:04d}-{month_start:02d} TO {year_end:04d}-{month_end:02d}]"
+        chunk_label = f"{year_start}-{month_start:02d}"
     else:
-        # Store metadata for new index
-        cursor.execute(
-            "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
-            ("query", query),
-        )
-        cursor.execute(
-            "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
-            ("date_range_start", str(year_start)),
-        )
-        cursor.execute(
-            "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
-            ("date_range_end", str(year_end)),
-        )
-        cursor.execute(
-            "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
-            ("created_at", datetime.now().isoformat()),
-        )
-        conn.commit()
+        date_query = f"date:[{year_start} TO {year_end}]"
+        chunk_label = f"{year_start}-{year_end}"
 
-    # First request (or resume from cursor)
-    print("Fetching batch to determine total size...")
-    first_batch = scrape_batch(query, fields, cursor=resume_cursor, count=batch_size)
+    query = f"{date_query} AND {base}"
 
-    if not first_batch:
-        print("Failed to fetch batch")
-        return None
+    print(f"  Chunk {chunk_label}: ", end="", flush=True)
 
-    total_found = first_batch.get("total", 0)
-    items = first_batch.get("items", [])
-    next_cursor = first_batch.get("cursor")
+    # Scrape with pagination
+    cursor = None
+    items_added = 0
+    batch_num = 0
 
-    print(f"  Total items in IA: {total_found:,}")
-    print(f"  Already have: {existing_count:,}")
-    print(f"  Remaining: {total_found - existing_count:,}")
-    print(f"  Batch size: {batch_size:,}")
-    print()
-
-    if total_found == 0:
-        print("No items found matching query")
-        return None
-
-    # Insert first batch
-    batch_data = []
-    for item in items:
-        collections = item.get("collection", [])
-        quality_score = calculate_quality_score(collections)
-
-        row = (
-            item.get("identifier"),
-            serialize_field(item.get("title")),
-            serialize_field(item.get("date")),
-            item.get("year"),
-            serialize_field(item.get("creator")),
-            serialize_field(item.get("publisher")),
-            serialize_field(item.get("subject")),
-            serialize_field(item.get("description")),
-            serialize_field(item.get("format")),
-            item.get("imagecount"),
-            item.get("downloads"),
-            serialize_field(item.get("contributor")),
-            serialize_field(item.get("scanner")),
-            serialize_field(item.get("rights")),
-            serialize_field(item.get("licenseurl")),
-            serialize_field(item.get("call_number")),
-            serialize_field(item.get("isbn")),
-            serialize_field(item.get("issn")),
-            serialize_field(item.get("lccn")),
-            serialize_field(item.get("publicdate")),
-            serialize_field(item.get("addeddate")),
-            serialize_field(collections),
-            quality_score,
-            None,  # text_filename
-            None,  # enriched_at
-        )
-        batch_data.append(row)
-
-    cursor.executemany(
-        """
-        INSERT OR IGNORE INTO items (
-            identifier, title, date, year, creator, publisher, subject,
-            description, format, imagecount, downloads, contributor, scanner,
-            rights, licenseurl, call_number, isbn, issn, lccn, publicdate,
-            addeddate, collection, quality_score, text_filename, enriched_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """,
-        batch_data,
-    )
-
-    # Update resume state
-    cursor.execute(
-        "INSERT OR REPLACE INTO resume_state (id, cursor, last_batch_at) VALUES (1, ?, ?)",
-        (next_cursor, datetime.now().isoformat()),
-    )
-
-    conn.commit()
-
-    # Update count
-    cursor.execute("SELECT COUNT(*) FROM items")
-    current_count = cursor.fetchone()[0]
-
-    batch_num = 1
-    batch_start_time = time.time()
-
-    print("Scraping with cursor-based pagination...")
-    print()
-
-    # Continue fetching
-    while next_cursor:
-        batch_num += 1
-        batch = scrape_batch(query, fields, cursor=next_cursor, count=batch_size)
+    while True:
+        batch = scrape_batch(query, fields, cursor=cursor, count=batch_size)
 
         if not batch:
-            print(f"  Failed to fetch batch {batch_num}, stopping")
-            break
+            return items_added, "API request failed"
 
         items = batch.get("items", [])
-        next_cursor = batch.get("cursor")
+        cursor = batch.get("cursor")
+        batch_num += 1
 
         if not items:
-            print(f"  Batch {batch_num} returned 0 items - stopping")
             break
 
         # Insert batch
@@ -411,70 +411,254 @@ def build_index(year_start, year_end, output_dir, batch_size=10000):
                 quality_score,
                 None,
                 None,
+                None,
+                None,
             )
             batch_data.append(row)
 
-        cursor.executemany(
+        db_cursor = conn.cursor()
+        db_cursor.executemany(
             """
             INSERT OR IGNORE INTO items (
                 identifier, title, date, year, creator, publisher, subject,
                 description, format, imagecount, downloads, contributor, scanner,
                 rights, licenseurl, call_number, isbn, issn, lccn, publicdate,
-                addeddate, collection, quality_score, text_filename, enriched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                addeddate, collection, quality_score, text_filename, enriched_at,
+                downloaded_at, download_failed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
             batch_data,
         )
 
-        # Update resume state
-        cursor.execute(
-            "INSERT OR REPLACE INTO resume_state (id, cursor, last_batch_at) VALUES (1, ?, ?)",
-            (next_cursor, datetime.now().isoformat()),
-        )
-
+        items_added += db_cursor.rowcount
         conn.commit()
 
-        # Update count
-        cursor.execute("SELECT COUNT(*) FROM items")
-        current_count = cursor.fetchone()[0]
-
-        # Progress reporting
-        if batch_num % 10 == 0 or batch_num <= 5:
-            pct = current_count / total_found * 100 if total_found > 0 else 0
-            db_size_mb = db_path.stat().st_size / 1024 / 1024
-            remaining = total_found - current_count
-            elapsed = time.time() - batch_start_time
-            rate = (current_count - existing_count) / elapsed if elapsed > 0 else 0
-            eta_sec = remaining / rate if rate > 0 else 0
-            eta_min = eta_sec / 60
-
-            print(
-                f"  Batch {batch_num} - got {len(items)} items - "
-                f"TOTAL: {current_count:,}/{total_found:,} ({pct:.1f}%) - "
-                f"{db_size_mb:.1f} MB - ETA: {eta_min:.0f}m"
-            )
-
-        # Safety: stop if we've gotten everything
-        if current_count >= total_found:
+        if not cursor:
             break
 
+    print(f"{items_added:,} new items")
+    return items_added, None
+
+
+def build_index(year_start, year_end, output_dir, batch_size=10000):
+    """
+    Build complete IA index using adaptive time chunking.
+    """
+    start_time = datetime.now()
+
+    print("=" * 80)
+    print("INTERNET ARCHIVE INDEX BUILDER (Time-Chunked SQLite)")
+    print("=" * 80)
+    print(f"Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Date range: {year_start}-{year_end}")
     print()
-    print(f"✓ Index complete: {current_count:,} items")
 
-    # Final metadata update
+    # Prepare database
+    index_dir = Path(output_dir) / "metadata"
+    index_dir.mkdir(parents=True, exist_ok=True)
+    db_path = index_dir / f"ia_index_{year_start}_{year_end}.db"
+
+    print(f"Database: {db_path}")
+    print()
+
+    # Connect to database
+    conn = sqlite3.Connection(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-64000")
+
+    create_schema(conn)
+    cursor = conn.cursor()
+
+    # Check for existing data
+    cursor.execute("SELECT COUNT(*) FROM items")
+    existing_count = cursor.fetchone()[0]
+
+    if existing_count > 0:
+        print(f"Found {existing_count:,} existing items")
+        print()
+
+    # Store metadata
+    base_query = build_base_query()
+    full_query = f"date:[{year_start} TO {year_end}] AND {base_query}"
+
     cursor.execute(
-        "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
-        ("total_found", str(total_found)),
+        "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)", ("query", full_query)
     )
     cursor.execute(
         "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
-        ("total_exported", str(current_count)),
+        ("date_range_start", str(year_start)),
     )
     cursor.execute(
         "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
-        ("completed_at", datetime.now().isoformat()),
+        ("date_range_end", str(year_end)),
+    )
+    cursor.execute(
+        "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
+        ("created_at", datetime.now().isoformat()),
+    )
+    conn.commit()
+
+    # Fields to request
+    fields = ",".join(
+        [
+            "identifier",
+            "title",
+            "date",
+            "year",
+            "creator",
+            "publisher",
+            "subject",
+            "collection",
+            "description",
+            "format",
+            "imagecount",
+            "downloads",
+            "contributor",
+            "scanner",
+            "rights",
+            "licenseurl",
+            "call_number",
+            "isbn",
+            "issn",
+            "lccn",
+            "publicdate",
+            "addeddate",
+        ]
     )
 
+    # Check if we have a chunk plan
+    cursor.execute("SELECT COUNT(*) FROM time_chunks")
+    has_chunks = cursor.fetchone()[0] > 0
+
+    if has_chunks:
+        print("Existing chunk plan found - resuming")
+        cursor.execute(
+            "SELECT chunk_id, year_start, year_end, month_start, month_end, expected_items, completed_at FROM time_chunks ORDER BY year_start, month_start"
+        )
+        chunks = []
+        for row in cursor.fetchall():
+            chunks.append(
+                {
+                    "chunk_id": row[0],
+                    "year_start": row[1],
+                    "year_end": row[2],
+                    "month_start": row[3],
+                    "month_end": row[4],
+                    "expected_items": row[5],
+                    "completed_at": row[6],
+                }
+            )
+    else:
+        # Plan chunks
+        chunks = plan_chunks(year_start, year_end, target_size=100000)
+
+        # If we have existing items, infer completed chunks
+        if existing_count > 0:
+            chunks = infer_completed_chunks(conn, chunks)
+
+        # Store chunk plan
+        for chunk in chunks:
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO time_chunks
+                (chunk_id, year_start, year_end, month_start, month_end, expected_items, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    chunk["chunk_id"],
+                    chunk["year_start"],
+                    chunk["year_end"],
+                    chunk.get("month_start"),
+                    chunk.get("month_end"),
+                    chunk.get("expected_items"),
+                    chunk.get("completed_at"),
+                ),
+            )
+        conn.commit()
+
+    # Count incomplete chunks
+    incomplete_chunks = [c for c in chunks if not c.get("completed_at")]
+    completed_chunks = len(chunks) - len(incomplete_chunks)
+
+    print(f"Chunk plan: {len(chunks)} total chunks")
+    print(f"  Completed: {completed_chunks}")
+    print(f"  Remaining: {len(incomplete_chunks)}")
+    print()
+
+    if not incomplete_chunks:
+        print("All chunks complete!")
+        cursor.execute("SELECT COUNT(*) FROM items")
+        total_count = cursor.fetchone()[0]
+
+        print()
+        print(f"✓ Index complete: {total_count:,} items")
+        print(f"✓ Database: {db_path}")
+        print(f"✓ Size: {db_path.stat().st_size / 1024 / 1024:.1f} MB")
+        conn.close()
+        return db_path
+
+    print("Scraping incomplete chunks...")
+    print()
+
+    # Process incomplete chunks
+    total_new_items = 0
+    for i, chunk in enumerate(incomplete_chunks):
+        chunk_num = i + 1
+        print(f"[{chunk_num}/{len(incomplete_chunks)}] ", end="")
+
+        items_added, error = scrape_chunk(chunk, conn, fields, batch_size)
+
+        # Update chunk status
+        cursor.execute(
+            """
+            UPDATE time_chunks
+            SET completed_at = ?, actual_items = ?, last_attempted_at = ?
+            WHERE chunk_id = ?
+        """,
+            (
+                datetime.now().isoformat() if not error else None,
+                items_added if not error else None,
+                datetime.now().isoformat(),
+                chunk["chunk_id"],
+            ),
+        )
+        conn.commit()
+
+        if error:
+            print(f"    ERROR: {error}")
+            print()
+            print(f"Chunk {chunk['chunk_id']} failed - state saved for resume")
+            break
+
+        total_new_items += items_added
+
+        # Progress update
+        if chunk_num % 5 == 0 or chunk_num == len(incomplete_chunks):
+            cursor.execute("SELECT COUNT(*) FROM items")
+            current_total = cursor.fetchone()[0]
+            db_size = db_path.stat().st_size / 1024 / 1024
+            print(
+                f"    Progress: {chunk_num}/{len(incomplete_chunks)} chunks - {current_total:,} total items - {db_size:.1f} MB"
+            )
+
+    # Final stats
+    cursor.execute("SELECT COUNT(*) FROM items")
+    final_count = cursor.fetchone()[0]
+
+    print()
+    print(f"✓ Scraping session complete: {total_new_items:,} new items added")
+    print(f"✓ Total items in database: {final_count:,}")
+
+    # Update metadata
+    cursor.execute(
+        "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
+        ("total_items", str(final_count)),
+    )
+    cursor.execute(
+        "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
+        ("last_updated", datetime.now().isoformat()),
+    )
     conn.commit()
 
     # Summary statistics
@@ -491,7 +675,7 @@ def build_index(year_start, year_end, output_dir, batch_size=10000):
 
     if year_range[0]:
         print(f"Year range: {year_range[0]} - {year_range[1]}")
-        print(f"Items with year: {with_year:,} / {current_count:,}")
+        print(f"Items with year: {with_year:,} / {final_count:,}")
     print()
 
     # Quality distribution
@@ -500,7 +684,7 @@ def build_index(year_start, year_end, output_dir, batch_size=10000):
     for threshold in thresholds:
         cursor.execute("SELECT COUNT(*) FROM items WHERE quality_score >= ?", (threshold,))
         count_above = cursor.fetchone()[0]
-        pct = count_above / current_count * 100 if current_count > 0 else 0
+        pct = count_above / final_count * 100 if final_count > 0 else 0
         print(f"  >= {threshold:.2f}: {count_above:7,} items ({pct:5.1f}%)")
 
     print()
@@ -522,7 +706,7 @@ def build_index(year_start, year_end, output_dir, batch_size=10000):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Build IA item index using cursor-based Scraping API (SQLite)",
+        description="Build IA item index using adaptive time chunking (SQLite)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -533,10 +717,10 @@ Examples:
   tc-ia-index --year-start 1800 --year-end 1914 -o /path/to/corpus
 
 Notes:
-  - Builds SQLite database directly (no JSON)
-  - Automatic resume support if interrupted
-  - ~75% smaller than JSON equivalent
-  - Can retrieve ALL 2.3M+ items (no 10k limit)
+  - Adaptive chunking (year or month-level based on density)
+  - Robust resume (continues from incomplete chunks only)
+  - No duplicate scanning on resume
+  - Safe to interrupt at any time
         """,
     )
 
@@ -549,12 +733,10 @@ Notes:
 
     args = parser.parse_args()
 
-    # Validate batch size
     if args.batch_size < 100:
         print("Error: batch-size must be at least 100")
         sys.exit(1)
 
-    # Build index
     result = build_index(args.year_start, args.year_end, args.output, args.batch_size)
 
     if not result:
