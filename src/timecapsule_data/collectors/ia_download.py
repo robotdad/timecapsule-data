@@ -609,7 +609,7 @@ Notes:
     signal.signal(signal.SIGINT, signal_handler)
 
     # Download with workers
-    print("Starting downloads with smart filename discovery...")
+    print("Starting downloads with smart filename discovery and global rate limiter...")
     print()
 
     # Progress monitor thread
