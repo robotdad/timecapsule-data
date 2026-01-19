@@ -30,8 +30,10 @@ import argparse
 import csv
 import json
 import re
+import signal
 import sqlite3
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -50,6 +52,16 @@ FILENAME_PATTERNS = [
     "{identifier}_ocr.txt",
     "{identifier}_hocr_searchtext.txt.gz",
 ]
+
+# Global cancellation event for graceful shutdown
+cancellation_event = threading.Event()
+
+
+def signal_handler(signum, frame):
+    """Handle Ctrl+C gracefully by setting cancellation event."""
+    print("\n\nCancellation requested, finishing current downloads...")
+    print("(This may take a moment as workers complete their current items)")
+    cancellation_event.set()
 
 
 @dataclass
@@ -331,6 +343,39 @@ def download_with_discovery(
         return False, f"save_error: {e}", None
 
 
+def print_interruption_summary(db_path: Path, starting_count: int, items_requested: int):
+    """Print summary when download is interrupted."""
+    conn = sqlite3.Connection(db_path)
+    cursor = conn.cursor()
+
+    # Get current counts
+    cursor.execute("SELECT COUNT(*) FROM items WHERE downloaded_at IS NOT NULL")
+    total_downloaded = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM items WHERE downloaded_at IS NULL")
+    remaining = cursor.fetchone()[0]
+
+    conn.close()
+
+    downloaded_this_run = total_downloaded - starting_count
+
+    print()
+    print("=" * 80)
+    print("INTERRUPTED - DOWNLOADS PAUSED")
+    print("=" * 80)
+    print()
+    print("Progress summary:")
+    print(f"  Downloaded this run: {downloaded_this_run:,}")
+    print(f"  Total in database: {total_downloaded:,}")
+    print(f"  Remaining items: {remaining:,}")
+    print()
+    print("Resume instructions:")
+    print("  Your progress has been saved to the database.")
+    print("  Simply run the same command again to continue downloading.")
+    print("  The tool will automatically skip already-downloaded items.")
+    print()
+
+
 def download_worker(
     items: list,
     output_dir: Path,
@@ -347,6 +392,10 @@ def download_worker(
     }
 
     for identifier, known_filename in items:
+        # Check for cancellation before starting new download
+        if cancellation_event.is_set():
+            break
+
         success, reason, discovered_filename = download_with_discovery(
             identifier, known_filename, output_dir, db_path, rate_limiter
         )
@@ -545,6 +594,9 @@ Notes:
         items_to_download[i : i + chunk_size] for i in range(0, len(items_to_download), chunk_size)
     ]
 
+    # Register signal handler for graceful cancellation
+    signal.signal(signal.SIGINT, signal_handler)
+
     # Download with workers
     print("Starting downloads with smart filename discovery...")
     print()
@@ -565,7 +617,7 @@ Notes:
             conn = sqlite3.Connection(self.db_path)
             cursor = conn.cursor()
 
-            while not self.stop_event.is_set():
+            while not self.stop_event.is_set() and not cancellation_event.is_set():
                 cursor.execute("SELECT COUNT(*) FROM items WHERE downloaded_at IS NOT NULL")
                 current_count = cursor.fetchone()[0]
 
@@ -616,19 +668,25 @@ Notes:
     total_guessed = 0
     total_metadata = 0
 
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = []
-        for worker_id, chunk in enumerate(chunks):
-            future = executor.submit(download_worker, chunk, output_dir, index_path, worker_id)
-            futures.append(future)
+    try:
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = []
+            for worker_id, chunk in enumerate(chunks):
+                future = executor.submit(download_worker, chunk, output_dir, index_path, worker_id)
+                futures.append(future)
 
-        # Collect results
-        for future in as_completed(futures):
-            stats = future.result()
-            total_downloaded += stats["downloaded"]
-            total_failed += stats["failed"]
-            total_guessed += stats["guessed_correct"]
-            total_metadata += stats["needed_metadata"]
+            # Collect results
+            for future in as_completed(futures):
+                stats = future.result()
+                total_downloaded += stats["downloaded"]
+                total_failed += stats["failed"]
+                total_guessed += stats["guessed_correct"]
+                total_metadata += stats["needed_metadata"]
+
+    except KeyboardInterrupt:
+        monitor.stop()
+        print_interruption_summary(index_path, already_downloaded, len(items_to_download))
+        sys.exit(0)
 
     monitor.stop()
 

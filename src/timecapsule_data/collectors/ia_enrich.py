@@ -20,6 +20,7 @@ Features:
 
 import argparse
 import json
+import signal
 import sqlite3
 import sys
 import threading
@@ -51,6 +52,16 @@ QUALITY_COLLECTIONS = {
     "opensource": 0.5,
     "folkscanomy": 0.5,
 }
+
+# Global cancellation event for graceful shutdown
+cancellation_event = threading.Event()
+
+
+def signal_handler(signum, frame):
+    """Handle Ctrl+C gracefully by setting cancellation event."""
+    print("\n\nCancellation requested, finishing current enrichments...")
+    print("(This may take a moment as workers complete their current items)")
+    cancellation_event.set()
 
 
 @dataclass
@@ -153,6 +164,43 @@ def find_text_file(files: list) -> Optional[str]:
     return None
 
 
+def print_interruption_summary(db_path: Path, starting_count: int, items_requested: int):
+    """Print summary when enrichment is interrupted."""
+    conn = sqlite3.Connection(db_path)
+    cursor = conn.cursor()
+
+    # Get current counts
+    cursor.execute("SELECT COUNT(*) FROM items WHERE text_filename IS NOT NULL")
+    total_with_filenames = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM items WHERE enriched_at IS NOT NULL")
+    total_enriched = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM items WHERE enriched_at IS NULL")
+    remaining = cursor.fetchone()[0]
+
+    conn.close()
+
+    enriched_this_run = total_enriched - starting_count
+
+    print()
+    print("=" * 80)
+    print("INTERRUPTED - ENRICHMENT PAUSED")
+    print("=" * 80)
+    print()
+    print("Progress summary:")
+    print(f"  Items enriched this run: {enriched_this_run:,}")
+    print(f"  Total enriched in database: {total_enriched:,}")
+    print(f"  Items with text filenames: {total_with_filenames:,}")
+    print(f"  Remaining items: {remaining:,}")
+    print()
+    print("Resume instructions:")
+    print("  Your progress has been saved to the database.")
+    print("  Simply run the same command again to continue enrichment.")
+    print("  The tool will automatically skip already-enriched items.")
+    print()
+
+
 def enrich_worker(
     identifiers_to_enrich: list,
     db_path: Path,
@@ -172,6 +220,10 @@ def enrich_worker(
     cursor = conn.cursor()
 
     for identifier in identifiers_to_enrich:
+        # Check for cancellation before starting new item
+        if cancellation_event.is_set():
+            break
+
         if not identifier:
             continue
 
@@ -239,7 +291,7 @@ class ProgressMonitor:
         conn = sqlite3.Connection(self.db_path)
         cursor = conn.cursor()
 
-        while not self.stop_event.is_set():
+        while not self.stop_event.is_set() and not cancellation_event.is_set():
             # Count enriched items
             cursor.execute("SELECT COUNT(*) FROM items WHERE enriched_at IS NOT NULL")
             enriched = cursor.fetchone()[0]
@@ -443,6 +495,15 @@ Notes:
         for i in range(0, len(identifiers_to_enrich), chunk_size)
     ]
 
+    # Get starting count for interruption summary
+    cursor.execute("SELECT COUNT(*) FROM items WHERE enriched_at IS NOT NULL")
+    starting_enriched_count = cursor.fetchone()[0]
+
+    conn.close()
+
+    # Register signal handler for graceful cancellation
+    signal.signal(signal.SIGINT, signal_handler)
+
     # Start enrichment
     print("Starting enrichment...")
     lock = threading.Lock()
@@ -455,18 +516,24 @@ Notes:
     total_failed = 0
     total_no_text = 0
 
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = []
-        for worker_id, chunk in enumerate(chunks):
-            future = executor.submit(enrich_worker, chunk, index_path, worker_id, lock)
-            futures.append(future)
+    try:
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = []
+            for worker_id, chunk in enumerate(chunks):
+                future = executor.submit(enrich_worker, chunk, index_path, worker_id, lock)
+                futures.append(future)
 
-        # Collect results
-        for future in as_completed(futures):
-            stats = future.result()
-            total_enriched += stats["enriched"]
-            total_failed += stats["failed"]
-            total_no_text += stats["no_text_file"]
+            # Collect results
+            for future in as_completed(futures):
+                stats = future.result()
+                total_enriched += stats["enriched"]
+                total_failed += stats["failed"]
+                total_no_text += stats["no_text_file"]
+
+    except KeyboardInterrupt:
+        monitor.stop()
+        print_interruption_summary(index_path, starting_enriched_count, len(identifiers_to_enrich))
+        sys.exit(0)
 
     # Stop monitor
     monitor.stop()

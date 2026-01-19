@@ -32,6 +32,7 @@ import argparse
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -41,6 +42,15 @@ from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Optional
+
+# =============================================================================
+# Global Cancellation State
+# =============================================================================
+
+# Global cancellation flag for graceful shutdown
+cancellation_event = threading.Event()
+current_subprocess = None
+
 
 # =============================================================================
 # Configuration
@@ -308,6 +318,69 @@ class CollectionState:
         return timedelta(hours=remaining_hours)
 
 
+def print_exit_summary(state: CollectionState, logger: logging.Logger):
+    """Print detailed summary when pipeline is interrupted."""
+    print()
+    logger.info("=" * 60)
+    logger.info("INTERRUPTED - PIPELINE PAUSED")
+    logger.info("=" * 60)
+    print()
+
+    # Show completed stages
+    if state.stages_completed:
+        logger.info("Completed stages:")
+        for stage_name, info in state.stages_completed.items():
+            duration = format_duration(info.get("duration_seconds", 0))
+            items = info.get("items_completed", 0)
+            bytes_dl = info.get("bytes_downloaded", 0)
+            size_str = f", {format_size(bytes_dl)}" if bytes_dl > 0 else ""
+            errors = info.get("errors", 0)
+            err_str = " [WITH ERRORS]" if errors > 0 else ""
+            logger.info(f"  ✓ {stage_name}: {items} items in {duration}{size_str}{err_str}")
+        print()
+
+    # Show current stage and progress
+    current_stage = state.current_stage
+    if current_stage in state.stages_in_progress:
+        progress_info = state.stages_in_progress[current_stage]
+        logger.info(f"Current stage: {current_stage}")
+        items_completed = progress_info.get("items_completed", 0)
+        items_total = progress_info.get("items_total", 0)
+        if items_total > 0:
+            pct = items_completed / items_total * 100
+            logger.info(f"  Progress: {items_completed}/{items_total} ({pct:.0f}%)")
+        print()
+
+    # Show failed stages
+    failed = state.get_failed_stages()
+    if failed:
+        logger.info("Failed stages (use --retry-failed):")
+        for stage in failed:
+            logger.info(f"  ✗ {stage.value}")
+        print()
+
+    # Time statistics
+    elapsed = state.get_elapsed_time()
+    remaining = state.estimate_remaining_time()
+    logger.info(f"Time elapsed: {format_duration(elapsed.total_seconds())}")
+    logger.info(f"Est. remaining: {format_duration(remaining.total_seconds())}")
+    print()
+
+    # Output location
+    logger.info(f"Output directory: {Config.OUTPUT_BASE}")
+    logger.info(f"State saved to: {Config.state_file()}")
+    print()
+
+    # Resume instructions
+    logger.info("To resume, run:")
+    logger.info("  uv run python scripts/collect_prewwi_corpus.py --resume")
+    if failed:
+        logger.info("To retry failed stages:")
+        logger.info("  uv run python scripts/collect_prewwi_corpus.py --resume --retry-failed")
+    logger.info("=" * 60)
+    print()
+
+
 # =============================================================================
 # Logging Setup
 # =============================================================================
@@ -359,9 +432,9 @@ class ProgressMonitor:
                 count += 1
                 try:
                     size += f.stat().st_size
-                except:
+                except Exception:
                     pass
-        except:
+        except Exception:
             pass
         return count, size
 
@@ -417,6 +490,8 @@ class ProgressMonitor:
 def run_tc_command(
     tool: str, args: list, logger: logging.Logger, monitor: Optional[ProgressMonitor] = None
 ) -> bool:
+    global current_subprocess
+
     cmd = ["uv", "run", tool] + args
     logger.debug(f"Running: {' '.join(cmd)}")
 
@@ -434,7 +509,30 @@ def run_tc_command(
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
 
+        # Store subprocess globally so signal handler can access it
+        current_subprocess = process
+
         for line in iter(process.stdout.readline, ""):
+            # Check for cancellation
+            if cancellation_event.is_set():
+                logger.info("Cancellation requested, terminating subprocess...")
+
+                # Try graceful termination first (SIGTERM)
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # Force kill if still running (SIGKILL)
+                    logger.warning("Subprocess did not terminate gracefully, forcing...")
+                    process.kill()
+                    process.wait()
+
+                if monitor:
+                    monitor.stop()
+
+                current_subprocess = None
+                return False
+
             line = line.rstrip()
             if line:
                 print(f"    {line}")
@@ -442,6 +540,7 @@ def run_tc_command(
                 logger.debug(f"[{tool}] {line}")
 
         process.wait()
+        current_subprocess = None
 
         if monitor:
             monitor.stop()
@@ -450,6 +549,7 @@ def run_tc_command(
 
     except Exception as e:
         logger.error(f"Command error: {e}")
+        current_subprocess = None
         if monitor:
             monitor.stop()
         return False
@@ -1188,6 +1288,27 @@ def run_pipeline(
 
 
 # =============================================================================
+# Signal Handling
+# =============================================================================
+
+
+def signal_handler(signum, frame):
+    """Handle SIGINT (Ctrl+C) gracefully."""
+    global current_subprocess
+
+    # Set cancellation flag
+    cancellation_event.set()
+
+    # If there's a running subprocess, terminate it
+    if current_subprocess:
+        try:
+            current_subprocess.terminate()
+        except Exception:
+            # Suppress any errors during termination
+            pass
+
+
+# =============================================================================
 # Main Entry Point
 # =============================================================================
 
@@ -1200,22 +1321,22 @@ def main():
 Examples:
   # Mini validation run (~5-10 minutes)
   uv run python scripts/collect_prewwi_corpus.py --mode mini
-  
+
   # Full collection (~3-5 days)
   uv run python scripts/collect_prewwi_corpus.py --mode full
-  
+
   # Resume interrupted run
   uv run python scripts/collect_prewwi_corpus.py --resume
-  
+
   # Retry stages that failed
   uv run python scripts/collect_prewwi_corpus.py --resume --retry-failed
-  
+
   # Run/retry a specific stage
   uv run python scripts/collect_prewwi_corpus.py --stage ia_books
-  
+
   # Custom output directory
   uv run python scripts/collect_prewwi_corpus.py --mode full --output /data/corpus
-  
+
   # Check status
   uv run python scripts/collect_prewwi_corpus.py --status
 
@@ -1264,6 +1385,9 @@ Stages: init, gutenberg, ia_index, ia_enrich, ia_download, validate, ocr_clean, 
 
     logger = setup_logging(Config.log_file())
 
+    # Set up signal handler for graceful cancellation
+    signal.signal(signal.SIGINT, signal_handler)
+
     # Handle --stage flag for single stage execution
     if args.stage:
         try:
@@ -1306,9 +1430,10 @@ Stages: init, gutenberg, ia_index, ia_enrich, ia_download, validate, ocr_clean, 
             retry_failed=args.retry_failed,
         )
     except KeyboardInterrupt:
-        print()
-        logger.info("Interrupted. State saved. Use --resume to continue.")
+        # Save state and print detailed summary
         state.save(Config.state_file())
+        print_exit_summary(state, logger)
+        sys.exit(0)  # Clean exit without stack trace
     except Exception as e:
         logger.error(f"Pipeline failed: {e}")
         state.save(Config.state_file())

@@ -22,14 +22,26 @@ Features:
 
 import argparse
 import json
+import signal
 import sqlite3
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+# Global cancellation event for graceful shutdown
+cancellation_event = threading.Event()
+
+
+def signal_handler(signum, frame):
+    """Handle Ctrl+C gracefully by setting cancellation event."""
+    print("\n\nCancellation requested, finishing current chunk...")
+    print("(This may take a moment as the current chunk completes)")
+    cancellation_event.set()
 
 
 def create_schema(conn: sqlite3.Connection):
@@ -440,6 +452,44 @@ def scrape_chunk(chunk, conn, fields, batch_size=10000):
     return items_added, None
 
 
+def print_interruption_summary(db_path: Path, chunks_completed: int, total_chunks: int):
+    """Print summary when index building is interrupted."""
+    conn = sqlite3.Connection(db_path)
+    cursor = conn.cursor()
+
+    # Get current counts
+    cursor.execute("SELECT COUNT(*) FROM items")
+    total_items = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM time_chunks WHERE completed_at IS NOT NULL")
+    completed_chunks = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM time_chunks WHERE completed_at IS NULL")
+    remaining_chunks = cursor.fetchone()[0]
+
+    conn.close()
+
+    print()
+    print("=" * 80)
+    print("INTERRUPTED - INDEX BUILD PAUSED")
+    print("=" * 80)
+    print()
+    print("Progress summary:")
+    print(f"  Chunks completed this run: {chunks_completed}")
+    print(f"  Total items indexed: {total_items:,}")
+    print(f"  Chunks complete: {completed_chunks}/{total_chunks}")
+    print(f"  Chunks remaining: {remaining_chunks}")
+    print()
+    print("Database location:")
+    print(f"  {db_path}")
+    print()
+    print("Resume instructions:")
+    print("  Your progress has been saved to the database.")
+    print("  Simply run the same command again to continue indexing.")
+    print("  The tool will automatically resume from the next incomplete chunk.")
+    print()
+
+
 def build_index(year_start, year_end, output_dir, batch_size=10000):
     """
     Build complete IA index using adaptive time chunking.
@@ -601,46 +651,62 @@ def build_index(year_start, year_end, output_dir, batch_size=10000):
     print("Scraping incomplete chunks...")
     print()
 
+    # Register signal handler for graceful cancellation
+    signal.signal(signal.SIGINT, signal_handler)
+
     # Process incomplete chunks
     total_new_items = 0
-    for i, chunk in enumerate(incomplete_chunks):
-        chunk_num = i + 1
-        print(f"[{chunk_num}/{len(incomplete_chunks)}] ", end="")
+    chunks_completed_this_run = 0
 
-        items_added, error = scrape_chunk(chunk, conn, fields, batch_size)
+    try:
+        for i, chunk in enumerate(incomplete_chunks):
+            # Check for cancellation
+            if cancellation_event.is_set():
+                break
 
-        # Update chunk status
-        cursor.execute(
-            """
-            UPDATE time_chunks
-            SET completed_at = ?, actual_items = ?, last_attempted_at = ?
-            WHERE chunk_id = ?
-        """,
-            (
-                datetime.now().isoformat() if not error else None,
-                items_added if not error else None,
-                datetime.now().isoformat(),
-                chunk["chunk_id"],
-            ),
-        )
-        conn.commit()
+            chunk_num = i + 1
+            print(f"[{chunk_num}/{len(incomplete_chunks)}] ", end="")
 
-        if error:
-            print(f"    ERROR: {error}")
-            print()
-            print(f"Chunk {chunk['chunk_id']} failed - state saved for resume")
-            break
+            items_added, error = scrape_chunk(chunk, conn, fields, batch_size)
 
-        total_new_items += items_added
-
-        # Progress update
-        if chunk_num % 5 == 0 or chunk_num == len(incomplete_chunks):
-            cursor.execute("SELECT COUNT(*) FROM items")
-            current_total = cursor.fetchone()[0]
-            db_size = db_path.stat().st_size / 1024 / 1024
-            print(
-                f"    Progress: {chunk_num}/{len(incomplete_chunks)} chunks - {current_total:,} total items - {db_size:.1f} MB"
+            # Update chunk status
+            cursor.execute(
+                """
+                UPDATE time_chunks
+                SET completed_at = ?, actual_items = ?, last_attempted_at = ?
+                WHERE chunk_id = ?
+            """,
+                (
+                    datetime.now().isoformat() if not error else None,
+                    items_added if not error else None,
+                    datetime.now().isoformat(),
+                    chunk["chunk_id"],
+                ),
             )
+            conn.commit()
+
+            if error:
+                print(f"    ERROR: {error}")
+                print()
+                print(f"Chunk {chunk['chunk_id']} failed - state saved for resume")
+                break
+
+            total_new_items += items_added
+            chunks_completed_this_run += 1
+
+            # Progress update
+            if chunk_num % 5 == 0 or chunk_num == len(incomplete_chunks):
+                cursor.execute("SELECT COUNT(*) FROM items")
+                current_total = cursor.fetchone()[0]
+                db_size = db_path.stat().st_size / 1024 / 1024
+                print(
+                    f"    Progress: {chunk_num}/{len(incomplete_chunks)} chunks - {current_total:,} total items - {db_size:.1f} MB"
+                )
+
+    except KeyboardInterrupt:
+        print_interruption_summary(db_path, chunks_completed_this_run, len(chunks))
+        conn.close()
+        sys.exit(0)
 
     # Final stats
     cursor.execute("SELECT COUNT(*) FROM items")
