@@ -53,6 +53,7 @@ tc-ocr-symspell = "timecapsule_data.utils.ocr_symspell:main"
 tc-ocr-vocab = "timecapsule_data.utils.ocr_vocab:main"
 tc-anachronistic-filter = "timecapsule_data.utils.anachronistic_filter:main"
 tc-quality = "timecapsule_data.utils.quality:main"
+tc-ia-migrate-to-sqlite = "timecapsule_data.utils.migrate_to_sqlite:main"
 
 [project.urls]
 Homepage = "https://github.com/robotdad/timecapsule-data"

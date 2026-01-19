@@ -530,7 +530,7 @@ def stage_ia_index(state: CollectionState, logger: logging.Logger) -> StageProgr
     """Build IA catalog index (Phase 1 - fast, Scraping API)."""
     progress = StageProgress(start_time=datetime.now().isoformat())
 
-    index_file = Config.metadata_dir() / f"ia_index_{Config.YEAR_START}_{Config.CUTOFF_YEAR}.json"
+    index_file = Config.metadata_dir() / f"ia_index_{Config.YEAR_START}_{Config.CUTOFF_YEAR}.db"
 
     # Skip if index already exists
     if index_file.exists():
@@ -573,7 +573,7 @@ def stage_ia_enrich(state: CollectionState, logger: logging.Logger) -> StageProg
     """Enrich IA index with text filenames (Phase 2 - selective, Metadata API)."""
     progress = StageProgress(start_time=datetime.now().isoformat())
 
-    index_file = Config.metadata_dir() / f"ia_index_{Config.YEAR_START}_{Config.CUTOFF_YEAR}.json"
+    index_file = Config.metadata_dir() / f"ia_index_{Config.YEAR_START}_{Config.CUTOFF_YEAR}.db"
 
     if not index_file.exists():
         logger.error(f"IA index not found: {index_file}")
@@ -596,12 +596,15 @@ def stage_ia_enrich(state: CollectionState, logger: logging.Logger) -> StageProg
     success = run_tc_command("tc-ia-enrich", args, logger)
 
     if success:
-        # Count enriched items
-        with open(index_file) as f:
-            import json
+        # Count enriched items from database
+        import sqlite3
 
-            data = json.load(f)
-        enriched = data.get("enrichment_status", {}).get("total_enriched", 0)
+        conn = sqlite3.Connection(index_file)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM items WHERE text_filename IS NOT NULL")
+        enriched = cursor.fetchone()[0]
+        conn.close()
+
         progress.items_completed = enriched
         progress.items_total = enriched
         logger.info(f"IA enrichment complete: {enriched:,} items with filenames")
@@ -620,7 +623,7 @@ def stage_ia_download(state: CollectionState, logger: logging.Logger) -> StagePr
     """Download texts from enriched index (Phase 3 - smart download)."""
     progress = StageProgress(start_time=datetime.now().isoformat())
 
-    index_file = Config.metadata_dir() / f"ia_index_{Config.YEAR_START}_{Config.CUTOFF_YEAR}.json"
+    index_file = Config.metadata_dir() / f"ia_index_{Config.YEAR_START}_{Config.CUTOFF_YEAR}.db"
     output_dir = Config.raw_dir() / "ia"
     gutenberg_meta = Config.raw_dir() / "gutenberg" / "metadata.csv"
 
@@ -631,11 +634,17 @@ def stage_ia_download(state: CollectionState, logger: logging.Logger) -> StagePr
         progress.duration_seconds = 0.1
         return progress
 
-    # Count existing files for resume
-    existing_files = list(output_dir.rglob("*.txt")) if output_dir.exists() else []
-    existing_count = len(existing_files)
+    # Check database for already downloaded count
+    import sqlite3
+
+    conn = sqlite3.Connection(index_file)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM items WHERE downloaded_at IS NOT NULL")
+    existing_count = cursor.fetchone()[0]
+    conn.close()
+
     if existing_count > 0:
-        logger.info(f"Found {existing_count} existing files, will skip already downloaded")
+        logger.info(f"Found {existing_count} already downloaded in database, will skip")
 
     limit = Config.MINI_IA_LIMIT if state.mode == "mini" else 100000
     progress.items_total = limit
@@ -1211,7 +1220,7 @@ Examples:
   # Check status
   uv run python scripts/collect_prewwi_corpus.py --status
 
-Stages: init, gutenberg, ia_books, ia_newspapers, validate, ocr_clean, dedup, finalize
+Stages: init, gutenberg, ia_index, ia_enrich, ia_download, validate, ocr_clean, vocab_extract, vocab_review, dedup, finalize
         """,
     )
 

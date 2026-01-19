@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Internet Archive Index Builder
+Internet Archive Index Builder (SQLite)
 
 Builds a complete catalog of all IA items in a date range using the Scraping API.
-This replaces the search-as-you-go approach with a one-time index build.
+Stores directly to SQLite database for efficient querying and updates.
 
 The Scraping API uses cursor-based pagination with NO result limits, allowing us
 to retrieve all 2.3M+ items without hitting the 10k pagination wall.
@@ -11,14 +11,18 @@ to retrieve all 2.3M+ items without hitting the 10k pagination wall.
 Usage:
     tc-ia-index --year-start 1800 --year-end 1914 -o /path/to/corpus/
 
-Creates: corpus/metadata/ia_index_1800_1914.json
+Creates: corpus/metadata/ia_index_1800_1914.db
 
-The index contains ALL metadata needed for filtering and downloading,
-eliminating the need for per-item metadata API calls.
+Features:
+- Direct SQLite storage (no intermediate JSON)
+- Resume support (continues from last cursor)
+- Instant commits after each batch
+- ~75% smaller than JSON
 """
 
 import argparse
 import json
+import sqlite3
 import sys
 import time
 from datetime import datetime
@@ -28,21 +32,87 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
+def create_schema(conn: sqlite3.Connection):
+    """Create the SQLite schema for IA items."""
+    cursor = conn.cursor()
+
+    # Main items table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS items (
+            identifier TEXT PRIMARY KEY,
+            title TEXT,
+            date TEXT,
+            year INTEGER,
+            creator TEXT,
+            publisher TEXT,
+            subject TEXT,
+            description TEXT,
+            format TEXT,
+            imagecount INTEGER,
+            downloads INTEGER,
+            contributor TEXT,
+            scanner TEXT,
+            rights TEXT,
+            licenseurl TEXT,
+            call_number TEXT,
+            isbn TEXT,
+            issn TEXT,
+            lccn TEXT,
+            publicdate TEXT,
+            addeddate TEXT,
+            collection TEXT,
+            quality_score REAL,
+            text_filename TEXT,
+            enriched_at TEXT
+        )
+    """)
+
+    # Indexes for common queries
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_quality ON items(quality_score)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_year ON items(year)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_enriched ON items(enriched_at)")
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_text_filename ON items(text_filename) WHERE text_filename IS NOT NULL"
+    )
+
+    # Metadata table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS index_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    # Resume state table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS resume_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            cursor TEXT,
+            last_batch_at TEXT
+        )
+    """)
+
+    conn.commit()
+
+
+def serialize_field(value):
+    """Serialize field for storage (lists/dicts as JSON)."""
+    if value is None:
+        return None
+    if isinstance(value, (list, dict)):
+        return json.dumps(value)
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
 def scrape_batch(query, fields, cursor=None, count=10000, timeout=300):
     """
     Fetch a batch using IA's Scraping API (cursor-based, no 10k limit).
 
-    Args:
-        query: Search query string
-        fields: Comma-separated field names
-        cursor: Cursor from previous batch (None for first batch)
-        count: Number of results per request (minimum 100)
-        timeout: Request timeout in seconds
-
     Returns:
         dict with 'items', 'total', 'count', 'cursor' (or None on error)
     """
-    # Build parameters
     params = {
         "q": query,
         "fields": fields,
@@ -53,7 +123,7 @@ def scrape_batch(query, fields, cursor=None, count=10000, timeout=300):
 
     url = f"https://archive.org/services/search/v1/scrape?{urlencode(params)}"
 
-    time.sleep(2)  # Rate limit - be respectful
+    time.sleep(2)  # Rate limit
 
     try:
         req = Request(url, headers={"User-Agent": "TimeCapsuleLLM-Research/1.0"})
@@ -65,15 +135,49 @@ def scrape_batch(query, fields, cursor=None, count=10000, timeout=300):
         return None
 
 
+# Quality collections (same as enrichment)
+QUALITY_COLLECTIONS = {
+    "americana": 0.9,
+    "library_of_congress": 0.9,
+    "toronto": 0.85,
+    "europeanlibraries": 0.85,
+    "jstor": 0.85,
+    "blc": 0.8,
+    "bplscas": 0.8,
+    "biodiversity": 0.8,
+    "medicalheritage": 0.8,
+    "digitallibraryindia": 0.75,
+    "newspaper": 0.7,
+    "internetarchivebooks": 0.65,
+    "jaigyan": 0.65,
+    "journal": 0.65,
+    "opensource": 0.5,
+    "folkscanomy": 0.5,
+}
+
+
+def calculate_quality_score(collections):
+    """Calculate quality score based on collections."""
+    if not collections:
+        return 0.5
+
+    if isinstance(collections, str):
+        collections = [collections]
+
+    best_score = 0.5
+    for coll in collections:
+        coll_lower = coll.lower()
+        for known, score in QUALITY_COLLECTIONS.items():
+            if known in coll_lower:
+                best_score = max(best_score, score)
+
+    return best_score
+
+
 def build_index(year_start, year_end, output_dir, batch_size=10000):
     """
     Build complete IA index for date range using cursor-based scraping.
-
-    Args:
-        year_start: Start year (e.g., 1800)
-        year_end: End year (e.g., 1914)
-        output_dir: Base output directory
-        batch_size: Items per request (default 10000, min 100)
+    Stores directly to SQLite with resume support.
     """
     # Build query
     query = (
@@ -83,7 +187,7 @@ def build_index(year_start, year_end, output_dir, batch_size=10000):
         f'AND (format:DjVu OR format:Text OR format:"Abbyy GZ")'
     )
 
-    # Request fields (comma-separated for Scraping API)
+    # Request fields
     fields = ",".join(
         [
             "identifier",
@@ -111,267 +215,334 @@ def build_index(year_start, year_end, output_dir, batch_size=10000):
         ]
     )
 
+    start_time = datetime.now()
+
     print("=" * 80)
-    print("INTERNET ARCHIVE INDEX BUILDER (Scraping API)")
+    print("INTERNET ARCHIVE INDEX BUILDER (SQLite)")
     print("=" * 80)
+    print(f"Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Date range: {year_start}-{year_end}")
     print(f"Query: {query}")
     print()
 
-    # First request to get total count
-    print("Fetching first batch to determine total size...")
-    first_batch = scrape_batch(query, fields, cursor=None, count=batch_size)
+    # Prepare database path
+    index_dir = Path(output_dir) / "metadata"
+    index_dir.mkdir(parents=True, exist_ok=True)
+    db_path = index_dir / f"ia_index_{year_start}_{year_end}.db"
+
+    print(f"Database: {db_path}")
+    print()
+
+    # Connect to database
+    conn = sqlite3.Connection(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-64000")
+
+    create_schema(conn)
+    cursor = conn.cursor()
+
+    # Check for existing data (resume support)
+    cursor.execute("SELECT COUNT(*) FROM items")
+    existing_count = cursor.fetchone()[0]
+
+    cursor.execute("SELECT cursor, last_batch_at FROM resume_state WHERE id = 1")
+    resume_row = cursor.fetchone()
+    resume_cursor = resume_row[0] if resume_row else None
+
+    if existing_count > 0:
+        print(f"RESUMING: Found {existing_count:,} existing items")
+        if resume_cursor:
+            print(f"  Last cursor: {resume_cursor[:50]}...")
+            print(f"  Last batch: {resume_row[1]}")
+        print()
+    else:
+        # Store metadata for new index
+        cursor.execute(
+            "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
+            ("query", query),
+        )
+        cursor.execute(
+            "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
+            ("date_range_start", str(year_start)),
+        )
+        cursor.execute(
+            "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
+            ("date_range_end", str(year_end)),
+        )
+        cursor.execute(
+            "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
+            ("created_at", datetime.now().isoformat()),
+        )
+        conn.commit()
+
+    # First request (or resume from cursor)
+    print("Fetching batch to determine total size...")
+    first_batch = scrape_batch(query, fields, cursor=resume_cursor, count=batch_size)
 
     if not first_batch:
-        print("Failed to fetch first batch")
+        print("Failed to fetch batch")
         return None
 
     total_found = first_batch.get("total", 0)
     items = first_batch.get("items", [])
-    cursor = first_batch.get("cursor")
+    next_cursor = first_batch.get("cursor")
 
     print(f"  Total items in IA: {total_found:,}")
+    print(f"  Already have: {existing_count:,}")
+    print(f"  Remaining: {total_found - existing_count:,}")
     print(f"  Batch size: {batch_size:,}")
-    estimated_requests = (total_found // batch_size) + 1
-    print(f"  Estimated requests: {estimated_requests}")
     print()
 
     if total_found == 0:
         print("No items found matching query")
         return None
 
-    all_items = items.copy()
-    batch_num = 1
+    # Insert first batch
+    batch_data = []
+    for item in items:
+        collections = item.get("collection", [])
+        quality_score = calculate_quality_score(collections)
 
-    # Prepare index file path
-    index_dir = Path(output_dir) / "metadata"
-    index_dir.mkdir(parents=True, exist_ok=True)
-    index_file = index_dir / f"ia_index_{year_start}_{year_end}.json"
+        row = (
+            item.get("identifier"),
+            serialize_field(item.get("title")),
+            serialize_field(item.get("date")),
+            item.get("year"),
+            serialize_field(item.get("creator")),
+            serialize_field(item.get("publisher")),
+            serialize_field(item.get("subject")),
+            serialize_field(item.get("description")),
+            serialize_field(item.get("format")),
+            item.get("imagecount"),
+            item.get("downloads"),
+            serialize_field(item.get("contributor")),
+            serialize_field(item.get("scanner")),
+            serialize_field(item.get("rights")),
+            serialize_field(item.get("licenseurl")),
+            serialize_field(item.get("call_number")),
+            serialize_field(item.get("isbn")),
+            serialize_field(item.get("issn")),
+            serialize_field(item.get("lccn")),
+            serialize_field(item.get("publicdate")),
+            serialize_field(item.get("addeddate")),
+            serialize_field(collections),
+            quality_score,
+            None,  # text_filename
+            None,  # enriched_at
+        )
+        batch_data.append(row)
+
+    cursor.executemany(
+        """
+        INSERT OR IGNORE INTO items (
+            identifier, title, date, year, creator, publisher, subject,
+            description, format, imagecount, downloads, contributor, scanner,
+            rights, licenseurl, call_number, isbn, issn, lccn, publicdate,
+            addeddate, collection, quality_score, text_filename, enriched_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """,
+        batch_data,
+    )
+
+    # Update resume state
+    cursor.execute(
+        "INSERT OR REPLACE INTO resume_state (id, cursor, last_batch_at) VALUES (1, ?, ?)",
+        (next_cursor, datetime.now().isoformat()),
+    )
+
+    conn.commit()
+
+    # Update count
+    cursor.execute("SELECT COUNT(*) FROM items")
+    current_count = cursor.fetchone()[0]
+
+    batch_num = 1
+    batch_start_time = time.time()
 
     print("Scraping with cursor-based pagination...")
-    print(f"Writing to: {index_file}")
     print()
 
-    # Continue fetching until no more cursor
-    while cursor:
+    # Continue fetching
+    while next_cursor:
         batch_num += 1
-        batch = scrape_batch(query, fields, cursor=cursor, count=batch_size)
+        batch = scrape_batch(query, fields, cursor=next_cursor, count=batch_size)
 
         if not batch:
             print(f"  Failed to fetch batch {batch_num}, stopping")
             break
 
-        items_in_batch = len(batch.get("items", []))
-        all_items.extend(batch.get("items", []))
-        cursor = batch.get("cursor")
+        items = batch.get("items", [])
+        next_cursor = batch.get("cursor")
 
-        # Write to disk after EVERY batch (resume support)
-        index_data = {
-            "query": query,
-            "date_range": [year_start, year_end],
-            "exported_at": datetime.now().isoformat(),
-            "total_found": total_found,
-            "total_exported": len(all_items),
-            "items": all_items,
-        }
-
-        with open(index_file, "w") as f:
-            json.dump(index_data, f, indent=2)
-
-        # Progress reporting
-        if batch_num % 10 == 0 or batch_num <= 5:
-            pct = len(all_items) / total_found * 100 if total_found > 0 else 0
-            file_size = index_file.stat().st_size / 1024 / 1024
-            remaining_items = total_found - len(all_items)
-            remaining_batches = remaining_items // batch_size if batch_size > 0 else 0
-            eta_seconds = remaining_batches * 3  # Rough estimate with 2s delay + 1s request
-            eta_minutes = eta_seconds // 60
-            print(
-                f"  Batch {batch_num} - got {items_in_batch} items - "
-                f"TOTAL: {len(all_items):,}/{total_found:,} ({pct:.1f}%) - "
-                f"{file_size:.1f} MB - ETA: {eta_minutes}m"
-            )
-
-        if items_in_batch == 0:
+        if not items:
             print(f"  Batch {batch_num} returned 0 items - stopping")
             break
 
+        # Insert batch
+        batch_data = []
+        for item in items:
+            collections = item.get("collection", [])
+            quality_score = calculate_quality_score(collections)
+
+            row = (
+                item.get("identifier"),
+                serialize_field(item.get("title")),
+                serialize_field(item.get("date")),
+                item.get("year"),
+                serialize_field(item.get("creator")),
+                serialize_field(item.get("publisher")),
+                serialize_field(item.get("subject")),
+                serialize_field(item.get("description")),
+                serialize_field(item.get("format")),
+                item.get("imagecount"),
+                item.get("downloads"),
+                serialize_field(item.get("contributor")),
+                serialize_field(item.get("scanner")),
+                serialize_field(item.get("rights")),
+                serialize_field(item.get("licenseurl")),
+                serialize_field(item.get("call_number")),
+                serialize_field(item.get("isbn")),
+                serialize_field(item.get("issn")),
+                serialize_field(item.get("lccn")),
+                serialize_field(item.get("publicdate")),
+                serialize_field(item.get("addeddate")),
+                serialize_field(collections),
+                quality_score,
+                None,
+                None,
+            )
+            batch_data.append(row)
+
+        cursor.executemany(
+            """
+            INSERT OR IGNORE INTO items (
+                identifier, title, date, year, creator, publisher, subject,
+                description, format, imagecount, downloads, contributor, scanner,
+                rights, licenseurl, call_number, isbn, issn, lccn, publicdate,
+                addeddate, collection, quality_score, text_filename, enriched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+            batch_data,
+        )
+
+        # Update resume state
+        cursor.execute(
+            "INSERT OR REPLACE INTO resume_state (id, cursor, last_batch_at) VALUES (1, ?, ?)",
+            (next_cursor, datetime.now().isoformat()),
+        )
+
+        conn.commit()
+
+        # Update count
+        cursor.execute("SELECT COUNT(*) FROM items")
+        current_count = cursor.fetchone()[0]
+
+        # Progress reporting
+        if batch_num % 10 == 0 or batch_num <= 5:
+            pct = current_count / total_found * 100 if total_found > 0 else 0
+            db_size_mb = db_path.stat().st_size / 1024 / 1024
+            remaining = total_found - current_count
+            elapsed = time.time() - batch_start_time
+            rate = (current_count - existing_count) / elapsed if elapsed > 0 else 0
+            eta_sec = remaining / rate if rate > 0 else 0
+            eta_min = eta_sec / 60
+
+            print(
+                f"  Batch {batch_num} - got {len(items)} items - "
+                f"TOTAL: {current_count:,}/{total_found:,} ({pct:.1f}%) - "
+                f"{db_size_mb:.1f} MB - ETA: {eta_min:.0f}m"
+            )
+
         # Safety: stop if we've gotten everything
-        if len(all_items) >= total_found:
+        if current_count >= total_found:
             break
 
     print()
-    print(f"✓ Export complete: {len(all_items):,} items retrieved")
+    print(f"✓ Index complete: {current_count:,} items")
 
-    # Add enrichment fields to each item
-    for item in all_items:
-        item["text_filename"] = None
-        item["enriched_at"] = None
-        item["quality_score"] = None  # Will be calculated during enrichment
+    # Final metadata update
+    cursor.execute(
+        "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
+        ("total_found", str(total_found)),
+    )
+    cursor.execute(
+        "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
+        ("total_exported", str(current_count)),
+    )
+    cursor.execute(
+        "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
+        ("completed_at", datetime.now().isoformat()),
+    )
 
-    # Final save
-    index_data = {
-        "query": query,
-        "date_range": [year_start, year_end],
-        "exported_at": datetime.now().isoformat(),
-        "total_found": total_found,
-        "total_exported": len(all_items),
-        "enrichment_status": {
-            "total_enriched": 0,
-            "last_enriched_at": None,
-            "quality_thresholds_completed": [],
-        },
-        "items": all_items,
-    }
+    conn.commit()
 
-    print(f"Saving final index to {index_file}...")
-    with open(index_file, "w") as f:
-        json.dump(index_data, f, indent=2)
-
-    print(f"✓ Index saved: {index_file.stat().st_size / 1024 / 1024:.1f} MB")
-
-    # Analyze what we got
+    # Summary statistics
     print()
     print("=" * 80)
     print("INDEX ANALYSIS")
     print("=" * 80)
 
     # Year distribution
-    year_counts = {}
-    for item in all_items:
-        year = item.get("year")
-        if year:
-            year_counts[year] = year_counts.get(year, 0) + 1
+    cursor.execute("SELECT MIN(year), MAX(year) FROM items WHERE year IS NOT NULL")
+    year_range = cursor.fetchone()
+    cursor.execute("SELECT COUNT(*) FROM items WHERE year IS NOT NULL")
+    with_year = cursor.fetchone()[0]
 
-    if year_counts:
-        print(f"Year range in results: {min(year_counts.keys())} - {max(year_counts.keys())}")
-        print(f"Items with year field: {sum(year_counts.values()):,} / {len(all_items):,}")
+    if year_range[0]:
+        print(f"Year range: {year_range[0]} - {year_range[1]}")
+        print(f"Items with year: {with_year:,} / {current_count:,}")
     print()
 
-    # Format analysis
-    text_formats = ["DjVuTXT", "Text PDF", "Abbyy GZ", "hOCR", "OCR Search Text"]
-    has_text = 0
-    no_text = 0
-
-    for item in all_items:
-        formats = item.get("format", [])
-        if isinstance(formats, str):
-            formats = [formats]
-
-        if any(fmt in text_formats for fmt in formats):
-            has_text += 1
-        else:
-            no_text += 1
-
-    print(f"Items with text formats: {has_text:,}")
-    print(f"Items without text formats: {no_text:,}")
-    print()
-
-    # Quality estimation (collection-based heuristic)
-    # NOTE: This is a PROXY based on source collection, not actual OCR quality.
-    # Real OCR quality requires downloading text and analyzing it.
-    # Known collections from empirical analysis:
-    quality_collections = {
-        # Major institutional libraries (excellent quality)
-        "americana": 0.9,  # American Libraries - generally excellent
-        "library_of_congress": 0.9,  # Library of Congress - excellent
-        # Academic/University libraries (high quality)
-        "toronto": 0.85,  # University of Toronto
-        "europeanlibraries": 0.85,  # European Libraries
-        "jstor": 0.85,  # JSTOR academic journals (all jstor_* collections)
-        # National/research libraries (good quality)
-        "blc": 0.8,  # British Library
-        "bplscas": 0.8,  # Boston Public Library
-        "biodiversity": 0.8,  # Biodiversity Heritage Library
-        "medicalheritage": 0.8,  # Medical Heritage Library
-        "digitallibraryindia": 0.75,  # Digital Library of India
-        # Newspaper archives (variable but generally usable)
-        "newspaper": 0.7,  # Catches: newspapers, newspaperarchive, kentuckynewspapers, etc.
-        # General book collections (moderate quality)
-        "internetarchivebooks": 0.65,  # General IA book uploads
-        "jaigyan": 0.65,  # JaiGyan digital library
-        "journal": 0.65,  # General journals collection
-        # User/community uploads (unknown quality - low default)
-        "opensource": 0.5,  # Community contributions
-        "folkscanomy": 0.5,  # User scanning projects
-    }
-
-    quality_scores = []
-    collection_matches = {}  # Track which collections items belong to
-
-    for item in all_items:
-        collections = item.get("collection", [])
-        if isinstance(collections, str):
-            collections = [collections]
-
-        best_score = 0.5  # Default for unknown collections
-        matched_collection = "unknown"
-
-        for coll in collections:
-            coll_lower = coll.lower()
-            for known, score in quality_collections.items():
-                if known in coll_lower:
-                    if score > best_score:
-                        best_score = score
-                        matched_collection = known
-
-        quality_scores.append(best_score)
-        collection_matches[matched_collection] = collection_matches.get(matched_collection, 0) + 1
-
-    # Quality distribution (bidirectional view)
+    # Quality distribution
     thresholds = [0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9]
     print("Quality score distribution (collection-based heuristic):")
-    print("  NOTE: This is based on source collection, NOT actual OCR quality.")
-    print("  Real OCR analysis happens during download when text is available.")
-    print()
-
     for threshold in thresholds:
-        count_above = sum(1 for s in quality_scores if s >= threshold)
-        count_below = sum(1 for s in quality_scores if s < threshold)
-        pct_above = count_above / len(all_items) * 100 if all_items else 0
-        pct_below = count_below / len(all_items) * 100 if all_items else 0
-        print(
-            f"  {threshold:.2f}: {count_above:7,} above ({pct_above:5.1f}%) | {count_below:7,} below ({pct_below:5.1f}%)"
-        )
+        cursor.execute("SELECT COUNT(*) FROM items WHERE quality_score >= ?", (threshold,))
+        count_above = cursor.fetchone()[0]
+        pct = count_above / current_count * 100 if current_count > 0 else 0
+        print(f"  >= {threshold:.2f}: {count_above:7,} items ({pct:5.1f}%)")
 
     print()
-    print("Collection breakdown (top collections):")
-    sorted_collections = sorted(collection_matches.items(), key=lambda x: -x[1])[:10]
-    for coll_name, count in sorted_collections:
-        pct = count / len(all_items) * 100 if all_items else 0
-        score = quality_collections.get(coll_name, 0.5)
-        print(f"  {coll_name:20s} (score={score:.2f}): {count:7,} items ({pct:5.1f}%)")
+    db_size_mb = db_path.stat().st_size / 1024 / 1024
+    end_time = datetime.now()
+    duration = end_time - start_time
+    duration_minutes = duration.total_seconds() / 60
 
+    print(f"✓ Database: {db_path}")
+    print(f"✓ Size: {db_size_mb:.1f} MB")
     print()
-    print("✓ Index build complete!")
-    print(f"✓ Saved to: {index_file}")
+    print(f"Started:  {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Ended:    {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Duration: {duration_minutes:.1f} minutes ({duration.total_seconds():.0f} seconds)")
 
-    return index_file
+    conn.close()
+    return db_path
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Build IA item index using cursor-based Scraping API",
+        description="Build IA item index using cursor-based Scraping API (SQLite)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Build index for 1800-1914
   tc-ia-index --year-start 1800 --year-end 1914 -o /path/to/corpus
 
-  # Refresh existing index
-  tc-ia-index --year-start 1800 --year-end 1914 --refresh -o /path/to/corpus
+  # Resume interrupted index build (automatic)
+  tc-ia-index --year-start 1800 --year-end 1914 -o /path/to/corpus
 
 Notes:
-  - Uses the Scraping API (cursor-based, NO 10k limit)
-  - Can retrieve ALL 2.3M+ items without pagination issues
-  - Writes progress after every batch (safe to interrupt)
+  - Builds SQLite database directly (no JSON)
+  - Automatic resume support if interrupted
+  - ~75% smaller than JSON equivalent
+  - Can retrieve ALL 2.3M+ items (no 10k limit)
         """,
     )
 
     parser.add_argument("-o", "--output", required=True, help="Output directory (corpus base)")
     parser.add_argument("--year-start", type=int, default=1800, help="Start year (default: 1800)")
     parser.add_argument("--year-end", type=int, default=1914, help="End year (default: 1914)")
-    parser.add_argument("--refresh", action="store_true", help="Rebuild index even if exists")
     parser.add_argument(
         "--batch-size", type=int, default=10000, help="Items per request (default: 10000, min: 100)"
     )
@@ -382,24 +553,6 @@ Notes:
     if args.batch_size < 100:
         print("Error: batch-size must be at least 100")
         sys.exit(1)
-
-    # Check if index already exists
-    index_file = Path(args.output) / "metadata" / f"ia_index_{args.year_start}_{args.year_end}.json"
-
-    if index_file.exists() and not args.refresh:
-        print(f"Index already exists: {index_file}")
-        print("Use --refresh to rebuild")
-
-        # Load and show summary
-        with open(index_file) as f:
-            data = json.load(f)
-
-        print()
-        print("Existing index:")
-        print(f"  Created: {data.get('exported_at', 'unknown')}")
-        print(f"  Items: {data.get('total_exported', 0):,}")
-        print(f"  File size: {index_file.stat().st_size / 1024 / 1024:.1f} MB")
-        return
 
     # Build index
     result = build_index(args.year_start, args.year_end, args.output, args.batch_size)

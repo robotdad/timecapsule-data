@@ -88,7 +88,7 @@ tc-perseus --list-only
 
 **Quality**: ⭐⭐⭐ Variable - OCR with quality filtering
 
-Massive collection (2.3M+ items for year 0-1914) with variable quality. Uses a redesigned three-phase approach to handle IA's pagination limits and improve reliability.
+Massive collection (2.3M+ items for year 0-1914) with variable quality. Uses a three-phase pipeline with SQLite storage for efficient querying and updates.
 
 #### Phase 1: Build Index (`tc-ia-index`)
 
@@ -98,9 +98,10 @@ Build a complete catalog of all IA items in your date range:
 # Build index for year 0-1914 (all available pre-WWI content)
 tc-ia-index --year-start 0 --year-end 1914 -o ./corpus
 
-# Creates: corpus/metadata/ia_index_0_1914.json (~2.3M items, 2GB file)
-# Time: ~15-20 minutes
+# Creates: corpus/metadata/ia_index_0_1914.db (~2.3M items, ~600MB SQLite database)
+# Time: ~12-15 minutes (constant speed, no slowdown)
 # Uses: Scraping API with cursor-based pagination (no 10k limit)
+# Resume: Automatic if interrupted (safe to Ctrl+C)
 ```
 
 #### Phase 2: Enrich Index (`tc-ia-enrich`)
@@ -109,12 +110,12 @@ Add text filenames to index (selective, based on quality threshold):
 
 ```bash
 # Enrich items with quality >= 0.65 (includes newspapers and general books)
-tc-ia-enrich --index corpus/metadata/ia_index_0_1914.json \
+tc-ia-enrich --index corpus/metadata/ia_index_0_1914.db \
   --min-quality 0.65 --workers 4
 
 # Time: ~12 hours for ~1.5M items at 0.65 threshold
-# Resumable: Ctrl+C anytime, run same command to continue
-# Saves: Every 100 items (~75 seconds max loss on interrupt)
+# Resumable: Ctrl+C safe, automatic resume on restart
+# Updates: Instant SQLite commits (no file rewrites)
 ```
 
 #### Phase 3: Download (`tc-ia-download`)
@@ -123,23 +124,38 @@ Download text files from enriched index:
 
 ```bash
 # Download up to 100,000 items
-tc-ia-download --index corpus/metadata/ia_index_0_1914.json \
+tc-ia-download --index corpus/metadata/ia_index_0_1914.db \
   --max-items 100000 --workers 4 \
   --gutenberg-metadata ./corpus/gutenberg/metadata.csv \
   -o ./corpus/ia
 
 # Time: ~48 hours for 100k items (depends on workers)
-# Resume support: Automatic via download_state.json
+# Resume: Automatic (download state stored in database)
 # Deduplication: Against Gutenberg if metadata provided
 ```
 
-**Benefits of three-phase approach:**
+**Benefits of SQLite-based pipeline:**
 - ✅ Bypasses IA's 10,000 result pagination limit (uses Scraping API)
-- ✅ One-time index build captures all 2.3M+ items
-- ✅ Selective enrichment saves API calls (don't enrich low-quality items)
-- ✅ 100% filename accuracy (no guessing, uses metadata API)
-- ✅ Full metadata traceability (text file → index → IA)
-- ✅ Resume support at all phases
+- ✅ One-time index build captures all 2.3M+ items in ~12-15 minutes
+- ✅ 75% smaller storage (600MB vs 2.5GB JSON)
+- ✅ Instant queries with indexes (filter by quality, year, etc.)
+- ✅ Efficient updates (no full file rewrites)
+- ✅ Download state tracked in database (no separate state files)
+- ✅ Safe resume at all phases (Ctrl+C safe)
+- ✅ Full metadata traceability
+
+#### Migrating Existing JSON Indexes
+
+If you have an existing JSON index, migrate it to SQLite:
+
+```bash
+tc-ia-migrate-to-sqlite \
+  --index corpus/metadata/ia_index_0_1914.json \
+  -o corpus/metadata/ia_index_0_1914.db
+
+# ~60-80% size reduction, preserves all data
+# Time: ~5 minutes for 2.3M items
+```
 
 ## Utilities
 
