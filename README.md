@@ -84,11 +84,11 @@ tc-perseus --languages grc,lat,eng -o ./perseus-with-translations
 tc-perseus --list-only
 ```
 
-### Internet Archive (Three-Phase Pipeline)
+### Internet Archive (Two-Phase Pipeline)
 
 **Quality**: ⭐⭐⭐ Variable - OCR with quality filtering
 
-Massive collection (2.3M+ items for year 0-1914) with variable quality. Uses a three-phase pipeline with SQLite storage for efficient querying and updates.
+Massive collection (2.3M+ items for year 0-1914) with variable quality. Uses a streamlined two-phase pipeline with SQLite storage and smart filename discovery.
 
 #### Phase 1: Build Index (`tc-ia-index`)
 
@@ -98,51 +98,53 @@ Build a complete catalog of all IA items in your date range:
 # Build index for year 0-1914 (all available pre-WWI content)
 tc-ia-index --year-start 0 --year-end 1914 -o ./corpus
 
-# Creates: corpus/metadata/ia_index_0_1914.db (~2.3M items, ~600MB SQLite database)
-# Time: ~12-15 minutes (constant speed, no slowdown)
-# Uses: Scraping API with cursor-based pagination (no 10k limit)
-# Resume: Automatic if interrupted (safe to Ctrl+C)
+# Creates: corpus/metadata/ia_index_0_1914.db (~2.3M items, ~2.5GB SQLite database)
+# Time: ~40-45 minutes with time-chunked scraping
+# Uses: Adaptive time chunking (robust resume, no duplicate scanning)
+# Resume: Automatic from incomplete chunks (safe to Ctrl+C)
 ```
 
-#### Phase 2: Enrich Index (`tc-ia-enrich`)
+#### Phase 2: Download (`tc-ia-download`)
 
-Add text filenames to index (selective, based on quality threshold):
-
-```bash
-# Enrich items with quality >= 0.65 (includes newspapers and general books)
-tc-ia-enrich --index corpus/metadata/ia_index_0_1914.db \
-  --min-quality 0.65 --workers 4
-
-# Time: ~12 hours for ~1.5M items at 0.65 threshold
-# Resumable: Ctrl+C safe, automatic resume on restart
-# Updates: Instant SQLite commits (no file rewrites)
-```
-
-#### Phase 3: Download (`tc-ia-download`)
-
-Download text files from enriched index:
+Download text files with smart filename discovery:
 
 ```bash
-# Download up to 100,000 items
+# Download all eligible items (quality >= 0.65, pages >= 10)
 tc-ia-download --index corpus/metadata/ia_index_0_1914.db \
-  --max-items 100000 --workers 4 \
+  --workers 6 \
   --gutenberg-metadata ./corpus/gutenberg/metadata.csv \
   -o ./corpus/ia
 
-# Time: ~48 hours for 100k items (depends on workers)
-# Resume: Automatic (download state stored in database)
+# Time: ~12-18 days for ~1.5M items (depends on workers and IA rate limits)
+# Smart discovery: Tries common filename patterns (85-100% success)
+# Fallback: Calls metadata API only when guesses fail
+# Resume: Automatic (download state in database)
+# Order: Oldest to newest (complete epochs if interrupted)
 # Deduplication: Against Gutenberg if metadata provided
 ```
 
-**Benefits of SQLite-based pipeline:**
+**Optional: Pre-enrichment for Known Filenames**
+
+If you want to pre-fetch filenames before downloading (not required):
+
+```bash
+tc-ia-enrich --index corpus/metadata/ia_index_0_1914.db \
+  --min-quality 0.65 --workers 4
+
+# Time: ~12-20 hours for ~1.5M items
+# Benefit: Slightly faster downloads (skips guessing)
+# Trade-off: Adds upfront time, but download discovers during fetch anyway
+```
+
+**Benefits of streamlined pipeline:**
 - ✅ Bypasses IA's 10,000 result pagination limit (uses Scraping API)
-- ✅ One-time index build captures all 2.3M+ items in ~12-15 minutes
-- ✅ 75% smaller storage (600MB vs 2.5GB JSON)
+- ✅ Time-chunked indexing with robust resume (~40 min for 2.3M items)
+- ✅ Smart filename discovery eliminates 3-week enrichment bottleneck
 - ✅ Instant queries with indexes (filter by quality, year, etc.)
-- ✅ Efficient updates (no full file rewrites)
 - ✅ Download state tracked in database (no separate state files)
+- ✅ Chronological downloads (oldest to newest for complete epochs)
 - ✅ Safe resume at all phases (Ctrl+C safe)
-- ✅ Full metadata traceability
+- ✅ 85-100% filename guess rate (minimal metadata API calls)
 
 #### Migrating Existing JSON Indexes
 
@@ -153,7 +155,7 @@ tc-ia-migrate-to-sqlite \
   --index corpus/metadata/ia_index_0_1914.json \
   -o corpus/metadata/ia_index_0_1914.db
 
-# ~60-80% size reduction, preserves all data
+# Preserves all data
 # Time: ~5 minutes for 2.3M items
 ```
 
