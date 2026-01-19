@@ -142,7 +142,6 @@ STAGE_ORDER = [
     Stage.INIT,
     Stage.GUTENBERG,
     Stage.IA_INDEX,
-    Stage.IA_ENRICH,
     Stage.IA_DOWNLOAD,
     Stage.VALIDATE,
     Stage.OCR_CLEAN,
