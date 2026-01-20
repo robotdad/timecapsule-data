@@ -24,9 +24,9 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Try to import dictionary for unknown word detection
+# Try to import dictionary for unknown word detection (optional)
 try:
-    import enchant
+    import enchant  # type: ignore[import-not-found]
 
     DICT = enchant.Dict("en_US")
     HAS_ENCHANT = True
@@ -358,57 +358,206 @@ def format_output(
 
 def cmd_extract(args):
     """Extract vocabulary candidates from corpus."""
+    import fnmatch
+    import os
+    import signal
+    import time
+
     input_dir = Path(args.input_dir)
+    interrupted = False
 
-    if not HAS_ENCHANT:
+    def handle_interrupt(signum, frame):
+        nonlocal interrupted
+        if interrupted:
+            print("\n\nForce quit.", file=sys.stderr)
+            sys.exit(1)
+        interrupted = True
+        print("\n\nInterrupted! Processing collected data...", file=sys.stderr)
+
+    old_handler = signal.signal(signal.SIGINT, handle_interrupt)
+
+    try:
+        # Try to use Rust for speed
+        rust_available = False
+        rust_extract_batch = None
+        try:
+            import rust_ocr_clean  # type: ignore[import-not-found]
+
+            rust_extract_batch = rust_ocr_clean.extract_vocab_batch
+            rust_available = True
+        except ImportError:
+            print("Note: Rust module not available, using Python (slower)", file=sys.stderr)
+
+        if not HAS_ENCHANT:
+            print(
+                "Warning: pyenchant not available, all words will be marked as unknown",
+                file=sys.stderr,
+            )
+
+        # Fast file discovery
+        print(f"Scanning {input_dir} for {args.pattern} files...", end="", flush=True)
+
+        def fast_find_files(directory: Path, pattern: str) -> list[Path]:
+            results = []
+            dirs_to_scan = [directory]
+            scanned = 0
+            while dirs_to_scan:
+                current_dir = dirs_to_scan.pop()
+                try:
+                    with os.scandir(current_dir) as it:
+                        for entry in it:
+                            if entry.is_dir(follow_symlinks=False):
+                                dirs_to_scan.append(Path(entry.path))
+                            elif entry.is_file() and fnmatch.fnmatch(entry.name, pattern):
+                                results.append(Path(entry.path))
+                except PermissionError:
+                    continue
+                scanned += 1
+                if scanned % 500 == 0:
+                    print(".", end="", flush=True)
+            return results
+
+        files = fast_find_files(input_dir, args.pattern)
+        total_files = len(files)
+        print(f" found {total_files:,} files", file=sys.stderr)
+
+        if total_files == 0:
+            print(f"No files matching '{args.pattern}' found in {input_dir}", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"\n{'=' * 60}", file=sys.stderr)
         print(
-            "Warning: pyenchant not available, all words will be marked as unknown", file=sys.stderr
+            f"Vocabulary Extraction - {'Rust' if rust_available else 'Python'} engine",
+            file=sys.stderr,
         )
+        print(f"{'=' * 60}", file=sys.stderr)
+        print(f"  Files to process: {total_files:,}", file=sys.stderr)
+        print(f"{'=' * 60}\n", file=sys.stderr)
 
-    # Find all text files
-    files = list(input_dir.rglob(args.pattern))
-    total_files = len(files)
+        candidates: dict[str, VocabCandidate] = {}
+        total_words = 0
+        start_time = time.time()
 
-    if total_files == 0:
-        print(f"No files matching '{args.pattern}' found in {input_dir}", file=sys.stderr)
-        sys.exit(1)
+        if rust_available and rust_extract_batch is not None:
+            # Process in batches with Rust
+            batch_size = 500
+            for batch_start in range(0, total_files, batch_size):
+                if interrupted:
+                    break
 
-    print(f"Processing {total_files} files...", file=sys.stderr)
+                batch_end = min(batch_start + batch_size, total_files)
+                batch_files = [str(f) for f in files[batch_start:batch_end]]
 
-    candidates: dict[str, VocabCandidate] = {}
-    total_words = 0
+                batch_words, batch_results = rust_extract_batch(batch_files, args.context_chars)
+                total_words += batch_words
 
-    for i, file_path in enumerate(files, 1):
-        if i % 500 == 0 or i == total_files:
-            print(f"  Progress: {i}/{total_files} ({i / total_files * 100:.0f}%)", file=sys.stderr)
+                # Merge batch results into candidates
+                for word_lower, (
+                    word,
+                    count,
+                    is_cap,
+                    is_susp,
+                    reason,
+                    context,
+                ) in batch_results.items():
+                    if word_lower in candidates:
+                        c = candidates[word_lower]
+                        c.frequency += count
+                        if is_cap:
+                            c.is_capitalized = True
+                            if not c.word[0].isupper():
+                                c.word = word
+                    else:
+                        candidates[word_lower] = VocabCandidate(
+                            word=word,
+                            frequency=count,
+                            contexts=[context] if context else [],
+                            is_capitalized=is_cap,
+                            is_unknown=not is_known_word(word),
+                            is_suspicious=is_susp,
+                            suspicious_reason=reason,
+                        )
 
-        total_words += process_file(
-            file_path,
+                # Progress update
+                elapsed = time.time() - start_time
+                files_done = batch_end
+                files_per_sec = files_done / elapsed if elapsed > 0 else 0
+                pct = (files_done / total_files) * 100
+                remaining = (total_files - files_done) / files_per_sec if files_per_sec > 0 else 0
+
+                if remaining >= 3600:
+                    eta = f"{remaining / 3600:.1f}h"
+                elif remaining >= 60:
+                    eta = f"{remaining / 60:.1f}m"
+                else:
+                    eta = f"{remaining:.0f}s"
+
+                # Count candidates meeting frequency threshold
+                above_threshold = sum(
+                    1 for c in candidates.values() if c.frequency >= args.min_freq
+                )
+
+                print(
+                    f"  [{pct:5.1f}%] {files_done:,}/{total_files:,} files | "
+                    f"{files_per_sec:.1f} files/s | ETA: {eta} | "
+                    f"vocab: {above_threshold:,}",
+                    file=sys.stderr,
+                )
+        else:
+            # Fall back to Python
+            for i, file_path in enumerate(files, 1):
+                if interrupted:
+                    break
+
+                if i % 500 == 0 or i == total_files:
+                    elapsed = time.time() - start_time
+                    files_per_sec = i / elapsed if elapsed > 0 else 0
+                    pct = (i / total_files) * 100
+                    print(
+                        f"  [{pct:5.1f}%] {i:,}/{total_files:,} files | "
+                        f"{files_per_sec:.1f} files/s | unique: {len(candidates):,}",
+                        file=sys.stderr,
+                    )
+
+                total_words += process_file(
+                    file_path,
+                    candidates,
+                    context_chars=args.context_chars,
+                    max_contexts=args.max_contexts,
+                )
+
+        elapsed = time.time() - start_time
+        print(f"\n{'=' * 60}", file=sys.stderr)
+        if interrupted:
+            print("INTERRUPTED - showing partial results", file=sys.stderr)
+        else:
+            print("COMPLETE", file=sys.stderr)
+        print(f"{'=' * 60}", file=sys.stderr)
+        print(f"  Time elapsed: {elapsed:.1f}s", file=sys.stderr)
+        print(f"  Total words processed: {total_words:,}", file=sys.stderr)
+        print(f"  Unique candidates: {len(candidates):,}", file=sys.stderr)
+
+        # Filter by frequency
+        above_threshold = sum(1 for c in candidates.values() if c.frequency >= args.min_freq)
+        print(f"  Candidates >= {args.min_freq} occurrences: {above_threshold:,}", file=sys.stderr)
+        print(f"{'=' * 60}", file=sys.stderr)
+
+        # Generate output
+        output = format_output(
             candidates,
-            context_chars=args.context_chars,
-            max_contexts=args.max_contexts,
+            min_freq=args.min_freq,
+            output_format=args.format,
+            show_known=args.show_known,
         )
 
-    print(f"\nTotal words processed: {total_words:,}", file=sys.stderr)
-    print(f"Unique candidates: {len(candidates):,}", file=sys.stderr)
+        if args.output:
+            Path(args.output).write_text(output, encoding="utf-8")
+            print(f"\nOutput written to: {args.output}", file=sys.stderr)
+        else:
+            print(output)
 
-    # Filter by frequency
-    above_threshold = sum(1 for c in candidates.values() if c.frequency >= args.min_freq)
-    print(f"Candidates >= {args.min_freq} occurrences: {above_threshold:,}", file=sys.stderr)
-
-    # Generate output
-    output = format_output(
-        candidates,
-        min_freq=args.min_freq,
-        output_format=args.format,
-        show_known=args.show_known,
-    )
-
-    if args.output:
-        Path(args.output).write_text(output, encoding="utf-8")
-        print(f"\nOutput written to: {args.output}", file=sys.stderr)
-    else:
-        print(output)
+    finally:
+        signal.signal(signal.SIGINT, old_handler)
 
 
 def cmd_simplify(args):

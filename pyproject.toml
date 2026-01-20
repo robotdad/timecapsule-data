@@ -26,7 +26,12 @@ dependencies = [
     "internetarchive>=4.0.0",
     "datasketch>=1.6.0",
     "xxhash>=3.0.0",
+    "rust-ocr-clean",
+    "pyenchant>=3.3.0",
 ]
+
+[tool.uv.sources]
+rust-ocr-clean = { path = "rust-ocr-clean" }
 
 [project.optional-dependencies]
 dev = [

@@ -342,39 +342,181 @@ def clean_batch(
     input_dir: Path,
     output_dir: Optional[Path] = None,
     file_pattern: str = "*.txt",
+    use_rust: bool = True,
 ) -> CleanupStats:
-    """Clean all text files in a directory."""
+    """
+    Clean all text files in a directory.
+
+    Uses Rust for file I/O when available (much faster).
+    Single-threaded for clean Ctrl+C handling.
+    """
+    import signal
+    import sys
+    import time
+
     stats = CleanupStats()
+    interrupted = False
 
-    input_files = list(input_dir.glob(f"**/{file_pattern}"))
-    stats.total_files = len(input_files)
+    def handle_interrupt(signum, frame):
+        nonlocal interrupted
+        if interrupted:
+            # Second Ctrl+C - force exit
+            print("\n\nForce quit.", file=sys.stderr)
+            sys.exit(1)
+        interrupted = True
+        print("\n\nInterrupted! Finishing current file, then stopping...", file=sys.stderr)
 
-    print(f"Processing {stats.total_files} files...")
+    # Set up clean interrupt handling
+    old_handler = signal.signal(signal.SIGINT, handle_interrupt)
 
-    for i, input_path in enumerate(input_files, 1):
-        if i % 100 == 0:
-            print(f"  Progress: {i}/{stats.total_files}")
+    try:
+        # Try to import Rust module
+        rust_available = False
+        rust_clean_file = None  # Will hold the Rust function if available
+        if use_rust:
+            try:
+                import rust_ocr_clean  # type: ignore[import-not-found]
 
-        if output_dir:
-            relative = input_path.relative_to(input_dir)
-            output_path = output_dir / relative
+                rust_clean_file = rust_ocr_clean.clean_file_to_file
+                rust_available = True
+            except ImportError:
+                print("Note: Rust module not available, using Python (slower)")
+
+        # Discover files using os.scandir (faster than glob)
+        print(f"Scanning {input_dir} for {file_pattern} files...", end="", flush=True)
+
+        import fnmatch
+        import os
+
+        def fast_find_files(directory: Path, pattern: str) -> list[Path]:
+            """Fast recursive file discovery using os.scandir."""
+            results = []
+            dirs_to_scan = [directory]
+            scanned = 0
+
+            while dirs_to_scan:
+                current_dir = dirs_to_scan.pop()
+                try:
+                    with os.scandir(current_dir) as it:
+                        for entry in it:
+                            if entry.is_dir(follow_symlinks=False):
+                                dirs_to_scan.append(Path(entry.path))
+                            elif entry.is_file() and fnmatch.fnmatch(entry.name, pattern):
+                                results.append(Path(entry.path))
+                except PermissionError:
+                    continue
+
+                scanned += 1
+                if scanned % 500 == 0:
+                    print(".", end="", flush=True)
+
+            return results
+
+        input_files = fast_find_files(input_dir, file_pattern)
+        stats.total_files = len(input_files)
+        print(f" found {stats.total_files:,} files")
+
+        if stats.total_files == 0:
+            print("No files found.")
+            return stats
+
+        # Skip upfront size calculation - we'll track as we go
+        print("(Size will be calculated during processing)")
+
+        print(f"\n{'=' * 60}")
+        print(f"OCR Cleanup - {'Rust' if rust_available else 'Python'} engine")
+        print(f"{'=' * 60}")
+        print(f"  Files to process: {stats.total_files:,}")
+        print(f"  Output: {output_dir or 'in-place'}")
+        print(f"{'=' * 60}\n")
+
+        start_time = time.time()
+        bytes_processed = 0
+        last_update = start_time
+        i = 0  # Track progress even if loop is empty or interrupted
+
+        for i, input_path in enumerate(input_files, 1):
+            if interrupted:
+                break
+
+            if output_dir:
+                relative = input_path.relative_to(input_dir)
+                output_path = output_dir / relative
+            else:
+                output_path = input_path  # in-place
+
+            try:
+                if rust_available and rust_clean_file is not None:
+                    # Use Rust for all file I/O (fast!)
+                    was_modified, sub_count, file_bytes = rust_clean_file(
+                        str(input_path), str(output_path)
+                    )
+                    bytes_processed += file_bytes
+                    garbage = []  # Skip garbage check for speed
+                else:
+                    # Fall back to Python
+                    was_modified, sub_count, garbage = clean_file(input_path, output_path, stats)
+                    bytes_processed += input_path.stat().st_size
+
+                if was_modified:
+                    stats.files_modified += 1
+                    stats.total_substitutions += sub_count
+
+                if garbage:
+                    stats.files_flagged += 1
+                    stats.flagged_files.append({"file": str(input_path), "issues": garbage})
+
+            except Exception as e:
+                print(f"\n  Error processing {input_path}: {e}", file=sys.stderr)
+                continue
+
+            # Progress update every 2 seconds or every 500 files
+            now = time.time()
+            if now - last_update >= 2.0 or i % 500 == 0:
+                elapsed = now - start_time
+                files_per_sec = i / elapsed if elapsed > 0 else 0
+                mb_per_sec = (bytes_processed / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                remaining = (stats.total_files - i) / files_per_sec if files_per_sec > 0 else 0
+
+                # Format remaining time
+                if remaining >= 3600:
+                    eta = f"{remaining / 3600:.1f}h"
+                elif remaining >= 60:
+                    eta = f"{remaining / 60:.1f}m"
+                else:
+                    eta = f"{remaining:.0f}s"
+
+                pct = (i / stats.total_files) * 100
+                print(
+                    f"  [{pct:5.1f}%] {i:,}/{stats.total_files:,} files | "
+                    f"{files_per_sec:.1f} files/s | {mb_per_sec:.1f} MB/s | "
+                    f"ETA: {eta} | subs: {stats.total_substitutions:,}"
+                )
+                last_update = now
+
+        # Final stats
+        elapsed = time.time() - start_time
+        files_per_sec = stats.total_files / elapsed if elapsed > 0 else 0
+        mb_per_sec = (bytes_processed / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+
+        print(f"\n{'=' * 60}")
+        if interrupted:
+            print(f"INTERRUPTED after {i:,} of {stats.total_files:,} files")
         else:
-            output_path = None
+            print("COMPLETE")
+        print(f"{'=' * 60}")
+        print(f"  Files processed: {i:,}")
+        print(f"  Files modified:  {stats.files_modified:,}")
+        print(f"  Substitutions:   {stats.total_substitutions:,}")
+        print(f"  Time elapsed:    {elapsed:.1f}s")
+        print(f"  Throughput:      {files_per_sec:.1f} files/s, {mb_per_sec:.1f} MB/s")
+        if stats.files_flagged > 0:
+            print(f"  Files flagged:   {stats.files_flagged:,} (garbage patterns)")
+        print(f"{'=' * 60}")
 
-        was_modified, sub_count, garbage = clean_file(input_path, output_path, stats)
-
-        if was_modified:
-            stats.files_modified += 1
-            stats.total_substitutions += sub_count
-
-        if garbage:
-            stats.files_flagged += 1
-            stats.flagged_files.append(
-                {
-                    "file": str(input_path),
-                    "issues": garbage,
-                }
-            )
+    finally:
+        # Restore original signal handler
+        signal.signal(signal.SIGINT, old_handler)
 
     return stats
 
