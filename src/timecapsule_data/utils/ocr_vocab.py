@@ -238,7 +238,8 @@ def process_file(
         if key not in candidates:
             candidate = VocabCandidate(word=word)
             candidate.is_capitalized = word[0].isupper()
-            candidate.is_unknown = not is_known_word(word)
+            # Skip dictionary lookup - too slow, filter by suspicious instead
+            candidate.is_unknown = True
             suspicious, reason = is_suspicious(word)
             candidate.is_suspicious = suspicious
             candidate.suspicious_reason = reason
@@ -468,12 +469,14 @@ def cmd_extract(args):
                             if not c.word[0].isupper():
                                 c.word = word
                     else:
+                        # Skip dictionary lookup in hot path - too slow
+                        # is_unknown will be set in post-processing if needed
                         candidates[word_lower] = VocabCandidate(
                             word=word,
                             frequency=count,
                             contexts=[context] if context else [],
                             is_capitalized=is_cap,
-                            is_unknown=not is_known_word(word),
+                            is_unknown=True,  # Default to unknown, filter by suspicious instead
                             is_suspicious=is_susp,
                             suspicious_reason=reason,
                         )
