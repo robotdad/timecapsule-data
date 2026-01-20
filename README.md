@@ -346,6 +346,68 @@ tc-ocr-clean batch ./corpus/ia -o ./corpus/ia-cleaned --report ocr-fixes.json
 Note: Gutenberg texts are human-proofread and typically don't need OCR cleanup.
 Perseus texts are scholarly editions, also high quality.
 
+## OCR Cleanup - Rust Engine
+
+The OCR cleanup tool uses a high-performance Rust engine (`rust-ocr-clean`) for pattern matching and text substitution. This provides **~50x speedup** over the original pure-Python regex implementation.
+
+### Performance
+
+| Metric | Python (original) | Rust Engine |
+|--------|-------------------|-------------|
+| Throughput | ~0.4 MB/s | ~20 MB/s |
+| 325k files | ~250 hours | ~5 hours |
+| Pattern matching | Sequential regex | Compiled regex set |
+
+### Pattern Categories
+
+The Rust engine includes 150+ OCR correction patterns:
+
+| Category | Examples | Count |
+|----------|----------|-------|
+| **Long-s artifacts** | `fuch→such`, `faid→said`, `himfelf→himself` | ~50 |
+| **li/h confusion** | `tlie→the`, `wliich→which`, `cliild→child` | ~40 |
+| **ll→U confusion** | `pubUc→public`, `fuUy→fully`, `WiUiam→William` | ~75 |
+| **Google watermarks** | `Digitized by Google`, `byGoogle`, `OOglC` | ~10 |
+| **Anachronisms** | `google`, `internet`, `website` (removed) | ~5 |
+
+### Context-Dependent Patterns
+
+Some patterns are ambiguous and tracked separately for human review:
+
+| Pattern | Ambiguity | Occurrences |
+|---------|-----------|-------------|
+| `HaUe` | Halle (German) vs Have vs Hall | 12k+ |
+| `publick` | Historical spelling vs OCR error | ~100 |
+| `shew` | Historical "show" vs OCR error | ~120 |
+| `lie` | Valid word vs `he` OCR error | 1.7k+ |
+
+Use `count_context_patterns()` to identify these for special processing:
+
+```python
+import rust_ocr_clean
+
+counts = rust_ocr_clean.count_context_patterns_batch(file_paths)
+# Returns: {"HaUe_ambiguous": 523, "publick": 42, ...}
+```
+
+### Building from Source
+
+The Rust extension requires Rust toolchain:
+
+```bash
+# Install Rust (if needed)
+# Linux/macOS: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# Windows: winget install Rustlang.Rustup
+
+# Build and install
+cd rust-ocr-clean
+pip install maturin
+maturin build --release
+pip install target/wheels/rust_ocr_clean-*.whl
+```
+
+Or let `uv sync` handle it automatically (builds from source on first install).
+
 ### Step 4: Deduplicate Across Sources
 
 ```bash
