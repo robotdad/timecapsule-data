@@ -352,11 +352,18 @@ The OCR cleanup tool uses a high-performance Rust engine (`rust-ocr-clean`) for 
 
 ### Performance
 
+Benchmarked on Windows 11, Ryzen 5950X, 64GB RAM, Samsung 970 EVO NVMe:
+
 | Metric | Python (original) | Rust Engine |
 |--------|-------------------|-------------|
-| Throughput | ~0.4 MB/s | ~20 MB/s |
-| 325k files | ~250 hours | ~5 hours |
-| Pattern matching | Sequential regex | Compiled regex set |
+| Throughput | ~0.4 MB/s | **13.9 MB/s** |
+| 325k files | ~250 hours | **4.9 hours** |
+| Speedup | baseline | **~35x faster** |
+
+Real-world results on 325,642 Internet Archive texts:
+- **143.9 million** substitutions applied
+- **99.5%** of files had OCR errors corrected
+- **~442** substitutions per file average
 
 ### Pattern Categories
 
