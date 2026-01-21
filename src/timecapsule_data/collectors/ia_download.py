@@ -35,7 +35,7 @@ import sqlite3
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -159,14 +159,27 @@ def signal_handler(signum, frame):
 
 @dataclass
 class RateLimiter:
-    """Adaptive rate limiter - starts slow, backs off on errors."""
+    """
+    Adaptive rate limiter for shared use across multiple workers.
+
+    Tuned for parallel downloads where transient errors from any single worker
+    shouldn't punish all workers. Key design choices:
+
+    - 429 (rate limit): Immediate backoff - server explicitly said slow down
+    - Other errors (503, timeout): Only back off after consecutive failures,
+      tolerating transient issues that affect individual workers
+    - Recovery: Faster than backoff to avoid getting stuck at max_delay
+    """
 
     base_delay: float = 2.0
     current_delay: float = 2.0
     max_delay: float = 60.0
     min_delay: float = 0.5
-    backoff_factor: float = 2.0
-    success_speedup: float = 0.9
+    backoff_factor: float = 1.5  # Less aggressive for transient errors
+    rate_limit_factor: float = 3.0  # More aggressive for explicit 429s
+    success_speedup: float = 0.95  # 5% speedup per threshold
+    successes_for_speedup: int = 5  # Recover faster with shared limiter
+    errors_before_backoff: int = 3  # Tolerate transient failures
     consecutive_successes: int = 0
     consecutive_errors: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
@@ -180,7 +193,7 @@ class RateLimiter:
         with self._lock:
             self.consecutive_successes += 1
             self.consecutive_errors = 0
-            if self.consecutive_successes >= 10:
+            if self.consecutive_successes >= self.successes_for_speedup:
                 self.current_delay = max(self.min_delay, self.current_delay * self.success_speedup)
                 self.consecutive_successes = 0
 
@@ -189,10 +202,13 @@ class RateLimiter:
             self.consecutive_errors += 1
             self.consecutive_successes = 0
             if is_rate_limit:
+                # 429 = explicit "slow down" signal - always respect immediately
                 self.current_delay = min(
-                    self.max_delay, self.current_delay * self.backoff_factor * 2
+                    self.max_delay, self.current_delay * self.rate_limit_factor
                 )
-            else:
+            elif self.consecutive_errors >= self.errors_before_backoff:
+                # Other errors: only back off after multiple consecutive failures
+                # This tolerates transient 503s/timeouts from individual workers
                 self.current_delay = min(self.max_delay, self.current_delay * self.backoff_factor)
 
 
@@ -744,15 +760,44 @@ Notes:
                 future = executor.submit(download_worker, chunk, output_dir, db_writer, worker_id)
                 futures.append(future)
 
-            # Collect results
-            for future in as_completed(futures):
-                stats = future.result()
-                total_downloaded += stats["downloaded"]
-                total_failed += stats["failed"]
-                total_guessed += stats["guessed_correct"]
-                total_metadata += stats["needed_metadata"]
+            # Collect results, with periodic status during cancellation
+            completed_futures = set()
+            last_status_time = time.time()
+            status_interval = 30.0  # Print status every 30 seconds during shutdown
+
+            while len(completed_futures) < len(futures):
+                # Check for newly completed futures (non-blocking with short timeout)
+                for future in futures:
+                    if future in completed_futures:
+                        continue
+                    if future.done():
+                        completed_futures.add(future)
+                        stats = future.result()
+                        total_downloaded += stats["downloaded"]
+                        total_failed += stats["failed"]
+                        total_guessed += stats["guessed_correct"]
+                        total_metadata += stats["needed_metadata"]
+
+                # During cancellation, print periodic status
+                if cancellation_event.is_set():
+                    now = time.time()
+                    if now - last_status_time >= status_interval:
+                        active_workers = len(futures) - len(completed_futures)
+                        print(
+                            f"  Still waiting for {active_workers} worker(s) to finish "
+                            f"(current rate limit delay: {global_rate_limiter.current_delay:.1f}s)..."
+                        )
+                        last_status_time = now
+
+                # Small sleep to avoid busy-waiting
+                time.sleep(0.5)
 
     except KeyboardInterrupt:
+        # Second Ctrl+C during shutdown
+        pass
+
+    # Handle graceful cancellation
+    if cancellation_event.is_set():
         monitor.stop()
         print("Waiting for pending database writes to complete...")
         db_writer.stop(timeout=30.0)
