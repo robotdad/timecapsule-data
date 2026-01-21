@@ -35,6 +35,7 @@ corpus/
 test_corpus_*/
 *.txt
 !README.md
+!src/timecapsule_data/data/known_vocab.txt
 
 # Metadata files (can be large)
 metadata.json

@@ -5,6 +5,13 @@ OCR Cleanup Module
 Repairs common OCR errors in historical texts. This goes beyond filtering -
 it actually attempts to fix recognizable error patterns.
 
+Pipeline order:
+1. Language detection (skip non-English documents)
+2. Whitespace normalization (strip trailing, collapse multiples)
+3. Hyphen rejoining (fix line-break hyphenation)
+4. Mid-word uppercase normalization (sVo -> svo)
+5. OCR substitutions (pattern-based fixes)
+
 Common OCR errors in 19th century texts:
 - 'tbe' -> 'the'
 - 'arid' -> 'and'
@@ -33,6 +40,220 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+# =============================================================================
+# Common English words for language detection
+# These are high-frequency English words unlikely to appear in other languages
+# Includes small function words that appear even in lists/directories
+# =============================================================================
+ENGLISH_MARKER_WORDS = {
+    # Articles and prepositions (appear even in lists)
+    "the",
+    "a",
+    "an",
+    "of",
+    "to",
+    "in",
+    "on",
+    "at",
+    "by",
+    "for",
+    "with",
+    "from",
+    "into",
+    "than",
+    "as",
+    # Conjunctions
+    "and",
+    "or",
+    "but",
+    "not",
+    # Pronouns
+    "it",
+    "he",
+    "she",
+    "they",
+    "you",
+    "we",
+    "this",
+    "that",
+    "which",
+    "who",
+    "what",
+    "his",
+    "her",
+    "its",
+    "their",
+    "him",
+    "them",
+    # Common verbs
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "have",
+    "has",
+    "had",
+    "do",
+    "did",
+    "will",
+    "would",
+    "could",
+    "should",
+    "can",
+    "may",
+    "made",
+    "make",
+    # Other common words
+    "there",
+    "when",
+    "where",
+    "more",
+    "other",
+    "these",
+    "after",
+    "two",
+    "over",
+    "such",
+    "through",
+    "also",
+    "new",
+    "any",
+    "all",
+}
+
+
+# =============================================================================
+# Preprocessing Functions (applied before OCR substitutions)
+# =============================================================================
+
+
+def detect_language(text: str, sample_size: int = 500) -> tuple[bool, float]:
+    """
+    Detect if text is primarily English.
+
+    Args:
+        text: The text to analyze
+        sample_size: Number of words to sample for detection
+
+    Returns:
+        (is_english, confidence) - is_english is True if >40% English markers found
+    """
+    # Extract words (simple tokenization)
+    words = re.findall(r"\b[a-zA-Z]{2,}\b", text.lower())
+
+    if len(words) < 20:
+        # Too short to determine, assume English
+        return True, 0.0
+
+    # Sample if text is long
+    if len(words) > sample_size:
+        import random
+
+        words = random.sample(words, sample_size)
+
+    # Count English marker words
+    english_count = sum(1 for w in words if w in ENGLISH_MARKER_WORDS)
+    ratio = english_count / len(words)
+
+    # English text typically has 20-40% marker words (with expanded list)
+    # Non-English will have <5%
+    # Threshold of 10% with minimum count catches most cases
+    # Even lists/directories hit 15%+ due to "of", "and", "for"
+    is_english = ratio > 0.10 and english_count >= 5
+
+    return is_english, ratio
+
+
+def normalize_whitespace(text: str) -> tuple[str, int]:
+    """
+    Normalize whitespace in text. Run BEFORE hyphen rejoining.
+
+    - Strip trailing whitespace from lines (important for hyphen detection)
+    - Collapse multiple spaces to single space
+    - Normalize line endings to \n
+    - Remove spaces around hyphens at line ends
+
+    Returns:
+        (normalized_text, count_of_changes)
+    """
+    changes = 0
+
+    # Normalize line endings first
+    if "\r\n" in text:
+        text = text.replace("\r\n", "\n")
+        changes += 1
+    if "\r" in text:
+        text = text.replace("\r", "\n")
+        changes += 1
+
+    # Strip trailing whitespace from each line (critical for hyphen detection)
+    lines = text.split("\n")
+    stripped_lines = []
+    for line in lines:
+        stripped = line.rstrip()
+        if stripped != line:
+            changes += 1
+        stripped_lines.append(stripped)
+    text = "\n".join(stripped_lines)
+
+    # Collapse multiple spaces to single (but not at line start - preserve indentation)
+    original = text
+    text = re.sub(r"([^ \n]) {2,}", r"\1 ", text)
+    if text != original:
+        changes += text.count("  ")  # Rough count
+
+    return text, changes
+
+
+def rejoin_hyphenated(text: str) -> tuple[str, int]:
+    """
+    Rejoin words split by end-of-line hyphenation.
+
+    Pattern: word-fragment + hyphen + newline + lowercase continuation
+    Example: "de-\npendance" -> "dependance"
+
+    Must run AFTER normalize_whitespace (to handle "word- \n" patterns).
+
+    Returns:
+        (rejoined_text, count_of_rejoins)
+    """
+    # Pattern: letters, hyphen, newline, optional whitespace, lowercase letters
+    # Only rejoin if continuation starts lowercase (indicates word continuation)
+    pattern = r"([a-zA-Z]{2,})-\n\s*([a-z]{2,})\b"
+
+    count = len(re.findall(pattern, text))
+    if count > 0:
+        text = re.sub(pattern, r"\1\2", text)
+
+    return text, count
+
+
+def normalize_midword_caps(text: str) -> tuple[str, int]:
+    """
+    Fix OCR errors where a letter is incorrectly uppercase mid-word.
+
+    Pattern: lowercase-UPPERCASE-lowercase in middle of word
+    Examples: sVo -> svo, tRe -> tre, lVs -> lvs
+
+    These are never intentional in normal text.
+
+    Returns:
+        (normalized_text, count_of_fixes)
+    """
+    # Pattern: lowercase letter followed by uppercase followed by lowercase
+    # This catches mid-word caps that are clearly OCR errors
+    pattern = r"(?<=[a-z])([A-Z])(?=[a-z])"
+
+    count = len(re.findall(pattern, text))
+    if count > 0:
+        text = re.sub(pattern, lambda m: m.group(1).lower(), text)
+
+    return text, count
+
 
 # Common OCR substitution errors
 # Format: (error_pattern, correction, context_required)
@@ -204,19 +425,19 @@ OCR_SUBSTITUTIONS = [
     # Google digitization watermark artifacts (anachronistic, safe to remove)
     # These appear in Google Books scans and are never legitimate pre-WWI content
     # ==========================================================================
-    (r"VjOOQIC", "", None),
-    (r"VjOOQLC", "", None),
-    (r"LjOOQIC", "", None),
-    (r"LiOOQLC", "", None),
-    (r"CjOOQIC", "", None),
-    (r"CjOOQlC", "", None),
-    (r"byVjOOQlC", "", None),
-    (r"byVrrOOQlC", "", None),
-    (r"byCjOOQlC", "", None),
-    (r"hyGoogIc", "", None),
-    (r"GoOglc", "", None),
-    (r"GoogXt", "", None),
-    (r"DigiLizedbyGoOglc", "", None),
+    (r"\bVjOOQIC\b", "", None),
+    (r"\bVjOOQLC\b", "", None),
+    (r"\bLjOOQIC\b", "", None),
+    (r"\bLiOOQLC\b", "", None),
+    (r"\bCjOOQIC\b", "", None),
+    (r"\bCjOOQlC\b", "", None),
+    (r"\bbyVjOOQlC\b", "", None),
+    (r"\bbyVrrOOQlC\b", "", None),
+    (r"\bbyCjOOQlC\b", "", None),
+    (r"\bhyGoogIc\b", "", None),
+    (r"\bGoOglc\b", "", None),
+    (r"\bGoogXt\b", "", None),
+    (r"\bDigiLizedbyGoOglc\b", "", None),
     (r"Digitized\s+by\s+[VLC]j?OOQ(?:IC|LC|lC)", "", None),
     # ==========================================================================
     # Repeated letter OCR artifacts (never legitimate words)
@@ -228,8 +449,32 @@ OCR_SUBSTITUTIONS = [
     # Clear 2-3 letter OCR noise (high frequency, never words)
     # Only the most obvious patterns with 10k+ occurrences
     # ==========================================================================
-    (r"[I1]A", "", None),  # 94,675 occurrences in newspaper corpus
-    (r"[I1]H", "", None),  # 65,786 occurrences in newspaper corpus
+    (r"\b[I1]A\b", "", None),  # 94,675 occurrences in newspaper corpus
+    (r"\b[I1]H\b", "", None),  # 65,786 occurrences in newspaper corpus
+    # ==========================================================================
+    # Word-joining fixes (spacing collapsed during OCR)
+    # Common patterns where space was lost between words
+    # ==========================================================================
+    (r"\b[Oo]fthe\b", "of the", None),
+    (r"\b[Tt]othe\b", "to the", None),
+    (r"\b[Ii]nthe\b", "in the", None),
+    (r"\b[Aa]ndthe\b", "and the", None),
+    (r"\b[Ff]orthe\b", "for the", None),
+    (r"\b[Oo]nthe\b", "on the", None),
+    (r"\b[Aa]tthe\b", "at the", None),
+    (r"\b[Bb]ythe\b", "by the", None),
+    (r"\b[Ii]tis\b", "it is", None),
+    (r"\b[Ii]twas\b", "it was", None),
+    (r"\b[Tt]obe\b", "to be", None),
+    (r"\b[Oo]fit\b", "of it", None),
+    (r"\b[Ii]fthe\b", "if the", None),
+    (r"\b[Aa]sthe\b", "as the", None),
+    (r"\b[Oo]rthe\b", "or the", None),
+    (r"\b[Oo]fhis\b", "of his", None),
+    (r"\b[Oo]fher\b", "of her", None),
+    (r"\b[Tt]othis\b", "to this", None),
+    (r"\b[Ii]nthis\b", "in this", None),
+    (r"\b[Oo]fthis\b", "of this", None),
 ]
 
 # Patterns that indicate garbage OCR (not fixable, flag for review)
@@ -248,18 +493,28 @@ class CleanupStats:
     total_files: int = 0
     files_modified: int = 0
     files_flagged: int = 0
+    files_skipped_language: int = 0  # Non-English documents skipped
     total_substitutions: int = 0
+    whitespace_fixes: int = 0
+    hyphen_rejoins: int = 0
+    midword_caps_fixes: int = 0
     substitution_counts: Counter = field(default_factory=Counter)
     flagged_files: list = field(default_factory=list)
+    skipped_files: list = field(default_factory=list)  # Non-English files
 
     def to_dict(self):
         return {
             "total_files": self.total_files,
             "files_modified": self.files_modified,
             "files_flagged": self.files_flagged,
+            "files_skipped_language": self.files_skipped_language,
             "total_substitutions": self.total_substitutions,
+            "whitespace_fixes": self.whitespace_fixes,
+            "hyphen_rejoins": self.hyphen_rejoins,
+            "midword_caps_fixes": self.midword_caps_fixes,
             "top_substitutions": self.substitution_counts.most_common(50),
             "flagged_files": self.flagged_files[:100],
+            "skipped_files": self.skipped_files[:100],
         }
 
 
@@ -275,12 +530,37 @@ def check_garbage(text: str) -> list[tuple[str, int]]:
 
 def clean_text(text: str, stats: Optional[CleanupStats] = None) -> tuple[str, int]:
     """
-    Apply OCR cleanup substitutions to text.
+    Apply full OCR cleanup pipeline to text.
 
-    Returns: (cleaned_text, substitution_count)
+    Pipeline order:
+    1. Whitespace normalization (strip trailing, collapse multiples)
+    2. Hyphen rejoining (fix line-break hyphenation)
+    3. Mid-word uppercase normalization (sVo -> svo)
+    4. OCR substitutions (pattern-based fixes)
+
+    Returns: (cleaned_text, total_modification_count)
     """
     total_subs = 0
 
+    # Step 1: Whitespace normalization (MUST be first for hyphen detection)
+    text, ws_count = normalize_whitespace(text)
+    total_subs += ws_count
+    if stats:
+        stats.whitespace_fixes += ws_count
+
+    # Step 2: Hyphen rejoining (after whitespace normalization)
+    text, hyphen_count = rejoin_hyphenated(text)
+    total_subs += hyphen_count
+    if stats:
+        stats.hyphen_rejoins += hyphen_count
+
+    # Step 3: Mid-word uppercase normalization
+    text, caps_count = normalize_midword_caps(text)
+    total_subs += caps_count
+    if stats:
+        stats.midword_caps_fixes += caps_count
+
+    # Step 4: OCR substitutions
     for pattern, replacement, context in OCR_SUBSTITUTIONS:
         if context:
 
@@ -309,18 +589,42 @@ def clean_file(
     input_path: Path,
     output_path: Optional[Path] = None,
     stats: Optional[CleanupStats] = None,
-) -> tuple[bool, int, list]:
+    skip_language_check: bool = False,
+) -> tuple[bool, int, list, bool]:
     """
     Clean a single file.
 
-    Returns: (was_modified, substitution_count, garbage_issues)
+    Args:
+        input_path: Path to input file
+        output_path: Path to output file (None = don't write)
+        stats: CleanupStats object to update
+        skip_language_check: If True, skip language detection
+
+    Returns: (was_modified, substitution_count, garbage_issues, was_skipped)
+        was_skipped is True if file was skipped due to non-English content
     """
     try:
         with open(input_path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
     except Exception as e:
         print(f"  Error reading {input_path}: {e}")
-        return False, 0, []
+        return False, 0, [], False
+
+    # Language detection - skip non-English documents
+    if not skip_language_check:
+        is_english, confidence = detect_language(content)
+        if not is_english:
+            if stats:
+                stats.files_skipped_language += 1
+                stats.skipped_files.append(
+                    {
+                        "file": str(input_path),
+                        "reason": "non-english",
+                        "confidence": confidence,
+                    }
+                )
+            # Don't process, don't copy to output
+            return False, 0, [], True
 
     garbage_issues = check_garbage(content)
     cleaned, sub_count = clean_text(content, stats)
@@ -335,7 +639,7 @@ def clean_file(
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(content)
 
-    return was_modified, sub_count, garbage_issues
+    return was_modified, sub_count, garbage_issues, False
 
 
 def clean_batch(
@@ -455,7 +759,11 @@ def clean_batch(
                     garbage = []  # Skip garbage check for speed
                 else:
                     # Fall back to Python
-                    was_modified, sub_count, garbage = clean_file(input_path, output_path, stats)
+                    was_modified, sub_count, garbage, was_skipped = clean_file(
+                        input_path, output_path, stats
+                    )
+                    if was_skipped:
+                        continue  # Skip non-English files
                     bytes_processed += input_path.stat().st_size
 
                 if was_modified:
@@ -607,9 +915,11 @@ Examples:
     args = parser.parse_args()
 
     if args.command == "clean":
-        was_modified, sub_count, garbage = clean_file(args.input, args.output)
+        was_modified, sub_count, garbage, was_skipped = clean_file(args.input, args.output)
 
-        if args.output:
+        if was_skipped:
+            print(f"Skipped {args.input} - detected as non-English")
+        elif args.output:
             print(f"Cleaned {args.input} -> {args.output}")
             print(f"  Substitutions: {sub_count}")
             if garbage:

@@ -24,6 +24,46 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# =============================================================================
+# Known Vocabulary Whitelist
+# Words in this set are skipped during extraction (known good words)
+# =============================================================================
+KNOWN_VOCAB_FILE = Path(__file__).parent.parent / "data" / "known_vocab.txt"
+
+
+def load_known_vocab(filepath: Path | None = None) -> set[str]:
+    """
+    Load known vocabulary whitelist from file.
+
+    Words in this list are considered "known good" and will be skipped
+    during vocab extraction to reduce noise.
+    """
+    if filepath is None:
+        filepath = KNOWN_VOCAB_FILE
+
+    if not filepath.exists():
+        return set()
+
+    words = set()
+    try:
+        with open(filepath, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                # Skip comments and empty lines
+                if not line or line.startswith("#"):
+                    continue
+                # Add lowercase version
+                words.add(line.lower())
+    except Exception as e:
+        print(f"Warning: Could not load known vocab from {filepath}: {e}", file=sys.stderr)
+        return set()
+
+    return words
+
+
+# Load known vocab at module import time
+KNOWN_VOCAB: set[str] = load_known_vocab()
+
 # Try to import dictionary for unknown word detection (optional)
 try:
     import enchant  # type: ignore[import-not-found]
@@ -214,8 +254,12 @@ def process_file(
     candidates: dict[str, VocabCandidate],
     context_chars: int = 40,
     max_contexts: int = 3,
+    known_vocab: set[str] | None = None,
 ) -> int:
     """Process a single file and update candidates dict."""
+    if known_vocab is None:
+        known_vocab = KNOWN_VOCAB
+
     try:
         text = file_path.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
@@ -229,6 +273,10 @@ def process_file(
 
         # Skip common words
         if word_lower in SKIP_WORDS:
+            continue
+
+        # Skip known vocabulary (British spellings, Latin terms, etc.)
+        if word_lower in known_vocab:
             continue
 
         # Skip very short words
@@ -407,6 +455,18 @@ def cmd_extract(args):
                 "Warning: pyenchant not available, all words will be marked as unknown",
                 file=sys.stderr,
             )
+
+        # Load known vocab whitelist
+        if hasattr(args, "no_whitelist") and args.no_whitelist:
+            known_vocab: set[str] = set()
+            print("Known vocabulary whitelist disabled", file=sys.stderr)
+        elif hasattr(args, "known_vocab") and args.known_vocab:
+            known_vocab = load_known_vocab(Path(args.known_vocab))
+            print(f"Loaded {len(known_vocab):,} words from custom whitelist", file=sys.stderr)
+        else:
+            known_vocab = KNOWN_VOCAB
+            if known_vocab:
+                print(f"Using {len(known_vocab):,} words from built-in whitelist", file=sys.stderr)
 
         # Fast file discovery
         print(f"Scanning {input_dir} for {args.pattern} files...", end="", flush=True)
@@ -670,6 +730,16 @@ Examples:
         "--show-known",
         action="store_true",
         help="Include known dictionary words",
+    )
+    extract_parser.add_argument(
+        "--known-vocab",
+        type=str,
+        help="Custom known vocabulary whitelist file (words to skip)",
+    )
+    extract_parser.add_argument(
+        "--no-whitelist",
+        action="store_true",
+        help="Disable the built-in known vocabulary whitelist",
     )
 
     # Simplify command
