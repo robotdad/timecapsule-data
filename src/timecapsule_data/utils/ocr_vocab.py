@@ -52,6 +52,10 @@ SUSPICIOUS_PATTERNS = [
 ]
 
 # Common words to skip (too common to be interesting)
+# Global interrupt flag for signal handler access from nested functions
+_interrupted = False
+
+
 SKIP_WORDS = {
     "a",
     "an",
@@ -269,15 +273,23 @@ def format_output(
     show_known: bool = False,
 ) -> str:
     """Format candidates for output."""
-    # Filter and sort candidates
+    global _interrupted
+
+    # Filter candidates - check interrupt periodically for large datasets
     filtered = []
-    for key, c in candidates.items():
+    check_interval = 100_000  # Check every 100k items
+    for i, (key, c) in enumerate(candidates.items()):
+        if i % check_interval == 0 and _interrupted:
+            break
         if c.frequency < min_freq:
             continue
         # By default, only show unknown words (not in dictionary)
         if not show_known and not c.is_unknown:
             continue
         filtered.append(c)
+
+    if _interrupted:
+        return ""  # Early exit on interrupt
 
     # Sort: suspicious first, then by frequency descending
     filtered.sort(key=lambda c: (not c.is_suspicious, -c.frequency))
@@ -364,15 +376,16 @@ def cmd_extract(args):
     import signal
     import time
 
+    global _interrupted
     input_dir = Path(args.input_dir)
-    interrupted = False
+    _interrupted = False
 
     def handle_interrupt(signum, frame):
-        nonlocal interrupted
-        if interrupted:
+        global _interrupted
+        if _interrupted:
             print("\n\nForce quit.", file=sys.stderr)
-            sys.exit(1)
-        interrupted = True
+            os._exit(1)  # Hard exit - sys.exit() doesn't work reliably in signal handlers
+        _interrupted = True
         print("\n\nInterrupted! Processing collected data...", file=sys.stderr)
 
     old_handler = signal.signal(signal.SIGINT, handle_interrupt)
@@ -443,7 +456,7 @@ def cmd_extract(args):
             # Process in batches with Rust
             batch_size = 500
             for batch_start in range(0, total_files, batch_size):
-                if interrupted:
+                if _interrupted:
                     break
 
                 batch_end = min(batch_start + batch_size, total_files)
@@ -509,7 +522,7 @@ def cmd_extract(args):
         else:
             # Fall back to Python
             for i, file_path in enumerate(files, 1):
-                if interrupted:
+                if _interrupted:
                     break
 
                 if i % 500 == 0 or i == total_files:
@@ -531,7 +544,7 @@ def cmd_extract(args):
 
         elapsed = time.time() - start_time
         print(f"\n{'=' * 60}", file=sys.stderr)
-        if interrupted:
+        if _interrupted:
             print("INTERRUPTED - showing partial results", file=sys.stderr)
         else:
             print("COMPLETE", file=sys.stderr)
@@ -540,24 +553,30 @@ def cmd_extract(args):
         print(f"  Total words processed: {total_words:,}", file=sys.stderr)
         print(f"  Unique candidates: {len(candidates):,}", file=sys.stderr)
 
-        # Filter by frequency
-        above_threshold = sum(1 for c in candidates.values() if c.frequency >= args.min_freq)
-        print(f"  Candidates >= {args.min_freq} occurrences: {above_threshold:,}", file=sys.stderr)
+        # Filter by frequency (skip if interrupted - this is slow with 200M+ candidates)
+        if not _interrupted:
+            above_threshold = sum(1 for c in candidates.values() if c.frequency >= args.min_freq)
+            print(
+                f"  Candidates >= {args.min_freq} occurrences: {above_threshold:,}", file=sys.stderr
+            )
         print(f"{'=' * 60}", file=sys.stderr)
 
-        # Generate output
-        output = format_output(
-            candidates,
-            min_freq=args.min_freq,
-            output_format=args.format,
-            show_known=args.show_known,
-        )
+        # Generate output (skip if interrupted)
+        if not _interrupted:
+            output = format_output(
+                candidates,
+                min_freq=args.min_freq,
+                output_format=args.format,
+                show_known=args.show_known,
+            )
 
-        if args.output:
-            Path(args.output).write_text(output, encoding="utf-8")
-            print(f"\nOutput written to: {args.output}", file=sys.stderr)
+            if args.output:
+                Path(args.output).write_text(output, encoding="utf-8")
+                print(f"\nOutput written to: {args.output}", file=sys.stderr)
+            else:
+                print(output)
         else:
-            print(output)
+            print("\nSkipped output generation due to interrupt.", file=sys.stderr)
 
     finally:
         signal.signal(signal.SIGINT, old_handler)
