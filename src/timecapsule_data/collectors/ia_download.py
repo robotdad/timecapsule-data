@@ -39,9 +39,102 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from queue import Queue
 from typing import Optional, Set
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
+
+
+class ThreadSafeDBWriter:
+    """
+    Thread-safe database writer that serializes all writes through a queue.
+
+    SQLite doesn't handle concurrent writes well, especially on slow filesystems
+    (like WSL2 → Windows). This class provides a single writer thread that
+    processes all database updates sequentially, avoiding lock contention.
+    """
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self._queue: Queue[tuple[str, tuple, threading.Event | None]] = Queue()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._conn: sqlite3.Connection | None = None
+
+    def start(self):
+        """Start the writer thread."""
+        self._thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 30.0):
+        """Stop the writer thread, waiting for pending writes to complete."""
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=timeout)
+
+    def _writer_loop(self):
+        """Main loop that processes database writes."""
+        self._conn = sqlite3.connect(self.db_path, timeout=60.0)
+        # WAL mode provides better concurrent read/write performance
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=60000")  # 60 second timeout
+        self._conn.execute("PRAGMA synchronous=NORMAL")  # Faster, still safe with WAL
+
+        while not self._stop_event.is_set() or not self._queue.empty():
+            try:
+                # Use timeout so we can check stop_event periodically
+                sql, params, done_event = self._queue.get(timeout=0.5)
+                try:
+                    self._conn.execute(sql, params)
+                    self._conn.commit()
+                except sqlite3.Error as e:
+                    # Log but don't crash - the download still succeeded
+                    print(f"  DB write error (non-fatal): {e}")
+                finally:
+                    if done_event:
+                        done_event.set()
+                    self._queue.task_done()
+            except Exception:
+                # Queue.get timeout - just continue
+                pass
+
+        # Final cleanup
+        if self._conn:
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
+            self._conn.close()
+
+    def execute(self, sql: str, params: tuple = (), wait: bool = False):
+        """
+        Queue a SQL statement for execution.
+
+        Args:
+            sql: SQL statement with ? placeholders
+            params: Parameters tuple
+            wait: If True, block until this specific write completes
+        """
+        done_event = threading.Event() if wait else None
+        self._queue.put((sql, params, done_event))
+        if done_event:
+            done_event.wait()
+
+    def update_downloaded(self, identifier: str, filename: str):
+        """Mark an item as successfully downloaded."""
+        self.execute(
+            "UPDATE items SET text_filename = ?, downloaded_at = ? WHERE identifier = ?",
+            (filename, datetime.now().isoformat(), identifier),
+        )
+
+    def update_failed(self, identifier: str):
+        """Mark an item as failed to download."""
+        self.execute(
+            "UPDATE items SET download_failed_at = ? WHERE identifier = ?",
+            (datetime.now().isoformat(), identifier),
+        )
+
 
 IA_DOWNLOAD_BASE = "https://archive.org/download"
 
@@ -241,7 +334,7 @@ def download_with_discovery(
     identifier: str,
     known_filename: Optional[str],
     output_dir: Path,
-    db_path: Path,
+    db_writer: ThreadSafeDBWriter,
     rate_limiter: RateLimiter,
 ) -> tuple[bool, str, Optional[str]]:
     """
@@ -261,7 +354,7 @@ def download_with_discovery(
 
     # Try each filename
     for filename in filenames_to_try:
-        url = f"{IA_DOWNLOAD_BASE}/{identifier}/{filename}"
+        url = f"{IA_DOWNLOAD_BASE}/{identifier}/{quote(filename, safe='')}"
         content = fetch_with_retry(url, rate_limiter, retries=1)
 
         if content:
@@ -273,16 +366,8 @@ def download_with_discovery(
                 with open(filepath, "w", encoding="utf-8") as f:
                     f.write(content)
 
-                # Update database with discovered filename
-                conn = sqlite3.Connection(db_path)
-                cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE items SET text_filename = ?, downloaded_at = ? WHERE identifier = ?",
-                    (filename, datetime.now().isoformat(), identifier),
-                )
-                conn.commit()
-                conn.close()
-
+                # Update database with discovered filename (via thread-safe writer)
+                db_writer.update_downloaded(identifier, filename)
                 return True, "success", filename
 
             except Exception as e:
@@ -292,43 +377,22 @@ def download_with_discovery(
     metadata = get_item_metadata(identifier, rate_limiter)
 
     if not metadata:
-        conn = sqlite3.Connection(db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE items SET download_failed_at = ? WHERE identifier = ?",
-            (datetime.now().isoformat(), identifier),
-        )
-        conn.commit()
-        conn.close()
+        db_writer.update_failed(identifier)
         return False, "metadata_api_failed", None
 
     # Find actual filename from metadata
     actual_filename = find_text_file_from_metadata(metadata)
 
     if not actual_filename:
-        conn = sqlite3.Connection(db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE items SET download_failed_at = ? WHERE identifier = ?",
-            (datetime.now().isoformat(), identifier),
-        )
-        conn.commit()
-        conn.close()
+        db_writer.update_failed(identifier)
         return False, "no_text_file_in_metadata", None
 
     # Download with discovered filename
-    url = f"{IA_DOWNLOAD_BASE}/{identifier}/{actual_filename}"
+    url = f"{IA_DOWNLOAD_BASE}/{identifier}/{quote(actual_filename, safe='')}"
     content = fetch_with_retry(url, rate_limiter)
 
     if not content:
-        conn = sqlite3.Connection(db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE items SET download_failed_at = ? WHERE identifier = ?",
-            (datetime.now().isoformat(), identifier),
-        )
-        conn.commit()
-        conn.close()
+        db_writer.update_failed(identifier)
         return False, "download_failed_after_metadata", None
 
     # Save file and update database
@@ -339,15 +403,7 @@ def download_with_discovery(
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(content)
 
-        conn = sqlite3.Connection(db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE items SET text_filename = ?, downloaded_at = ? WHERE identifier = ?",
-            (actual_filename, datetime.now().isoformat(), identifier),
-        )
-        conn.commit()
-        conn.close()
-
+        db_writer.update_downloaded(identifier, actual_filename)
         return True, "success_via_metadata", actual_filename
 
     except Exception as e:
@@ -390,7 +446,7 @@ def print_interruption_summary(db_path: Path, starting_count: int, items_request
 def download_worker(
     items: list,
     output_dir: Path,
-    db_path: Path,
+    db_writer: ThreadSafeDBWriter,
     worker_id: int,
 ) -> dict:
     """Worker function for parallel downloads with discovery."""
@@ -408,7 +464,7 @@ def download_worker(
             break
 
         success, reason, discovered_filename = download_with_discovery(
-            identifier, known_filename, output_dir, db_path, global_rate_limiter
+            identifier, known_filename, output_dir, db_writer, global_rate_limiter
         )
 
         if success:
@@ -613,8 +669,6 @@ Notes:
     print()
 
     # Progress monitor thread
-    import threading
-
     class DownloadProgressMonitor:
         def __init__(self, db_path: Path, starting_count: int, target_count: int):
             self.db_path = db_path
@@ -674,6 +728,10 @@ Notes:
     monitor = DownloadProgressMonitor(index_path, already_downloaded, len(items_to_download))
     monitor.start()
 
+    # Create thread-safe database writer (serializes all DB writes to avoid lock contention)
+    db_writer = ThreadSafeDBWriter(index_path)
+    db_writer.start()
+
     total_downloaded = 0
     total_failed = 0
     total_guessed = 0
@@ -683,7 +741,7 @@ Notes:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             futures = []
             for worker_id, chunk in enumerate(chunks):
-                future = executor.submit(download_worker, chunk, output_dir, index_path, worker_id)
+                future = executor.submit(download_worker, chunk, output_dir, db_writer, worker_id)
                 futures.append(future)
 
             # Collect results
@@ -696,10 +754,13 @@ Notes:
 
     except KeyboardInterrupt:
         monitor.stop()
+        print("Waiting for pending database writes to complete...")
+        db_writer.stop(timeout=30.0)
         print_interruption_summary(index_path, already_downloaded, len(items_to_download))
         sys.exit(0)
 
     monitor.stop()
+    db_writer.stop(timeout=30.0)
 
     # Summary
     end_time = datetime.now()
