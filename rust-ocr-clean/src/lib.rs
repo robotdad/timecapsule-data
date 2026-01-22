@@ -1,6 +1,8 @@
 use pyo3::prelude::*;
 use regex::Regex;
 use lazy_static::lazy_static;
+use unicode_normalization::UnicodeNormalization;
+use whatlang::{detect, Lang};
 
 // Pre-compile all OCR patterns at module load time
 lazy_static! {
@@ -930,6 +932,619 @@ fn extract_vocab_batch(
     Ok((total_words, global_counts))
 }
 
+// =============================================================================
+// DOCUMENT TRIAGE MODULE
+// =============================================================================
+// Fast heuristic-based document classification to filter out problematic content
+// BEFORE running expensive OCR cleanup. Identifies:
+// - Low quality scans (low alpha ratio, fragmented text)
+// - Multicolumn content (newspapers with column mixing)
+// - Catalog-like content (lists, indexes)
+
+/// Triage result for a single document
+#[pyclass]
+#[derive(Clone)]
+pub struct TriageResult {
+    #[pyo3(get)]
+    pub path: String,
+    #[pyo3(get)]
+    pub action: String,  // "pass", "quarantine", "reject"
+    #[pyo3(get)]
+    pub problems: Vec<String>,  // ["multicolumn", "low_alpha", "fragmented", "catalog_like"]
+    #[pyo3(get)]
+    pub alpha_ratio: f64,
+    #[pyo3(get)]
+    pub line_length_cv: f64,
+    #[pyo3(get)]
+    pub mean_words_per_line: f64,
+    #[pyo3(get)]
+    pub fragment_ratio: f64,
+    #[pyo3(get)]
+    pub list_pattern_ratio: f64,
+    #[pyo3(get)]
+    pub line_count: usize,
+    #[pyo3(get)]
+    pub char_count: usize,
+}
+
+#[pymethods]
+impl TriageResult {
+    fn to_dict(&self) -> std::collections::HashMap<String, pyo3::PyObject> {
+        Python::with_gil(|py| {
+            let mut map = std::collections::HashMap::new();
+            map.insert("path".to_string(), self.path.clone().into_pyobject(py).unwrap().into_any().unbind());
+            map.insert("action".to_string(), self.action.clone().into_pyobject(py).unwrap().into_any().unbind());
+            map.insert("problems".to_string(), self.problems.clone().into_pyobject(py).unwrap().into_any().unbind());
+            map.insert("alpha_ratio".to_string(), self.alpha_ratio.into_pyobject(py).unwrap().into_any().unbind());
+            map.insert("line_length_cv".to_string(), self.line_length_cv.into_pyobject(py).unwrap().into_any().unbind());
+            map.insert("mean_words_per_line".to_string(), self.mean_words_per_line.into_pyobject(py).unwrap().into_any().unbind());
+            map.insert("fragment_ratio".to_string(), self.fragment_ratio.into_pyobject(py).unwrap().into_any().unbind());
+            map.insert("list_pattern_ratio".to_string(), self.list_pattern_ratio.into_pyobject(py).unwrap().into_any().unbind());
+            map.insert("line_count".to_string(), self.line_count.into_pyobject(py).unwrap().into_any().unbind());
+            map.insert("char_count".to_string(), self.char_count.into_pyobject(py).unwrap().into_any().unbind());
+            map
+        })
+    }
+}
+
+/// Thresholds for triage decisions (calibrated from corpus sampling)
+struct TriageThresholds {
+    // REJECT thresholds
+    min_alpha_ratio: f64,           // Below this = garbage scan
+    max_fragment_for_reject: f64,   // Combined with low words/line = reject
+    min_words_per_line_reject: f64, // Combined with high fragment = reject
+    
+    // QUARANTINE thresholds (multicolumn)
+    min_cv_for_multicolumn: f64,    // High variance suggests column mixing
+    min_fragment_for_multicolumn: f64, // Combined with CV
+    
+    // QUARANTINE thresholds (catalog-like)
+    min_list_pattern_ratio: f64,    // High list patterns = catalog/index
+}
+
+impl Default for TriageThresholds {
+    fn default() -> Self {
+        Self {
+            // REJECT: garbage scans, photo albums
+            min_alpha_ratio: 0.45,
+            max_fragment_for_reject: 0.50,
+            min_words_per_line_reject: 2.5,
+            
+            // QUARANTINE: multicolumn (newspapers)
+            min_cv_for_multicolumn: 0.50,
+            min_fragment_for_multicolumn: 0.25,
+            
+            // QUARANTINE: catalog-like content
+            min_list_pattern_ratio: 0.15,
+        }
+    }
+}
+
+lazy_static! {
+    static ref LIST_PATTERN: Regex = Regex::new(r"^\s*(\d+[\.\):\-]|\*|\-|•|[a-z][\.\)])").unwrap();
+}
+
+/// Compute triage signals from text content
+fn compute_triage_signals(text: &str) -> (f64, f64, f64, f64, f64, usize, usize) {
+    let char_count = text.len();
+    if char_count == 0 {
+        return (0.0, 0.0, 0.0, 1.0, 0.0, 0, 0);
+    }
+    
+    // Alpha ratio
+    let alpha_count = text.chars().filter(|c| c.is_alphabetic()).count();
+    let alpha_ratio = alpha_count as f64 / char_count as f64;
+    
+    // Line-based signals
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let line_count = lines.len();
+    
+    if line_count < 5 {
+        // Too short to analyze meaningfully
+        return (alpha_ratio, 0.0, 0.0, 1.0, 0.0, line_count, char_count);
+    }
+    
+    // Line lengths for CV calculation
+    let lengths: Vec<f64> = lines.iter().map(|l| l.len() as f64).collect();
+    let mean_len: f64 = lengths.iter().sum::<f64>() / lengths.len() as f64;
+    
+    let line_length_cv = if mean_len > 0.0 && lengths.len() > 1 {
+        let variance: f64 = lengths.iter()
+            .map(|&x| (x - mean_len).powi(2))
+            .sum::<f64>() / (lengths.len() - 1) as f64;
+        variance.sqrt() / mean_len
+    } else {
+        0.0
+    };
+    
+    // Words per line
+    let word_counts: Vec<usize> = lines.iter()
+        .map(|l| l.split_whitespace().count())
+        .collect();
+    let total_words: usize = word_counts.iter().sum();
+    let mean_words_per_line = total_words as f64 / line_count as f64;
+    
+    // Fragment ratio (lines with < 3 words)
+    let fragment_count = word_counts.iter().filter(|&&wc| wc < 3).count();
+    let fragment_ratio = fragment_count as f64 / line_count as f64;
+    
+    // List pattern ratio
+    let list_count = lines.iter()
+        .filter(|l| LIST_PATTERN.is_match(l))
+        .count();
+    let list_pattern_ratio = list_count as f64 / line_count as f64;
+    
+    (alpha_ratio, line_length_cv, mean_words_per_line, fragment_ratio, 
+     list_pattern_ratio, line_count, char_count)
+}
+
+/// Determine triage action and problems from signals
+fn determine_triage(
+    alpha_ratio: f64,
+    line_length_cv: f64,
+    mean_words_per_line: f64,
+    fragment_ratio: f64,
+    list_pattern_ratio: f64,
+    line_count: usize,
+) -> (String, Vec<String>) {
+    let thresholds = TriageThresholds::default();
+    let mut problems = Vec::new();
+    
+    // Check for REJECT conditions
+    if alpha_ratio < thresholds.min_alpha_ratio {
+        problems.push("low_alpha".to_string());
+    }
+    
+    if mean_words_per_line < thresholds.min_words_per_line_reject 
+        && fragment_ratio > thresholds.max_fragment_for_reject {
+        problems.push("fragmented".to_string());
+    }
+    
+    // Check for QUARANTINE conditions
+    if line_length_cv > thresholds.min_cv_for_multicolumn 
+        && fragment_ratio > thresholds.min_fragment_for_multicolumn {
+        problems.push("multicolumn".to_string());
+    }
+    
+    if list_pattern_ratio > thresholds.min_list_pattern_ratio {
+        problems.push("catalog_like".to_string());
+    }
+    
+    // Determine action
+    let action = if problems.contains(&"low_alpha".to_string()) 
+        || problems.contains(&"fragmented".to_string()) {
+        "reject".to_string()
+    } else if problems.contains(&"multicolumn".to_string()) 
+        || problems.contains(&"catalog_like".to_string()) {
+        "quarantine".to_string()
+    } else if line_count < 5 {
+        // Too short to evaluate - quarantine for manual review
+        problems.push("too_short".to_string());
+        "quarantine".to_string()
+    } else {
+        "pass".to_string()
+    };
+    
+    (action, problems)
+}
+
+/// Triage a text string
+#[pyfunction]
+#[pyo3(signature = (text, path = ""))]
+fn triage_text(text: &str, path: &str) -> PyResult<TriageResult> {
+    let (alpha_ratio, line_length_cv, mean_words_per_line, fragment_ratio,
+         list_pattern_ratio, line_count, char_count) = compute_triage_signals(text);
+    
+    let (action, problems) = determine_triage(
+        alpha_ratio, line_length_cv, mean_words_per_line, 
+        fragment_ratio, list_pattern_ratio, line_count
+    );
+    
+    Ok(TriageResult {
+        path: path.to_string(),
+        action,
+        problems,
+        alpha_ratio,
+        line_length_cv,
+        mean_words_per_line,
+        fragment_ratio,
+        list_pattern_ratio,
+        line_count,
+        char_count,
+    })
+}
+
+/// Triage a file
+#[pyfunction]
+fn triage_file(path: &str) -> PyResult<TriageResult> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
+            format!("Failed to read {}: {}", path, e)
+        ))?;
+    
+    triage_text(&content, path)
+}
+
+/// Triage multiple files in batch (parallel processing)
+#[pyfunction]
+fn triage_batch(paths: Vec<String>) -> PyResult<Vec<TriageResult>> {
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    
+    let results = Arc::new(Mutex::new(Vec::with_capacity(paths.len())));
+    let paths = Arc::new(paths);
+    
+    // Use available parallelism, capped at 8 threads
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(4);
+    
+    let chunk_size = (paths.len() + num_threads - 1) / num_threads;
+    let mut handles = vec![];
+    
+    for chunk_idx in 0..num_threads {
+        let paths = Arc::clone(&paths);
+        let results = Arc::clone(&results);
+        let start = chunk_idx * chunk_size;
+        let end = (start + chunk_size).min(paths.len());
+        
+        if start >= paths.len() {
+            break;
+        }
+        
+        let handle = thread::spawn(move || {
+            let mut local_results = Vec::new();
+            
+            for i in start..end {
+                let path = &paths[i];
+                match std::fs::read_to_string(path) {
+                    Ok(content) => {
+                        let (alpha_ratio, line_length_cv, mean_words_per_line, 
+                             fragment_ratio, list_pattern_ratio, line_count, char_count) 
+                            = compute_triage_signals(&content);
+                        
+                        let (action, problems) = determine_triage(
+                            alpha_ratio, line_length_cv, mean_words_per_line,
+                            fragment_ratio, list_pattern_ratio, line_count
+                        );
+                        
+                        local_results.push(TriageResult {
+                            path: path.clone(),
+                            action,
+                            problems,
+                            alpha_ratio,
+                            line_length_cv,
+                            mean_words_per_line,
+                            fragment_ratio,
+                            list_pattern_ratio,
+                            line_count,
+                            char_count,
+                        });
+                    }
+                    Err(e) => {
+                        // File read error - mark as reject with error
+                        local_results.push(TriageResult {
+                            path: path.clone(),
+                            action: "reject".to_string(),
+                            problems: vec![format!("read_error: {}", e)],
+                            alpha_ratio: 0.0,
+                            line_length_cv: 0.0,
+                            mean_words_per_line: 0.0,
+                            fragment_ratio: 0.0,
+                            list_pattern_ratio: 0.0,
+                            line_count: 0,
+                            char_count: 0,
+                        });
+                    }
+                }
+            }
+            
+            let mut results = results.lock().unwrap();
+            results.extend(local_results);
+        });
+        
+        handles.push(handle);
+    }
+    
+    for handle in handles {
+        handle.join().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Thread panicked")
+        })?;
+    }
+    
+    let results = Arc::try_unwrap(results)
+        .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to unwrap results"))?
+        .into_inner()
+        .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Mutex poisoned"))?;
+    
+    Ok(results)
+}
+
+// =============================================================================
+// Language Detection (using whatlang)
+// =============================================================================
+
+/// Result of language detection
+#[pyclass]
+#[derive(Clone)]
+pub struct LangDetectResult {
+    #[pyo3(get)]
+    pub is_english: bool,
+    #[pyo3(get)]
+    pub detected_lang: String,
+    #[pyo3(get)]
+    pub confidence: f64,
+}
+
+/// Detect if text is English using whatlang
+/// Returns (is_english, detected_language_code, confidence)
+#[pyfunction]
+fn detect_language(text: &str, confidence_threshold: Option<f64>) -> LangDetectResult {
+    let threshold = confidence_threshold.unwrap_or(0.5);
+    
+    // Use first 10k chars for speed
+    let sample: String = text.chars().take(10000).collect();
+    
+    if sample.len() < 20 {
+        // Too short to determine, assume English
+        return LangDetectResult {
+            is_english: true,
+            detected_lang: "unknown".to_string(),
+            confidence: 0.0,
+        };
+    }
+    
+    match detect(&sample) {
+        Some(info) => {
+            let is_english = info.lang() == Lang::Eng && info.confidence() >= threshold;
+            LangDetectResult {
+                is_english,
+                detected_lang: format!("{:?}", info.lang()).to_lowercase(),
+                confidence: info.confidence(),
+            }
+        }
+        None => {
+            // Detection failed, assume English to avoid blocking
+            LangDetectResult {
+                is_english: true,
+                detected_lang: "unknown".to_string(),
+                confidence: 0.0,
+            }
+        }
+    }
+}
+
+/// Detect language from a file
+#[pyfunction]
+fn detect_language_file(path: &str, confidence_threshold: Option<f64>) -> PyResult<LangDetectResult> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read file: {}", e)))?;
+    Ok(detect_language(&content, confidence_threshold))
+}
+
+// =============================================================================
+// Unicode Normalization (ftfy-equivalent)
+// =============================================================================
+
+/// Fix common Unicode issues in text
+/// - Normalizes to NFC form (canonical composition)
+/// - Fixes common mojibake patterns
+/// - Normalizes whitespace characters
+#[pyfunction]
+fn fix_unicode(text: &str) -> String {
+    // Step 1: NFC normalization (canonical decomposition + canonical composition)
+    let normalized: String = text.nfc().collect();
+    
+    // Step 2: Fix common mojibake patterns
+    // These are UTF-8 bytes misinterpreted as Latin-1/Windows-1252
+    let fixed = fix_mojibake(&normalized);
+    
+    // Step 3: Normalize various Unicode whitespace to ASCII equivalents
+    let fixed = normalize_unicode_whitespace(&fixed);
+    
+    // Step 4: Fix common HTML entities that might have been double-encoded
+    let fixed = fix_html_entities(&fixed);
+    
+    fixed
+}
+
+/// Fix common mojibake patterns (UTF-8 misread as Latin-1)
+fn fix_mojibake(text: &str) -> String {
+    lazy_static! {
+        static ref MOJIBAKE_PATTERNS: Vec<(&'static str, &'static str)> = vec![
+            // Common UTF-8 -> Latin-1 mojibake (using escape sequences)
+            // Accented vowels
+            ("\u{00C3}\u{00A1}", "\u{00E1}"),  // Ã¡ -> á
+            ("\u{00C3}\u{00A9}", "\u{00E9}"),  // Ã© -> é
+            ("\u{00C3}\u{00AD}", "\u{00ED}"),  // Ã­ -> í
+            ("\u{00C3}\u{00B3}", "\u{00F3}"),  // Ã³ -> ó
+            ("\u{00C3}\u{00BA}", "\u{00FA}"),  // Ãº -> ú
+            ("\u{00C3}\u{00B1}", "\u{00F1}"),  // Ã± -> ñ
+            ("\u{00C3}\u{00BC}", "\u{00FC}"),  // Ã¼ -> ü
+            ("\u{00C3}\u{00B6}", "\u{00F6}"),  // Ã¶ -> ö
+            ("\u{00C3}\u{00A4}", "\u{00E4}"),  // Ã¤ -> ä
+            ("\u{00C3}\u{00A8}", "\u{00E8}"),  // Ã¨ -> è
+            ("\u{00C3}\u{00A0}", "\u{00E0}"),  // Ã  -> à
+            ("\u{00C3}\u{00A2}", "\u{00E2}"),  // Ã¢ -> â
+            ("\u{00C3}\u{00AA}", "\u{00EA}"),  // Ãª -> ê
+            ("\u{00C3}\u{00AE}", "\u{00EE}"),  // Ã® -> î
+            ("\u{00C3}\u{00B4}", "\u{00F4}"),  // Ã´ -> ô
+            ("\u{00C3}\u{00BB}", "\u{00FB}"),  // Ã» -> û
+            ("\u{00C3}\u{00A7}", "\u{00E7}"),  // Ã§ -> ç
+            ("\u{00C3}\u{00BF}", "\u{00FF}"),  // Ã¿ -> ÿ
+            ("\u{00C3}\u{00AF}", "\u{00EF}"),  // Ã¯ -> ï
+            ("\u{00C3}\u{00B8}", "\u{00F8}"),  // Ã¸ -> ø
+            ("\u{00C3}\u{00A6}", "\u{00E6}"),  // Ã¦ -> æ
+            ("\u{00C3}\u{00B0}", "\u{00F0}"),  // Ã° -> ð
+            ("\u{00C3}\u{00BD}", "\u{00FD}"),  // Ã½ -> ý
+            // Curly quotes mojibake
+            ("\u{00E2}\u{20AC}\u{0153}", "\""),  // â€œ -> "
+            ("\u{00E2}\u{20AC}\u{009D}", "\""),  // â€ -> "
+            ("\u{00E2}\u{20AC}\u{02DC}", "'"),   // â€˜ -> '
+            ("\u{00E2}\u{20AC}\u{2122}", "'"),   // â€™ -> '
+            // Em/en dash mojibake
+            ("\u{00E2}\u{20AC}\u{201C}", "\u{2014}"),  // â€" -> —
+            ("\u{00E2}\u{20AC}\u{201D}", "\u{2013}"),  // â€" -> –
+            // Ellipsis
+            ("\u{00E2}\u{20AC}\u{00A6}", "\u{2026}"),  // â€¦ -> …
+            // Non-breaking space mojibake
+            ("\u{00C2}\u{00A0}", " "),  // Â  -> space
+        ];
+    }
+    
+    let mut result = text.to_string();
+    for (pattern, replacement) in MOJIBAKE_PATTERNS.iter() {
+        result = result.replace(pattern, replacement);
+    }
+    result
+}
+
+/// Normalize various Unicode whitespace characters
+fn normalize_unicode_whitespace(text: &str) -> String {
+    lazy_static! {
+        static ref WHITESPACE_MAP: Vec<(char, Option<char>)> = vec![
+            ('\u{00A0}', Some(' ')),  // Non-breaking space
+            ('\u{2000}', Some(' ')),  // En quad
+            ('\u{2001}', Some(' ')),  // Em quad
+            ('\u{2002}', Some(' ')),  // En space
+            ('\u{2003}', Some(' ')),  // Em space
+            ('\u{2004}', Some(' ')),  // Three-per-em space
+            ('\u{2005}', Some(' ')),  // Four-per-em space
+            ('\u{2006}', Some(' ')),  // Six-per-em space
+            ('\u{2007}', Some(' ')),  // Figure space
+            ('\u{2008}', Some(' ')),  // Punctuation space
+            ('\u{2009}', Some(' ')),  // Thin space
+            ('\u{200A}', Some(' ')),  // Hair space
+            ('\u{202F}', Some(' ')),  // Narrow no-break space
+            ('\u{205F}', Some(' ')),  // Medium mathematical space
+            ('\u{3000}', Some(' ')),  // Ideographic space
+            ('\u{FEFF}', None),       // BOM / zero-width no-break space (remove)
+        ];
+    }
+    
+    let mut result = String::with_capacity(text.len());
+    for c in text.chars() {
+        let mut found = false;
+        for (from, to) in WHITESPACE_MAP.iter() {
+            if c == *from {
+                if let Some(replacement) = to {
+                    result.push(*replacement);
+                }
+                // If None, we skip (remove the character)
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Fix common HTML entities
+fn fix_html_entities(text: &str) -> String {
+    lazy_static! {
+        static ref HTML_ENTITIES: Vec<(&'static str, &'static str)> = vec![
+            ("&amp;", "&"),
+            ("&lt;", "<"),
+            ("&gt;", ">"),
+            ("&quot;", "\""),
+            ("&apos;", "'"),
+            ("&#39;", "'"),
+            ("&nbsp;", " "),
+            // Double-encoded
+            ("&amp;amp;", "&"),
+            ("&amp;lt;", "<"),
+            ("&amp;gt;", ">"),
+        ];
+    }
+    
+    let mut result = text.to_string();
+    for (entity, replacement) in HTML_ENTITIES.iter() {
+        result = result.replace(entity, replacement);
+    }
+    result
+}
+
+/// Fix unicode issues in a file and write to output
+#[pyfunction]
+fn fix_unicode_file(input_path: &str, output_path: &str) -> PyResult<bool> {
+    let content = std::fs::read_to_string(input_path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read file: {}", e)))?;
+    
+    let fixed = fix_unicode(&content);
+    let was_modified = fixed != content;
+    
+    std::fs::write(output_path, &fixed)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to write file: {}", e)))?;
+    
+    Ok(was_modified)
+}
+
+// =============================================================================
+// Combined preprocessing: unicode fix + language detection
+// =============================================================================
+
+/// Result of preprocessing a file
+#[pyclass]
+#[derive(Clone)]
+pub struct PreprocessResult {
+    #[pyo3(get)]
+    pub is_english: bool,
+    #[pyo3(get)]
+    pub detected_lang: String,
+    #[pyo3(get)]
+    pub lang_confidence: f64,
+    #[pyo3(get)]
+    pub unicode_was_fixed: bool,
+}
+
+/// Preprocess text: fix unicode and detect language
+#[pyfunction]
+fn preprocess_text(text: &str, confidence_threshold: Option<f64>) -> (String, PreprocessResult) {
+    let fixed = fix_unicode(text);
+    let unicode_was_fixed = fixed != text;
+    
+    let lang_result = detect_language(&fixed, confidence_threshold);
+    
+    let result = PreprocessResult {
+        is_english: lang_result.is_english,
+        detected_lang: lang_result.detected_lang,
+        lang_confidence: lang_result.confidence,
+        unicode_was_fixed,
+    };
+    
+    (fixed, result)
+}
+
+/// Preprocess a file: fix unicode, detect language, optionally write output
+/// Returns PreprocessResult. If output_path is provided and text is English, writes fixed content.
+#[pyfunction]
+fn preprocess_file(
+    input_path: &str, 
+    output_path: Option<&str>,
+    confidence_threshold: Option<f64>
+) -> PyResult<PreprocessResult> {
+    let content = std::fs::read_to_string(input_path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read file: {}", e)))?;
+    
+    let (fixed, result) = preprocess_text(&content, confidence_threshold);
+    
+    // Only write if English and output path provided
+    if let Some(out_path) = output_path {
+        if result.is_english {
+            if let Some(parent) = std::path::Path::new(out_path).parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            std::fs::write(out_path, &fixed)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to write file: {}", e)))?;
+        }
+    }
+    
+    Ok(result)
+}
+
 #[pymodule]
 fn rust_ocr_clean(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(clean_text, m)?)?;
@@ -939,6 +1554,19 @@ fn rust_ocr_clean(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(count_context_patterns, m)?)?;
     m.add_function(wrap_pyfunction!(count_context_patterns_file, m)?)?;
     m.add_function(wrap_pyfunction!(count_context_patterns_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(triage_text, m)?)?;
+    m.add_function(wrap_pyfunction!(triage_file, m)?)?;
+    m.add_function(wrap_pyfunction!(triage_batch, m)?)?;
+    // New preprocessing functions
+    m.add_function(wrap_pyfunction!(detect_language, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_language_file, m)?)?;
+    m.add_function(wrap_pyfunction!(fix_unicode, m)?)?;
+    m.add_function(wrap_pyfunction!(fix_unicode_file, m)?)?;
+    m.add_function(wrap_pyfunction!(preprocess_text, m)?)?;
+    m.add_function(wrap_pyfunction!(preprocess_file, m)?)?;
     m.add_class::<WordInfo>()?;
+    m.add_class::<TriageResult>()?;
+    m.add_class::<LangDetectResult>()?;
+    m.add_class::<PreprocessResult>()?;
     Ok(())
 }

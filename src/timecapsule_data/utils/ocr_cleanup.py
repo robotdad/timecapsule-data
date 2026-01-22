@@ -41,131 +41,64 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-# =============================================================================
-# Common English words for language detection
-# These are high-frequency English words unlikely to appear in other languages
-# Includes small function words that appear even in lists/directories
-# =============================================================================
-ENGLISH_MARKER_WORDS = {
-    # Articles and prepositions (appear even in lists)
-    "the",
-    "a",
-    "an",
-    "of",
-    "to",
-    "in",
-    "on",
-    "at",
-    "by",
-    "for",
-    "with",
-    "from",
-    "into",
-    "than",
-    "as",
-    # Conjunctions
-    "and",
-    "or",
-    "but",
-    "not",
-    # Pronouns
-    "it",
-    "he",
-    "she",
-    "they",
-    "you",
-    "we",
-    "this",
-    "that",
-    "which",
-    "who",
-    "what",
-    "his",
-    "her",
-    "its",
-    "their",
-    "him",
-    "them",
-    # Common verbs
-    "is",
-    "are",
-    "was",
-    "were",
-    "be",
-    "been",
-    "being",
-    "have",
-    "has",
-    "had",
-    "do",
-    "did",
-    "will",
-    "would",
-    "could",
-    "should",
-    "can",
-    "may",
-    "made",
-    "make",
-    # Other common words
-    "there",
-    "when",
-    "where",
-    "more",
-    "other",
-    "these",
-    "after",
-    "two",
-    "over",
-    "such",
-    "through",
-    "also",
-    "new",
-    "any",
-    "all",
-}
+import rust_ocr_clean
+
+
+def get_unique_path(path: Path) -> Path:
+    """Return a unique path by adding numeric suffix if file exists.
+
+    Examples:
+        _cleanup_report.json -> _cleanup_report_1.json -> _cleanup_report_2.json
+    """
+    if not path.exists():
+        return path
+
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+
+    counter = 1
+    while True:
+        new_path = parent / f"{stem}_{counter}{suffix}"
+        if not new_path.exists():
+            return new_path
+        counter += 1
 
 
 # =============================================================================
 # Preprocessing Functions (applied before OCR substitutions)
+# Uses Rust implementations for performance at scale (2M+ docs)
 # =============================================================================
 
 
-def detect_language(text: str, sample_size: int = 500) -> tuple[bool, float]:
+def detect_language(text: str, confidence_threshold: float = 0.5) -> tuple[bool, float]:
     """
-    Detect if text is primarily English.
+    Detect if text is primarily English using Rust whatlang.
 
     Args:
         text: The text to analyze
-        sample_size: Number of words to sample for detection
+        confidence_threshold: Minimum confidence to accept detection (default 0.5)
 
     Returns:
-        (is_english, confidence) - is_english is True if >40% English markers found
+        (is_english, confidence) - is_english is True if detected as English with sufficient confidence
     """
-    # Extract words (simple tokenization)
-    words = re.findall(r"\b[a-zA-Z]{2,}\b", text.lower())
+    result = rust_ocr_clean.detect_language(text, confidence_threshold)
+    return result.is_english, result.confidence
 
-    if len(words) < 20:
-        # Too short to determine, assume English
-        return True, 0.0
 
-    # Sample if text is long
-    if len(words) > sample_size:
-        import random
+def fix_unicode(text: str) -> str:
+    """
+    Fix Unicode issues using Rust implementation.
 
-        words = random.sample(words, sample_size)
+    Fixes:
+    - Mojibake (encoding errors like "Ã©" → "é")
+    - Broken HTML entities
+    - Unicode whitespace normalization
+    - NFC normalization
 
-    # Count English marker words
-    english_count = sum(1 for w in words if w in ENGLISH_MARKER_WORDS)
-    ratio = english_count / len(words)
-
-    # English text typically has 20-40% marker words (with expanded list)
-    # Non-English will have <5%
-    # Threshold of 10% with minimum count catches most cases
-    # Even lists/directories hit 15%+ due to "of", "and", "for"
-    is_english = ratio > 0.10 and english_count >= 5
-
-    return is_english, ratio
+    Should run BEFORE pattern matching.
+    """
+    return rust_ocr_clean.fix_unicode(text)
 
 
 def normalize_whitespace(text: str) -> tuple[str, int]:
@@ -501,6 +434,12 @@ class CleanupStats:
     substitution_counts: Counter = field(default_factory=Counter)
     flagged_files: list = field(default_factory=list)
     skipped_files: list = field(default_factory=list)  # Non-English files
+    # Triage stats
+    triage_passed: int = 0
+    triage_quarantined: int = 0
+    triage_rejected: int = 0
+    triage_results: list = field(default_factory=list)  # Full triage results for JSONL export
+    elapsed_seconds: float = 0.0  # Total processing time
 
     def to_dict(self):
         return {
@@ -515,6 +454,12 @@ class CleanupStats:
             "top_substitutions": self.substitution_counts.most_common(50),
             "flagged_files": self.flagged_files[:100],
             "skipped_files": self.skipped_files[:100],
+            "triage_passed": self.triage_passed,
+            "triage_quarantined": self.triage_quarantined,
+            "triage_rejected": self.triage_rejected,
+            "triage_skipped_files": [r for r in self.triage_results if r["action"] != "pass"][
+                :500
+            ],  # Cap at 500 to avoid huge reports
         }
 
 
@@ -533,34 +478,39 @@ def clean_text(text: str, stats: Optional[CleanupStats] = None) -> tuple[str, in
     Apply full OCR cleanup pipeline to text.
 
     Pipeline order:
-    1. Whitespace normalization (strip trailing, collapse multiples)
-    2. Hyphen rejoining (fix line-break hyphenation)
-    3. Mid-word uppercase normalization (sVo -> svo)
-    4. OCR substitutions (pattern-based fixes)
+    1. Unicode normalization (ftfy - fix mojibake, encoding errors)
+    2. Whitespace normalization (strip trailing, collapse multiples)
+    3. Hyphen rejoining (fix line-break hyphenation)
+    4. Mid-word uppercase normalization (sVo -> svo)
+    5. OCR substitutions (pattern-based fixes)
 
     Returns: (cleaned_text, total_modification_count)
     """
     total_subs = 0
 
-    # Step 1: Whitespace normalization (MUST be first for hyphen detection)
+    # Step 1: Unicode normalization (fix mojibake, encoding errors)
+    # Must run before pattern matching to ensure consistent character representation
+    text = fix_unicode(text)
+
+    # Step 2: Whitespace normalization (MUST be before hyphen detection)
     text, ws_count = normalize_whitespace(text)
     total_subs += ws_count
     if stats:
         stats.whitespace_fixes += ws_count
 
-    # Step 2: Hyphen rejoining (after whitespace normalization)
+    # Step 3: Hyphen rejoining (after whitespace normalization)
     text, hyphen_count = rejoin_hyphenated(text)
     total_subs += hyphen_count
     if stats:
         stats.hyphen_rejoins += hyphen_count
 
-    # Step 3: Mid-word uppercase normalization
+    # Step 4: Mid-word uppercase normalization
     text, caps_count = normalize_midword_caps(text)
     total_subs += caps_count
     if stats:
         stats.midword_caps_fixes += caps_count
 
-    # Step 4: OCR substitutions
+    # Step 5: OCR substitutions
     for pattern, replacement, context in OCR_SUBSTITUTIONS:
         if context:
 
@@ -647,12 +597,22 @@ def clean_batch(
     output_dir: Optional[Path] = None,
     file_pattern: str = "*.txt",
     use_rust: bool = True,
+    skip_triage: bool = False,
+    triage_output: Optional[Path] = None,
 ) -> CleanupStats:
     """
     Clean all text files in a directory.
 
     Uses Rust for file I/O when available (much faster).
     Single-threaded for clean Ctrl+C handling.
+
+    Args:
+        input_dir: Directory containing input files
+        output_dir: Directory for output files (None = in-place)
+        file_pattern: Glob pattern for files to process
+        use_rust: Use Rust engine for speed
+        skip_triage: If True, skip document triage and process all files
+        triage_output: If set, write triage results to this JSONL file
     """
     import signal
     import sys
@@ -724,13 +684,141 @@ def clean_batch(
             print("No files found.")
             return stats
 
+        # Document triage - filter out problematic content before OCR cleanup
+        files_to_process = input_files
+        if not skip_triage:
+            print("Running document triage...")
+            try:
+                import rust_ocr_clean  # type: ignore[import-not-found]
+
+                # Process in chunks for progress and cancel support
+                chunk_size = 1000
+                total_files = len(input_files)
+                pass_files = []
+                language_counts: dict[str, int] = {}
+                non_english_count = 0
+                triage_start = time.time()
+                last_triage_update = triage_start
+
+                for chunk_start in range(0, total_files, chunk_size):
+                    if interrupted:
+                        print("\n  Triage interrupted!")
+                        break
+
+                    chunk_end = min(chunk_start + chunk_size, total_files)
+                    chunk_files = input_files[chunk_start:chunk_end]
+                    paths = [str(f) for f in chunk_files]
+
+                    # Batch triage with Rust
+                    triage_results = rust_ocr_clean.triage_batch(paths)
+
+                    for r in triage_results:
+                        if interrupted:
+                            break
+
+                        triage_record = {
+                            "path": r.path,
+                            "action": r.action,
+                            "problems": list(r.problems),
+                            "signals": {
+                                "alpha_ratio": round(r.alpha_ratio, 4),
+                                "line_length_cv": round(r.line_length_cv, 4),
+                                "mean_words_per_line": round(r.mean_words_per_line, 2),
+                                "fragment_ratio": round(r.fragment_ratio, 4),
+                            },
+                        }
+
+                        # Language detection for files that pass structural checks
+                        if r.action == "pass":
+                            try:
+                                lang_result = rust_ocr_clean.detect_language_file(r.path, 0.5)
+                                triage_record["language"] = {
+                                    "detected": lang_result.detected_lang,
+                                    "confidence": round(lang_result.confidence, 4),
+                                    "is_english": lang_result.is_english,
+                                }
+                                if not lang_result.is_english:
+                                    triage_record["action"] = "reject"
+                                    triage_record["problems"] = list(triage_record["problems"]) + [
+                                        "non_english"
+                                    ]
+                                    non_english_count += 1
+                                    lang = lang_result.detected_lang
+                                    language_counts[lang] = language_counts.get(lang, 0) + 1
+                            except Exception:
+                                pass  # Assume English if detection fails
+
+                        stats.triage_results.append(triage_record)
+
+                        if triage_record["action"] == "pass":
+                            pass_files.append(Path(r.path))
+                            stats.triage_passed += 1
+                        elif triage_record["action"] == "quarantine":
+                            stats.triage_quarantined += 1
+                        else:  # reject
+                            stats.triage_rejected += 1
+
+                    # Progress update
+                    now = time.time()
+                    processed = chunk_end
+                    if now - last_triage_update >= 1.0 or processed == total_files or interrupted:
+                        elapsed = now - triage_start
+                        files_per_sec = processed / elapsed if elapsed > 0 else 0
+                        remaining = (
+                            (total_files - processed) / files_per_sec if files_per_sec > 0 else 0
+                        )
+
+                        if remaining >= 3600:
+                            eta = f"{remaining / 3600:.1f}h"
+                        elif remaining >= 60:
+                            eta = f"{remaining / 60:.1f}m"
+                        else:
+                            eta = f"{remaining:.0f}s"
+
+                        pct = (processed / total_files) * 100
+                        print(
+                            f"  [{pct:5.1f}%] {processed:,}/{total_files:,} | "
+                            f"{files_per_sec:.0f} files/s | ETA: {eta} | "
+                            f"pass: {stats.triage_passed:,}, "
+                            f"quarantine: {stats.triage_quarantined:,}, "
+                            f"reject: {stats.triage_rejected:,}"
+                        )
+                        last_triage_update = now
+
+                files_to_process = pass_files
+
+                # Show language stats
+                if language_counts:
+                    print(f"\n  Non-English detected: {non_english_count:,} files")
+                    sorted_langs = sorted(language_counts.items(), key=lambda x: -x[1])[:10]
+                    for lang, count in sorted_langs:
+                        print(f"    {lang}: {count:,}")
+                    if len(language_counts) > 10:
+                        print(f"    ... and {len(language_counts) - 10} more languages")
+                else:
+                    print("\n  Language check: all files English (or detection inconclusive)")
+
+                # Write triage results to JSONL if requested
+                if triage_output:
+                    import json
+
+                    with open(triage_output, "w") as f:
+                        for record in stats.triage_results:
+                            f.write(json.dumps(record) + "\n")
+                    print(f"  Triage results written to: {triage_output}")
+
+            except ImportError:
+                print("  Skipped (Rust module not available)")
+
         # Skip upfront size calculation - we'll track as we go
         print("(Size will be calculated during processing)")
 
         print(f"\n{'=' * 60}")
         print(f"OCR Cleanup - {'Rust' if rust_available else 'Python'} engine")
         print(f"{'=' * 60}")
-        print(f"  Files to process: {stats.total_files:,}")
+        print(f"  Files to process: {len(files_to_process):,}")
+        if not skip_triage:
+            print(f"  (Skipped by triage: {stats.triage_quarantined + stats.triage_rejected:,})")
         print(f"  Output: {output_dir or 'in-place'}")
         print(f"{'=' * 60}\n")
 
@@ -739,7 +827,7 @@ def clean_batch(
         last_update = start_time
         i = 0  # Track progress even if loop is empty or interrupted
 
-        for i, input_path in enumerate(input_files, 1):
+        for i, input_path in enumerate(files_to_process, 1):
             if interrupted:
                 break
 
@@ -780,11 +868,12 @@ def clean_batch(
 
             # Progress update every 2 seconds or every 500 files
             now = time.time()
+            total_to_process = len(files_to_process)
             if now - last_update >= 2.0 or i % 500 == 0:
                 elapsed = now - start_time
                 files_per_sec = i / elapsed if elapsed > 0 else 0
                 mb_per_sec = (bytes_processed / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                remaining = (stats.total_files - i) / files_per_sec if files_per_sec > 0 else 0
+                remaining = (total_to_process - i) / files_per_sec if files_per_sec > 0 else 0
 
                 # Format remaining time
                 if remaining >= 3600:
@@ -794,9 +883,9 @@ def clean_batch(
                 else:
                     eta = f"{remaining:.0f}s"
 
-                pct = (i / stats.total_files) * 100
+                pct = (i / total_to_process) * 100 if total_to_process > 0 else 100
                 print(
-                    f"  [{pct:5.1f}%] {i:,}/{stats.total_files:,} files | "
+                    f"  [{pct:5.1f}%] {i:,}/{total_to_process:,} files | "
                     f"{files_per_sec:.1f} files/s | {mb_per_sec:.1f} MB/s | "
                     f"ETA: {eta} | subs: {stats.total_substitutions:,}"
                 )
@@ -804,18 +893,25 @@ def clean_batch(
 
         # Final stats
         elapsed = time.time() - start_time
-        files_per_sec = stats.total_files / elapsed if elapsed > 0 else 0
+        stats.elapsed_seconds = elapsed  # Store for final report
+        total_to_process = len(files_to_process)
+        files_per_sec = total_to_process / elapsed if elapsed > 0 else 0
         mb_per_sec = (bytes_processed / (1024 * 1024)) / elapsed if elapsed > 0 else 0
 
         print(f"\n{'=' * 60}")
         if interrupted:
-            print(f"INTERRUPTED after {i:,} of {stats.total_files:,} files")
+            print(f"INTERRUPTED after {i:,} of {total_to_process:,} files")
         else:
             print("COMPLETE")
         print(f"{'=' * 60}")
         print(f"  Files processed: {i:,}")
         print(f"  Files modified:  {stats.files_modified:,}")
         print(f"  Substitutions:   {stats.total_substitutions:,}")
+        if not skip_triage:
+            print(
+                f"  Triage skipped:  {stats.triage_quarantined + stats.triage_rejected:,} "
+                f"({stats.triage_quarantined:,} quarantine, {stats.triage_rejected:,} reject)"
+            )
         print(f"  Time elapsed:    {elapsed:.1f}s")
         print(f"  Throughput:      {files_per_sec:.1f} files/s, {mb_per_sec:.1f} MB/s")
         if stats.files_flagged > 0:
@@ -904,7 +1000,26 @@ Examples:
     batch_parser.add_argument("input_dir", type=Path, help="Input directory")
     batch_parser.add_argument("-o", "--output-dir", type=Path, help="Output directory")
     batch_parser.add_argument("--pattern", default="*.txt", help="File pattern (default: *.txt)")
-    batch_parser.add_argument("--report", type=Path, help="Save stats report to JSON")
+    batch_parser.add_argument(
+        "--report",
+        type=Path,
+        help="Override stats report location (default: {output_parent}/_cleanup_report.json)",
+    )
+    batch_parser.add_argument(
+        "--triage-output",
+        type=Path,
+        help="Override triage results location (default: {output_parent}/_triage_results.jsonl)",
+    )
+    batch_parser.add_argument(
+        "--no-report",
+        action="store_true",
+        help="Disable automatic report generation",
+    )
+    batch_parser.add_argument(
+        "--skip-triage",
+        action="store_true",
+        help="Skip document triage and process all files",
+    )
 
     # Analyze
     analyze_parser = subparsers.add_parser("analyze", help="Analyze corpus for OCR errors")
@@ -931,25 +1046,106 @@ Examples:
             print(cleaned)
 
     elif args.command == "batch":
-        stats = clean_batch(args.input_dir, args.output_dir, args.pattern)
+        from datetime import datetime
+
+        run_start = datetime.now()
+
+        # Determine report paths (default to parent of output dir)
+        output_parent = args.output_dir.parent if args.output_dir else args.input_dir
+        report_path = args.report if args.report else output_parent / "_cleanup_report.json"
+        triage_path = (
+            args.triage_output if args.triage_output else output_parent / "_triage_results.jsonl"
+        )
+
+        # Don't overwrite existing files - add numeric suffix
+        if report_path:
+            report_path = get_unique_path(report_path)
+        if triage_path:
+            triage_path = get_unique_path(triage_path)
+
+        # Disable reports if requested
+        if args.no_report:
+            report_path = None
+            triage_path = None
+
+        stats = clean_batch(
+            args.input_dir,
+            args.output_dir,
+            args.pattern,
+            skip_triage=args.skip_triage,
+            triage_output=triage_path,
+        )
+
+        run_end = datetime.now()
 
         print(f"\n{'=' * 60}")
         print("Batch cleanup complete")
         print(f"{'=' * 60}")
-        print(f"  Total files: {stats.total_files}")
-        print(f"  Files modified: {stats.files_modified}")
-        print(f"  Files flagged (garbage): {stats.files_flagged}")
-        print(f"  Total substitutions: {stats.total_substitutions}")
+
+        # Format duration in human terms
+        duration = stats.elapsed_seconds if hasattr(stats, "elapsed_seconds") else 0
+        if duration >= 3600:
+            hours = int(duration // 3600)
+            mins = int((duration % 3600) // 60)
+            secs = int(duration % 60)
+            duration_str = f"{hours}h {mins}m {secs}s"
+        elif duration >= 60:
+            mins = int(duration // 60)
+            secs = int(duration % 60)
+            duration_str = f"{mins}m {secs}s"
+        else:
+            duration_str = f"{duration:.1f}s"
+
+        print(f"  Duration: {duration_str}")
+        print(f"  Total files scanned: {stats.total_files:,}")
+
+        # Triage summary
+        if stats.triage_passed > 0 or stats.triage_quarantined > 0 or stats.triage_rejected > 0:
+            print("\n  Triage results:")
+            print(f"    Passed (processed):  {stats.triage_passed:,}")
+            print(f"    Quarantined:         {stats.triage_quarantined:,}")
+            print(f"    Rejected:            {stats.triage_rejected:,}")
+
+        # OCR cleanup results
+        print("\n  OCR cleanup:")
+        print(f"    Files modified:      {stats.files_modified:,}")
+        print(f"    Total substitutions: {stats.total_substitutions:,}")
+        if stats.files_flagged > 0:
+            print(f"    Flagged (post-OCR garbage): {stats.files_flagged:,}")
 
         if stats.substitution_counts:
-            print("\nTop substitutions:")
+            print("\n  Top substitutions:")
             for pattern, count in stats.substitution_counts.most_common(10):
-                print(f"  {pattern}: {count}")
+                print(f"    {pattern}: {count:,}")
 
-        if args.report:
-            with open(args.report, "w") as f:
-                json.dump(stats.to_dict(), f, indent=2)
-            print(f"\nReport saved to {args.report}")
+        # Write reports with metadata
+        print("\n  Reports:")
+        print(f"    Output directory: {args.output_dir}")
+
+        if report_path:
+            report_data = {
+                "metadata": {
+                    "input_dir": str(args.input_dir.resolve()),
+                    "output_dir": str(args.output_dir.resolve()) if args.output_dir else None,
+                    "run_started": run_start.isoformat(),
+                    "run_completed": run_end.isoformat(),
+                    "duration_seconds": duration,
+                    "duration_human": duration_str,
+                    "pattern": args.pattern,
+                    "skip_triage": args.skip_triage,
+                },
+                "stats": stats.to_dict(),
+            }
+            with open(report_path, "w") as f:
+                json.dump(report_data, f, indent=2)
+            print(f"    Stats report: {report_path}")
+
+        if triage_path and triage_path.exists():
+            print(f"    Triage results: {triage_path}")
+        elif args.no_report:
+            print("    (Reports disabled with --no-report)")
+
+        print(f"{'=' * 60}")
 
     elif args.command == "analyze":
         report = analyze_corpus(args.corpus_dir, args.sample)

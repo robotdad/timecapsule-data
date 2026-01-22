@@ -10,46 +10,150 @@ Historical documents digitized via OCR (Optical Character Recognition) contain v
 - **Word fragments**: "ing", "tion" split from parent words
 - **Garbage text**: Random character sequences from poor scans
 - **Missing/extra characters**: "th" → "the", "thhe" → "the"
+- **Encoding errors**: Mojibake like "Ã©" instead of "é"
+- **Non-English content**: Documents in other languages mixed in
 
 These errors degrade the quality of text for LLM training. However, not all documents need the same level of cleanup - some have excellent OCR, others are severely corrupted.
 
-## Tiered Approach
+## Pipeline Overview
 
-We use a tiered strategy to balance quality vs computational cost:
+The OCR cleanup pipeline runs entirely in Rust for performance at scale (2M+ documents):
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  TIER 0: Scoring & Triage (tc-ocr-score)                        │
-│  Fast dictionary-based scoring to identify problem files        │
-│  Score = % unknown words + 2×(% garbage patterns)               │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│  PREPROCESSING (Rust)                                               │
+│  1. Unicode normalization - Fix mojibake, HTML entities, encoding   │
+│  2. Language detection - Reject non-English (whatlang library)      │
+└─────────────────────────────────────────────────────────────────────┘
                               │
-                    ┌─────────┴─────────┐
-                    ▼                   ▼
-            Score < 0.10          Score >= 0.10
-            (Good/Moderate)       (Poor/Garbage)
-                    │                   │
-                    ▼                   ▼
-┌───────────────────────────┐   ┌───────────────────────────────────┐
-│ TIER 1: Basic Cleanup     │   │ TIER 2: SymSpell Correction       │
-│ tc-ocr-clean (patterns)   │   │ tc-ocr-symspell (dictionary)      │
-│ ~40 common substitutions  │   │ Edit distance corrections         │
-└───────────────────────────┘   └───────────────────────────────────┘
-                                        │
-                              Still bad (Score >= 0.20)?
-                                        │
-                                        ▼
-                    ┌───────────────────────────────────────────┐
-                    │ TIER 3: LLM Correction (future)           │
-                    │ Llama-3.1-70B via vLLM                    │
-                    │ Only for worst ~5% of corpus              │
-                    │ See: LLM_OCR_CORRECTION_RESEARCH.md       │
-                    └───────────────────────────────────────────┘
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  DOCUMENT TRIAGE (tc-doc-triage, Rust)                              │
+│  Classify documents based on quality signals:                       │
+│  - alpha_ratio: % alphabetic characters                             │
+│  - line_length_cv: coefficient of variation in line lengths         │
+│  - fragment_ratio: short incomplete lines                           │
+│  - list_pattern_ratio: index/catalog patterns                       │
+│  Actions: process | review | reject                                 │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+           process         review          reject
+              │               │               │
+              ▼               ▼               ▼
+┌─────────────────────┐ ┌───────────┐ ┌─────────────────┐
+│ TIER 1: OCR Cleanup │ │ Human     │ │ Logged to       │
+│ tc-ocr-clean (Rust) │ │ Review    │ │ rejected.jsonl  │
+│ 150+ patterns ~35x  │ │ Queue     │ │ (not processed) │
+└─────────────────────┘ └───────────┘ └─────────────────┘
+              │
+              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  TIER 2: SymSpell Correction (for poor quality)                     │
+│  tc-ocr-symspell - Dictionary-based edit distance corrections       │
+└─────────────────────────────────────────────────────────────────────┘
+              │
+              ▼ (Still bad? Score >= 0.20)
+┌─────────────────────────────────────────────────────────────────────┐
+│  TIER 3: LLM Correction (future)                                    │
+│  Llama-3.1-70B via vLLM - Only for worst ~5% of corpus              │
+│  See: LLM_OCR_CORRECTION_RESEARCH.md                                │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
+## Preprocessing (Rust)
+
+Before any OCR pattern matching, the pipeline applies preprocessing in Rust:
+
+### Unicode Normalization
+
+Fixes common encoding issues that corrupt text:
+
+| Issue | Example | Fixed |
+|-------|---------|-------|
+| Mojibake (UTF-8 as Latin-1) | "Ã©" | "é" |
+| HTML entities | "&amp;" | "&" |
+| Double-encoded entities | "&amp;amp;" | "&" |
+| Unicode whitespace | Non-breaking spaces | Regular spaces |
+| BOM markers | Zero-width chars | Removed |
+
+**Implementation**: Rust `unicode-normalization` crate (NFC) plus custom mojibake patterns.
+
+### Language Detection
+
+Rejects non-English documents to maintain corpus coherence:
+
+| Language | Action | Logged To |
+|----------|--------|-----------|
+| English (confidence ≥ 0.5) | Process | - |
+| Non-English | Reject | `rejected_files.jsonl` |
+| Unknown/too short | Assume English | - |
+
+**Implementation**: Rust `whatlang` library (no external model files needed).
+
+---
+
 ## Tools
+
+### tc-doc-triage - Document Classification
+
+Classifies documents based on structural quality signals before OCR cleanup.
+
+```bash
+# Triage a directory
+tc-doc-triage /path/to/corpus -o triage_results.jsonl
+
+# Triage with custom thresholds
+tc-doc-triage /path/to/corpus -o results.jsonl --alpha-min 0.7
+```
+
+**Triage Actions:**
+
+| Action | Criteria | Handling |
+|--------|----------|----------|
+| `process` | Good quality signals | Proceed to OCR cleanup |
+| `review` | Ambiguous quality | Queue for human review |
+| `reject` | Poor quality / catalogs / non-English | Log and skip |
+
+**Quality Signals:**
+
+| Signal | Description | Reject If |
+|--------|-------------|-----------|
+| `alpha_ratio` | % alphabetic characters | < 0.6 |
+| `line_length_cv` | Line length variation | > 1.5 (multicolumn) |
+| `fragment_ratio` | Short incomplete lines | > 0.4 |
+| `list_pattern_ratio` | Index/catalog patterns | > 0.3 |
+| `is_english` | Language detection | False |
+
+### tc-ocr-clean - Pattern Replacement
+
+Rust-powered OCR cleanup with 150+ patterns.
+
+```bash
+# Clean a single file
+tc-ocr-clean input.txt -o output.txt
+
+# Batch process (includes triage by default)
+tc-ocr-clean batch ./corpus -o ./cleaned
+
+# Skip triage (if already done separately)
+tc-ocr-clean batch ./corpus -o ./cleaned --skip-triage
+```
+
+**Pattern Categories:**
+
+| Category | Examples | Count |
+|----------|----------|-------|
+| Long-s artifacts | fuch→such, faid→said | ~50 |
+| li/h confusion | tlie→the, wliich→which | ~40 |
+| ll→U confusion | wiU→will, pubUc→public | ~75 |
+| rn/m confusion | tirne→time, frorn→from | ~10 |
+| Google watermarks | "Digitized by Google" | ~10 |
+
+**Performance**: ~35x faster than Python (~14 MB/s on NVMe).
 
 ### tc-ocr-score - Quality Scoring
 
@@ -76,28 +180,6 @@ tc-ocr-score filter ./corpus --threshold 0.10 \
 | POOR | < 0.20 | Many errors, needs SymSpell |
 | GARBAGE | >= 0.20 | Severe corruption, may need LLM or discard |
 
-**How scoring works:**
-1. Extract all words from text
-2. Check each word against English dictionary (pyenchant)
-3. Detect "garbage" patterns (long consonant runs, repeated chars)
-4. Calculate: `score = unknown_rate + 2 × garbage_rate`
-
-### tc-ocr-clean - Pattern Replacement
-
-Simple pattern-based cleanup for common OCR substitutions.
-
-```bash
-tc-ocr-clean input.txt -o output.txt
-tc-ocr-clean batch ./corpus -o ./cleaned
-```
-
-Handles ~40 common patterns like:
-- `tbe` → `the`
-- `liave` → `have`
-- `wliich` → `which`
-
-**Limitation**: Only fixes known patterns. Cannot handle novel errors.
-
 ### tc-ocr-symspell - Dictionary Spell Correction
 
 Uses SymSpell algorithm for fast, dictionary-based correction.
@@ -113,68 +195,87 @@ tc-ocr-symspell clean document.txt -o cleaned.txt
 tc-ocr-symspell batch ./corpus -o ./cleaned --report stats.json
 ```
 
-**How it works:**
-1. Load 82,000+ word frequency dictionary
-2. For each word, find closest dictionary match within edit distance 2
-3. Apply correction if match has high frequency
-4. Preserve case (THE → THE, the → the, The → The)
-
 **Limitations:**
 - Cannot fix severely corrupted words (edit distance > 2)
 - May incorrectly "fix" proper nouns, place names, historical terms
 - Word fragments (split words) remain unfixed
-- Conservative to avoid false positives
+
+### tc-ocr-vocab - Vocabulary Extraction
+
+Extract vocabulary from cleaned corpus for analysis or whitelist building.
+
+```bash
+# Extract vocabulary with minimum frequency
+tc-ocr-vocab /path/to/cleaned -o vocab.json --min-freq 5
+```
+
+**Use cases:**
+- Identify additional OCR patterns to add
+- Build whitelist for spell-checking
+- Analyze corpus quality
 
 ---
 
 ## Recommended Workflow
 
-### 1. Score the corpus
+### 1. Triage documents (optional, included in batch)
 
 ```bash
-tc-ocr-score analyze /path/to/corpus --report quality_report.json
+tc-doc-triage /path/to/corpus -o triage_results.jsonl
 ```
 
-Review the quality distribution to understand your corpus.
+Review `triage_results.jsonl` to understand corpus quality distribution.
 
-### 2. Separate by quality tier
+### 2. Run OCR cleanup
 
 ```bash
-# Good files (minimal cleanup)
-tc-ocr-score filter /path/to/corpus --threshold 0.05 \
-    --output-good ./tier_good
-
-# Moderate files (basic cleanup)
-tc-ocr-score filter /path/to/corpus --threshold 0.10 \
-    --output-good ./tier_moderate --output-bad ./tier_needs_work
-
-# etc.
+# Full pipeline (triage + preprocess + OCR patterns)
+tc-ocr-clean batch /path/to/raw -o /path/to/cleaned
 ```
 
-### 3. Apply appropriate cleanup
+This will:
+- Apply unicode normalization (Rust)
+- Detect and reject non-English documents (Rust)
+- Run document triage (Rust)
+- Apply 150+ OCR patterns (Rust)
+- Log rejected files to `rejected_files.jsonl`
+
+### 3. Score cleaned corpus
 
 ```bash
-# Tier 1: Basic pattern cleanup for moderate files
-tc-ocr-clean batch ./tier_moderate -o ./tier_moderate_clean
-
-# Tier 2: SymSpell for poor files
-tc-ocr-symspell batch ./tier_needs_work -o ./tier_symspell_clean \
-    --report symspell_stats.json
+tc-ocr-score analyze /path/to/cleaned --report quality_report.json
 ```
 
-### 4. Re-score and verify
+### 4. Apply SymSpell to poor quality files
 
 ```bash
-# Check if cleanup improved quality
-tc-ocr-score analyze ./tier_symspell_clean --report post_cleanup.json
+tc-ocr-symspell batch /path/to/poor_quality -o /path/to/symspell_cleaned
 ```
 
-### 5. Handle remaining garbage
+### 5. Extract vocabulary (optional)
 
-Files still scoring >= 0.20 after SymSpell are candidates for:
-- Tier 3 LLM correction (see `LLM_OCR_CORRECTION_RESEARCH.md`)
-- Manual review
-- Exclusion from training corpus
+```bash
+tc-ocr-vocab /path/to/cleaned -o vocab.json --min-freq 5
+```
+
+---
+
+## Output Files
+
+| File | Description |
+|------|-------------|
+| `cleaned/*.txt` | Processed text files |
+| `rejected_files.jsonl` | Files rejected (non-English, garbage, catalogs) |
+| `triage_results.jsonl` | Detailed triage decisions and signals |
+| `cleanup_stats.json` | Processing statistics |
+
+**rejected_files.jsonl format:**
+
+```json
+{"path": "file.txt", "reason": "non_english", "lang": "fra", "confidence": 0.95}
+{"path": "file2.txt", "reason": "low_alpha_ratio", "alpha_ratio": 0.45}
+{"path": "file3.txt", "reason": "catalog_index", "list_pattern_ratio": 0.52}
+```
 
 ---
 
@@ -186,43 +287,35 @@ SymSpell may incorrectly "correct":
 - **Proper nouns**: "Taggart" → "Haggard", "Sunbury" → "Sudbury"
 - **Historical terms**: "connexion" → "connection" 
 - **Brand names**: "Ripans" → "Ripens" (Ripans Tabules was a medicine)
-- **Technical terms**: Domain-specific vocabulary
 
-We mitigate this by:
-- Requiring high frequency for suggestions (>1000 occurrences)
-- Skipping short words and acronyms
-- Skipping common word fragments
-- Using conservative edit distance thresholds
+We mitigate this with vocabulary whitelists and conservative thresholds.
+
+### Multi-Column Text
+
+Documents with multi-column layouts (newspapers, some books) produce garbled text when OCR'd line-by-line. These are detected by high `line_length_cv` and flagged for review or rejection.
+
+**Future work**: Column detection and reordering.
 
 ### Word Fragments
 
-OCR often splits words across line breaks or incorrectly:
+OCR often splits words across line breaks:
 - "ap- propriate" → "ap" + "propriate"
-- "associa- tion" → "associa" + "tion"
 
-These fragments are detected but not corrected by current tools.
-They require context-aware LLM correction (Tier 3).
-
-### Garbage Text
-
-Severely corrupted text (score >= 0.35) often cannot be recovered:
-- Missing pages from scans
-- Heavily damaged original documents
-- Non-text content (tables, images) OCR'd incorrectly
-
-Consider excluding these from training corpus.
+Hyphen rejoining handles most cases, but some fragments remain.
 
 ---
 
 ## Dependencies
 
-```bash
-# Python packages
-pip install symspellpy pyenchant
+**Rust crates** (in rust-ocr-clean):
+- `whatlang` - Language detection
+- `unicode-normalization` - NFC normalization
+- `regex` - Pattern matching
+- `pyo3` - Python bindings
 
-# Optional (for NLTK fallback if pyenchant unavailable)
-pip install nltk
-```
+**Python packages:**
+- `symspellpy` - Spell correction
+- `pyenchant` - Dictionary lookups
 
 **System packages** (for pyenchant):
 - Ubuntu/Debian: `libenchant-2-dev`
@@ -230,9 +323,24 @@ pip install nltk
 
 ---
 
+## Performance
+
+Benchmarked on Ryzen 5950X, NVMe storage:
+
+| Component | Language | Throughput |
+|-----------|----------|------------|
+| Preprocessing | Rust | ~20 MB/s |
+| OCR patterns | Rust | ~14 MB/s |
+| Scoring | Python (C-backed) | ~5 MB/s |
+| SymSpell | Python | ~2 MB/s |
+
+For 2M+ documents, the Rust components are critical for reasonable processing times.
+
+---
+
 ## Future Work
 
 1. **Tier 3 LLM Correction**: See `LLM_OCR_CORRECTION_RESEARCH.md`
-2. **Custom vocabulary**: Add corpus-derived vocabulary to reduce false positives
-3. **Word fragment joining**: Detect and rejoin split words
-4. **Confidence scoring**: Provide per-correction confidence for review
+2. **Multi-column detection**: Reorder columns before OCR cleanup
+3. **Custom vocabulary expansion**: Corpus-derived vocabulary
+4. **Perplexity scoring**: KenLM as complement to dictionary scoring

@@ -339,8 +339,10 @@ The OCR cleanup pipeline has multiple stages for progressively cleaning text:
 
 #### Stage 1: Pattern-Based Cleanup (`tc-ocr-clean`)
 
-Fast, safe transformations using regex patterns. Includes:
-- **Language detection** - Skips non-English documents (flags for review)
+Fast, safe transformations using Rust-powered processing. Includes:
+- **Document triage** - Classifies documents (process/review/reject) based on quality signals
+- **Language detection** - Rust `whatlang` library rejects non-English documents
+- **Unicode normalization** - Fixes mojibake, HTML entities, encoding errors (ftfy-equivalent in Rust)
 - **Whitespace normalization** - Strips trailing whitespace, collapses multiple spaces
 - **Hyphen rejoining** - Fixes line-break hyphenation (`word-\ncontinuation` → `wordcontinuation`)
 - **Mid-word caps** - Fixes OCR errors like `sVo` → `svo`
@@ -348,11 +350,14 @@ Fast, safe transformations using regex patterns. Includes:
 - **Garbage detection** - Flags files with excessive OCR noise
 
 ```bash
-# Analyze OCR quality (dry run)
-tc-ocr-clean analyze ./corpus/ia --report ocr-report.json
+# Triage documents first (classify quality)
+tc-doc-triage /path/to/corpus -o triage_results.jsonl
 
-# Clean with pattern-based rules
-tc-ocr-clean batch ./corpus/ia/raw -o ./corpus/ia/cleaned --report cleanup-report.json
+# Clean with pattern-based rules (includes triage by default)
+tc-ocr-clean batch ./corpus/ia/raw -o ./corpus/ia/cleaned
+
+# Skip triage if already done separately
+tc-ocr-clean batch ./corpus/ia/raw -o ./corpus/ia/cleaned --skip-triage
 ```
 
 #### Stage 2: Vocabulary Extraction (`tc-ocr-vocab`)
@@ -401,7 +406,7 @@ Perseus texts are scholarly editions, also high quality.
 
 ## OCR Cleanup - Rust Engine
 
-The OCR cleanup tool uses a high-performance Rust engine (`rust-ocr-clean`) for pattern matching and text substitution. This provides **~50x speedup** over the original pure-Python regex implementation.
+The OCR cleanup tool uses a high-performance Rust engine (`rust-ocr-clean`) for pattern matching and text substitution. This provides **~35x speedup** over the original pure-Python regex implementation.
 
 ### Performance
 

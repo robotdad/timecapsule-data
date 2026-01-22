@@ -24,6 +24,28 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+
+def get_unique_path(path: Path) -> Path:
+    """Return a unique path by adding numeric suffix if file exists.
+
+    Examples:
+        vocab_candidates.txt -> vocab_candidates_1.txt -> vocab_candidates_2.txt
+    """
+    if not path.exists():
+        return path
+
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+
+    counter = 1
+    while True:
+        new_path = parent / f"{stem}_{counter}{suffix}"
+        if not new_path.exists():
+            return new_path
+        counter += 1
+
+
 # =============================================================================
 # Known Vocabulary Whitelist
 # Words in this set are skipped during extraction (known good words)
@@ -630,11 +652,18 @@ def cmd_extract(args):
                 show_known=args.show_known,
             )
 
+            # Default output to parent of input dir
+            input_path = Path(args.input_dir)
             if args.output:
-                Path(args.output).write_text(output, encoding="utf-8")
-                print(f"\nOutput written to: {args.output}", file=sys.stderr)
+                output_path = Path(args.output)
             else:
-                print(output)
+                output_path = input_path.parent / "_vocab_candidates.txt"
+
+            # Don't overwrite existing files - add numeric suffix
+            output_path = get_unique_path(output_path)
+
+            output_path.write_text(output, encoding="utf-8")
+            print(f"\nOutput written to: {output_path}", file=sys.stderr)
         else:
             print("\nSkipped output generation due to interrupt.", file=sys.stderr)
 
@@ -696,12 +725,16 @@ Examples:
     # Extract command
     extract_parser = subparsers.add_parser("extract", help="Extract vocabulary candidates")
     extract_parser.add_argument("input_dir", help="Input directory to scan")
-    extract_parser.add_argument("-o", "--output", help="Output file (default: stdout)")
+    extract_parser.add_argument(
+        "-o",
+        "--output",
+        help="Output file (default: {input_parent}/_vocab_candidates.txt)",
+    )
     extract_parser.add_argument(
         "--min-freq",
         type=int,
-        default=3,
-        help="Minimum frequency to include (default: 3)",
+        default=5,
+        help="Minimum frequency to include (default: 5)",
     )
     extract_parser.add_argument(
         "--pattern",
