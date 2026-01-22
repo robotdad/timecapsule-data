@@ -335,12 +335,65 @@ tc-validate ./corpus/ia --cutoff-year 1914
 
 ### Step 3: Clean OCR Errors (for IA texts)
 
+The OCR cleanup pipeline has multiple stages for progressively cleaning text:
+
+#### Stage 1: Pattern-Based Cleanup (`tc-ocr-clean`)
+
+Fast, safe transformations using regex patterns. Includes:
+- **Language detection** - Skips non-English documents (flags for review)
+- **Whitespace normalization** - Strips trailing whitespace, collapses multiple spaces
+- **Hyphen rejoining** - Fixes line-break hyphenation (`word-\ncontinuation` → `wordcontinuation`)
+- **Mid-word caps** - Fixes OCR errors like `sVo` → `svo`
+- **Pattern substitutions** - Long-s artifacts, li/h confusion, ll→U errors, word-joining
+- **Garbage detection** - Flags files with excessive OCR noise
+
 ```bash
-# Analyze OCR quality
+# Analyze OCR quality (dry run)
 tc-ocr-clean analyze ./corpus/ia --report ocr-report.json
 
-# Clean OCR errors
-tc-ocr-clean batch ./corpus/ia -o ./corpus/ia-cleaned --report ocr-fixes.json
+# Clean with pattern-based rules
+tc-ocr-clean batch ./corpus/ia/raw -o ./corpus/ia/cleaned --report cleanup-report.json
+```
+
+#### Stage 2: Vocabulary Extraction (`tc-ocr-vocab`)
+
+Extract unknown words for human/AI review before spell correction. This prevents false corrections on proper nouns, historical terms, and corpus-specific vocabulary.
+
+```bash
+# Extract vocabulary candidates
+tc-ocr-vocab extract ./corpus/ia/cleaned -o vocab_candidates.txt --min-freq 5
+
+# Uses built-in whitelist (British spellings, Latin terms, archaic English, etc.)
+# Override with --known-vocab custom.txt or disable with --no-whitelist
+```
+
+The built-in whitelist (`data/known_vocab.txt`) includes ~1,200 words:
+- British spellings (`colour`, `travelling`, `civilisation`)
+- Latin terms (`corpus`, `circa`, `ipso`, `qua`)
+- Archaic English (`hath`, `doth`, `wherefore`, `thee`)
+- Medical/scientific terms common in historical texts
+- Legal and religious terminology
+
+#### Stage 3: Human Review
+
+Review the candidates file, removing OCR errors and keeping legitimate words:
+- Lines starting with `?` flag are suspicious (likely OCR errors)
+- Capitalized words are likely proper nouns (keep)
+- Check context snippets to verify
+
+```bash
+# After review, simplify to word list
+tc-ocr-vocab simplify vocab_candidates_reviewed.txt -o approved_vocab.txt
+```
+
+#### Stage 4: Spell Correction (`tc-ocr-symspell`)
+
+Dictionary-based spell correction using SymSpell, with your approved vocabulary protected:
+
+```bash
+# Correct remaining errors, protecting approved words
+tc-ocr-symspell batch ./corpus/ia/cleaned -o ./corpus/ia/final \
+  --vocab approved_vocab.txt
 ```
 
 Note: Gutenberg texts are human-proofread and typically don't need OCR cleanup.
