@@ -113,6 +113,33 @@ SUSPICIOUS_PATTERNS = [
     re.compile(r"[rnm]{4,}"),  # Multiple similar chars (rn looks like m)
 ]
 
+# =============================================================================
+# Pattern-based whitelist (skip these patterns during extraction)
+# These are legitimate patterns that would otherwise be flagged as unknown
+# =============================================================================
+SKIP_PATTERNS = [
+    # Roman numerals (valid sequences only: I, V, X, L, C, D, M)
+    # Matches: III, VIII, XIII, XLVIII, MCMXCIX, etc.
+    # Does NOT match corrupted ones like IIL, IIII, VX (invalid sequences)
+    re.compile(r"^M{0,3}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$"),
+    # Scottish/Irish surname prefixes (Mc/Mac + capital + lowercase)
+    # Matches: McDonald, McLean, MacArthur, MacNeil, etc.
+    re.compile(r"^M[ac][A-Z][a-z]+$"),
+    re.compile(r"^Mac[A-Z][a-z]+$"),
+    # Common -ville place name suffix (American towns)
+    # Matches: Nashville, Louisville, Taylorsville, etc.
+    re.compile(r"^[A-Z][a-z]+ville$"),
+]
+
+
+def matches_skip_pattern(word: str) -> bool:
+    """Check if word matches any skip pattern (known legitimate patterns)."""
+    for pattern in SKIP_PATTERNS:
+        if pattern.match(word):
+            return True
+    return False
+
+
 # Common words to skip (too common to be interesting)
 # Global interrupt flag for signal handler access from nested functions
 _interrupted = False
@@ -299,6 +326,10 @@ def process_file(
 
         # Skip known vocabulary (British spellings, Latin terms, etc.)
         if word_lower in known_vocab:
+            continue
+
+        # Skip pattern-based whitelist (Roman numerals, Mc/Mac names, -ville places)
+        if matches_skip_pattern(word):
             continue
 
         # Skip very short words
