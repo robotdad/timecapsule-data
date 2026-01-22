@@ -188,6 +188,324 @@ def normalize_midword_caps(text: str) -> tuple[str, int]:
     return text, count
 
 
+# =============================================================================
+# Long-s (ſ) Detection and Fixing
+# =============================================================================
+# In pre-1800 texts, the "long s" (ſ) was commonly used and OCR misreads it as 'f'.
+# Instead of enumerating all variants, we:
+# 1. Detect documents with pervasive long-s using marker words
+# 2. Apply broad pattern-based fixes only to those documents
+
+# Marker words where ſ→f is unmistakable (these patterns don't occur in normal English)
+LONG_S_MARKERS = [
+    # -self/-selves words (himfelf, herfelf, itfelf, themfelves)
+    "himfelf",
+    "herfelf",
+    "itfelf",
+    "myfelf",
+    "yourfelf",
+    "ourfelf",
+    "themfelves",
+    # sh- words misread as fh-
+    "fhall",
+    "fhould",
+    "fhew",
+    "fhort",
+    "fhip",
+    "fhape",
+    "fhare",
+    # sp- words misread as fp-
+    "fpirit",
+    "fpeak",
+    "fpace",
+    "fpecial",
+    "fpeed",
+    "fpend",
+    # st- words misread as ft-
+    "ftand",
+    "ftate",
+    "ftill",
+    "ftory",
+    "ftrong",
+    "ftreet",
+    "ftrange",
+    # -sure words
+    "meafure",
+    "pleafure",
+    "treafure",
+    "leifure",
+    # -ss- words with ff
+    "poffeffion",
+    "profeffion",
+    "fuccefs",
+    "neceffary",
+    "poffible",
+    # Other distinctive patterns
+    "becaufe",
+    "houfe",
+    "ufe",
+    "raife",
+    "praife",
+    "caufe",
+]
+
+# Compiled patterns for long-s fixes (applied only to flagged documents)
+# Order matters: more specific patterns first
+LONG_S_PATTERNS = [
+    # Word-initial consonant clusters: fh→sh, fp→sp, ft→st
+    (re.compile(r"\bfh", re.IGNORECASE), lambda m: "Sh" if m.group()[0].isupper() else "sh"),
+    (re.compile(r"\bfp", re.IGNORECASE), lambda m: "Sp" if m.group()[0].isupper() else "sp"),
+    (re.compile(r"\bft", re.IGNORECASE), lambda m: "St" if m.group()[0].isupper() else "st"),
+    # Double-f patterns: ff before vowel often = ss (poffeffion → possession)
+    (re.compile(r"ff([aeiou])", re.IGNORECASE), r"ss\1"),
+    # -lf at word end after vowel = -ls (himfelf → himself) - but not "half", "elf"
+    (re.compile(r"([aeiou])lf\b"), r"\1lf"),  # Keep as-is, handle via word patterns below
+    # Word-final -fe patterns (houfe → house, ufe → use)
+    (re.compile(r"\b([a-z]+[aeiou])fe\b", re.IGNORECASE), r"\1se"),
+    # -fion → -sion (poffeffion → possession after ff→ss)
+    (re.compile(r"fion\b", re.IGNORECASE), "sion"),
+    # Medial f between vowels is often s (fatisfy → satisfy)
+    # This is riskier, so we're conservative - only common patterns
+    (re.compile(r"\braifel\b", re.IGNORECASE), "raisel"),  # Keep specific
+]
+
+# High-confidence word-level substitutions for long-s documents
+LONG_S_WORD_FIXES = {
+    # -self words
+    "himfelf": "himself",
+    "herfelf": "herself",
+    "itfelf": "itself",
+    "myfelf": "myself",
+    "yourfelf": "yourself",
+    "themfelves": "themselves",
+    "ourfelf": "ourself",
+    "ourfelves": "ourselves",
+    # Common short words
+    "fuch": "such",
+    "fo": "so",
+    "fome": "some",
+    "foon": "soon",
+    "faid": "said",
+    "fay": "say",
+    "fays": "says",
+    "fee": "see",
+    "feen": "seen",
+    "feem": "seem",
+    "feems": "seems",
+    "feemed": "seemed",
+    "fent": "sent",
+    "fet": "set",
+    "fide": "side",
+    "fides": "sides",
+    "fince": "since",
+    "fir": "sir",
+    "fit": "sit",
+    "fize": "size",
+    "fon": "son",
+    "fons": "sons",
+    "foul": "soul",
+    "fouls": "souls",
+    # Demonstratives and pronouns
+    "thefe": "these",
+    "thofe": "those",
+    "whofe": "whose",
+    # Common words
+    "becaufe": "because",
+    "occafion": "occasion",
+    "occafions": "occasions",
+    "occafioned": "occasioned",
+    "thoufand": "thousand",
+    "thoufands": "thousands",
+    "lefs": "less",
+    "unlefs": "unless",
+    "pafs": "pass",
+    "paffed": "passed",
+    "paffing": "passing",
+    "paft": "past",
+    "befides": "besides",
+    "eafily": "easily",
+    "eafy": "easy",
+    "eafier": "easier",
+    "eafieft": "easiest",
+    "fuppofe": "suppose",
+    "fuppofed": "supposed",
+    "fuppofing": "supposing",
+    "likewife": "likewise",
+    "otherwife": "otherwise",
+    "preferve": "preserve",
+    "preferved": "preserved",
+    "obferve": "observe",
+    "obferved": "observed",
+    "obfervation": "observation",
+    "obfervations": "observations",
+    "reprefent": "represent",
+    "reprefented": "represented",
+    "reprefents": "represents",
+    "doubtlefs": "doubtless",
+    "rehearfe": "rehearse",
+    "rehearfed": "rehearsed",
+    "rife": "rise",
+    "rifing": "rising",
+    "rifen": "risen",
+    "rofe": "rose",
+    "lofe": "lose",
+    "lofing": "losing",
+    "loft": "lost",
+    "clofe": "close",
+    "clofed": "closed",
+    "clofely": "closely",
+    "purpofe": "purpose",
+    "purpofes": "purposes",
+    "purpofed": "purposed",
+    "courfe": "course",
+    "difcourfe": "discourse",
+    # -ness words (darknefs, happinefs, etc.)
+    "darknefs": "darkness",
+    "happinefs": "happiness",
+    "bufinefs": "business",
+    "greatnefs": "greatness",
+    "goodnefs": "goodness",
+    "weaknefs": "weakness",
+    "ficknefs": "sickness",
+    "madnefs": "madness",
+    "fadnefs": "sadness",
+    "boldnefs": "boldness",
+    "kindnefs": "kindness",
+    "blindnefs": "blindness",
+    "willingnefs": "willingness",
+    "righteoufnefs": "righteousness",
+    "wickednefs": "wickedness",
+    "houfe": "house",
+    "houfes": "houses",
+    "ufe": "use",
+    "ufed": "used",
+    "ufeful": "useful",
+    "ufelefs": "useless",
+    "raife": "raise",
+    "raifed": "raised",
+    "praife": "praise",
+    "praifed": "praised",
+    "caufe": "cause",
+    "caufed": "caused",
+    "caufes": "causes",
+    "pleafe": "please",
+    "pleafed": "pleased",
+    "pleafure": "pleasure",
+    "meafure": "measure",
+    "meafured": "measured",
+    "meafures": "measures",
+    "treafure": "treasure",
+    "treafures": "treasures",
+    "poffefs": "possess",
+    "poffeffion": "possession",
+    "poffeffed": "possessed",
+    "fuccefs": "success",
+    "fuccefsful": "successful",
+    "neceffary": "necessary",
+    "neceffity": "necessity",
+    "poffible": "possible",
+    "impoffible": "impossible",
+    "profeffion": "profession",
+    "profeffor": "professor",
+    "reafon": "reason",
+    "reafons": "reasons",
+    "reafoned": "reasoned",
+    "feafon": "season",
+    "feafons": "seasons",
+    "perfon": "person",
+    "perfons": "persons",
+    "prefent": "present",
+    "prefented": "presented",
+    "prefence": "presence",
+    "abfent": "absent",
+    "abfence": "absence",
+    "defign": "design",
+    "defigned": "designed",
+    "refult": "result",
+    "refults": "results",
+    "infift": "insist",
+    "infifted": "insisted",
+    "confider": "consider",
+    "confidered": "considered",
+    "defcribe": "describe",
+    "defcribed": "described",
+}
+
+
+def has_long_s_patterns(text: str) -> tuple[bool, int]:
+    """
+    Detect if document has pervasive long-s (ſ→f) OCR errors.
+
+    Returns:
+        (has_long_s, marker_count) - True if 3+ markers found
+    """
+    text_lower = text.lower()
+    marker_count = sum(1 for marker in LONG_S_MARKERS if marker in text_lower)
+    return marker_count >= 3, marker_count
+
+
+def fix_long_s(text: str) -> tuple[str, int]:
+    """
+    Fix long-s OCR errors in text that has been flagged as having pervasive long-s.
+
+    Should only be called on documents where has_long_s_patterns() returned True.
+
+    Returns:
+        (fixed_text, count_of_fixes)
+    """
+    total_fixes = 0
+
+    # First pass: word-level substitutions (highest confidence)
+    words = text.split()
+    fixed_words = []
+    for word in words:
+        # Strip punctuation for lookup
+        prefix = ""
+        suffix = ""
+        core = word
+
+        # Extract leading punctuation
+        while core and not core[0].isalpha():
+            prefix += core[0]
+            core = core[1:]
+
+        # Extract trailing punctuation
+        while core and not core[-1].isalpha():
+            suffix = core[-1] + suffix
+            core = core[:-1]
+
+        if core:
+            # Check for replacement (case-insensitive lookup, preserve case)
+            lookup = core.lower()
+            if lookup in LONG_S_WORD_FIXES:
+                replacement = LONG_S_WORD_FIXES[lookup]
+                # Preserve original case pattern
+                if core.isupper():
+                    replacement = replacement.upper()
+                elif core[0].isupper():
+                    replacement = replacement[0].upper() + replacement[1:]
+                fixed_words.append(prefix + replacement + suffix)
+                total_fixes += 1
+            else:
+                fixed_words.append(word)
+        else:
+            fixed_words.append(word)
+
+    text = " ".join(fixed_words)
+
+    # Second pass: pattern-based fixes for remaining cases
+    for pattern, replacement in LONG_S_PATTERNS:
+        matches = len(pattern.findall(text))
+        if matches > 0:
+            if callable(replacement):
+                text = pattern.sub(replacement, text)
+            else:
+                text = pattern.sub(replacement, text)
+            total_fixes += matches
+
+    return text, total_fixes
+
+
 # Common OCR substitution errors
 # Format: (error_pattern, correction, context_required)
 # context_required: None = always apply, or regex that must match around the word
@@ -997,6 +1315,10 @@ GARBAGE_PATTERNS = [
 ]
 
 
+# Threshold for flagging high-substitution documents (substitutions per 1000 chars)
+HIGH_SUBSTITUTION_THRESHOLD = 50.0
+
+
 @dataclass
 class CleanupStats:
     """Track cleanup statistics."""
@@ -1009,15 +1331,70 @@ class CleanupStats:
     whitespace_fixes: int = 0
     hyphen_rejoins: int = 0
     midword_caps_fixes: int = 0
+    long_s_fixes: int = 0  # Track long-s fixes separately
     substitution_counts: Counter = field(default_factory=Counter)
     flagged_files: list = field(default_factory=list)
     skipped_files: list = field(default_factory=list)  # Non-English files
+    # Per-document tracking (only interesting docs, not all 1M+)
+    high_substitution_docs: list = field(default_factory=list)  # Docs above threshold
+    long_s_documents: list = field(default_factory=list)  # Docs with long-s patterns
+    long_s_document_count: int = 0  # Total count (list is capped)
+    high_sub_document_count: int = 0  # Total count (list is capped)
     # Triage stats
     triage_passed: int = 0
     triage_quarantined: int = 0
     triage_rejected: int = 0
     triage_results: list = field(default_factory=list)  # Full triage results for JSONL export
     elapsed_seconds: float = 0.0  # Total processing time
+
+    def track_document(
+        self,
+        filename: str,
+        char_count: int,
+        total_subs: int,
+        long_s_fixes: int,
+        whitespace_fixes: int,
+        hyphen_fixes: int,
+        midword_caps_fixes: int,
+        has_long_s: bool,
+    ):
+        """Track per-document stats - only stores interesting documents to avoid memory bloat."""
+        # Calculate substitution rate
+        sub_rate = (total_subs / char_count) * 1000 if char_count > 0 else 0
+
+        # Only store high-substitution docs (cap at 1000 to avoid memory issues)
+        if sub_rate >= HIGH_SUBSTITUTION_THRESHOLD:
+            self.high_sub_document_count += 1
+            if len(self.high_substitution_docs) < 1000:
+                ocr_pattern_fixes = (
+                    total_subs - long_s_fixes - whitespace_fixes - hyphen_fixes - midword_caps_fixes
+                )
+                self.high_substitution_docs.append(
+                    {
+                        "filename": filename,
+                        "char_count": char_count,
+                        "total_substitutions": total_subs,
+                        "substitution_rate": round(sub_rate, 2),
+                        "categories": {
+                            "long_s": long_s_fixes,
+                            "whitespace": whitespace_fixes,
+                            "hyphens": hyphen_fixes,
+                            "midword_caps": midword_caps_fixes,
+                            "ocr_patterns": ocr_pattern_fixes,
+                        },
+                    }
+                )
+
+        # Only store long-s docs (cap at 1000)
+        if has_long_s:
+            self.long_s_document_count += 1
+            if len(self.long_s_documents) < 1000:
+                self.long_s_documents.append(
+                    {
+                        "filename": filename,
+                        "long_s_fixes": long_s_fixes,
+                    }
+                )
 
     def to_dict(self):
         return {
@@ -1026,12 +1403,33 @@ class CleanupStats:
             "files_flagged": self.files_flagged,
             "files_skipped_language": self.files_skipped_language,
             "total_substitutions": self.total_substitutions,
-            "whitespace_fixes": self.whitespace_fixes,
-            "hyphen_rejoins": self.hyphen_rejoins,
-            "midword_caps_fixes": self.midword_caps_fixes,
+            "substitution_breakdown": {
+                "whitespace": self.whitespace_fixes,
+                "hyphens": self.hyphen_rejoins,
+                "midword_caps": self.midword_caps_fixes,
+                "long_s": self.long_s_fixes,
+                "ocr_patterns": self.total_substitutions
+                - self.whitespace_fixes
+                - self.hyphen_rejoins
+                - self.midword_caps_fixes
+                - self.long_s_fixes,
+            },
             "top_substitutions": self.substitution_counts.most_common(50),
             "flagged_files": self.flagged_files[:100],
             "skipped_files": self.skipped_files[:100],
+            # Per-document analysis (only interesting docs stored, not all 1M+)
+            "long_s_documents": {
+                "total_count": self.long_s_document_count,
+                "sample_files": self.long_s_documents[:100],  # First 100 of up to 1000 stored
+            },
+            "high_substitution_documents": {
+                "total_count": self.high_sub_document_count,
+                "threshold_per_1000_chars": HIGH_SUBSTITUTION_THRESHOLD,
+                "sample_files": sorted(
+                    self.high_substitution_docs, key=lambda x: x["substitution_rate"], reverse=True
+                )[:100],
+            },
+            # Triage stats
             "triage_passed": self.triage_passed,
             "triage_quarantined": self.triage_quarantined,
             "triage_rejected": self.triage_rejected,
@@ -1060,7 +1458,8 @@ def clean_text(text: str, stats: Optional[CleanupStats] = None) -> tuple[str, in
     2. Whitespace normalization (strip trailing, collapse multiples)
     3. Hyphen rejoining (fix line-break hyphenation)
     4. Mid-word uppercase normalization (sVo -> svo)
-    5. OCR substitutions (pattern-based fixes)
+    5. Long-s detection and fixing (for pre-1800 texts)
+    6. OCR substitutions (pattern-based fixes)
 
     Returns: (cleaned_text, total_modification_count)
     """
@@ -1088,7 +1487,16 @@ def clean_text(text: str, stats: Optional[CleanupStats] = None) -> tuple[str, in
     if stats:
         stats.midword_caps_fixes += caps_count
 
-    # Step 5: OCR substitutions
+    # Step 5: Long-s detection and fixing (for pre-1800 texts with ſ→f OCR errors)
+    long_s_count = 0
+    has_long_s, marker_count = has_long_s_patterns(text)
+    if has_long_s:
+        text, long_s_count = fix_long_s(text)
+        total_subs += long_s_count
+        if stats:
+            stats.long_s_fixes += long_s_count
+
+    # Step 6: OCR substitutions
     for pattern, replacement, context in OCR_SUBSTITUTIONS:
         if context:
 
@@ -1154,9 +1562,36 @@ def clean_file(
             # Don't process, don't copy to output
             return False, 0, [], True
 
+    # Snapshot stats before cleaning to calculate per-document breakdown
+    ws_before = stats.whitespace_fixes if stats else 0
+    hyphen_before = stats.hyphen_rejoins if stats else 0
+    caps_before = stats.midword_caps_fixes if stats else 0
+    long_s_before = stats.long_s_fixes if stats else 0
+
     garbage_issues = check_garbage(content)
+
+    # Check for long-s patterns (for per-document tracking)
+    has_long_s, _ = has_long_s_patterns(content)
+
     cleaned, sub_count = clean_text(content, stats)
     was_modified = sub_count > 0
+
+    # Update total substitutions
+    if stats:
+        stats.total_substitutions += sub_count
+
+    # Track per-document stats (only stores interesting docs - high sub rate or long-s)
+    if stats and sub_count > 0:
+        stats.track_document(
+            filename=input_path.name,
+            char_count=len(content),
+            total_subs=sub_count,
+            long_s_fixes=stats.long_s_fixes - long_s_before,
+            whitespace_fixes=stats.whitespace_fixes - ws_before,
+            hyphen_fixes=stats.hyphen_rejoins - hyphen_before,
+            midword_caps_fixes=stats.midword_caps_fixes - caps_before,
+            has_long_s=has_long_s,
+        )
 
     if output_path and was_modified:
         output_path.parent.mkdir(parents=True, exist_ok=True)

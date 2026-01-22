@@ -104,12 +104,18 @@ except ImportError:
 WORD_PATTERN = re.compile(r"\b([a-zA-Z][a-zA-Z']*[a-zA-Z]|[a-zA-Z])\b")
 
 # Patterns that suggest OCR errors (suspicious words)
+# NOTE: These are checked AFTER dictionary lookup - if a word matches a pattern
+# but is in the dictionary, it's NOT flagged as suspicious.
 SUSPICIOUS_PATTERNS = [
     re.compile(r"[a-z][A-Z]"),  # camelCase in middle (OCR mixing)
     re.compile(r"(.)\1{2,}"),  # Triple+ repeated chars
     re.compile(r"[^aeiouAEIOU]{5,}"),  # 5+ consonants in a row
     re.compile(r"^[bcdfghjklmnpqrstvwxz]{4,}$", re.I),  # All consonants, 4+ chars
-    re.compile(r"[il1|]{3,}"),  # Multiple confusable chars (l/1/|/i)
+    # Confusable char sequences - tightened to require actual OCR confusion markers
+    # Old pattern r"[il1|]{3,}" caught legitimate words like "Still", "William", "Military"
+    # New patterns require digits or pipe chars that indicate actual OCR confusion
+    re.compile(r"[1|][il1|]+"),  # Starts with digit/pipe (Wi1liam, fi|l)
+    re.compile(r"[il1|]+[1|]"),  # Ends with digit/pipe (Will1, fil|)
     re.compile(r"[rnm]{4,}"),  # Multiple similar chars (rn looks like m)
 ]
 
@@ -343,11 +349,25 @@ def process_file(
         if key not in candidates:
             candidate = VocabCandidate(word=word)
             candidate.is_capitalized = word[0].isupper()
-            # Skip dictionary lookup - too slow, filter by suspicious instead
-            candidate.is_unknown = True
+
+            # Check if word matches suspicious patterns first
             suspicious, reason = is_suspicious(word)
-            candidate.is_suspicious = suspicious
-            candidate.suspicious_reason = reason
+
+            if suspicious:
+                # Only do dictionary lookup for suspicious words (performance optimization)
+                # If word is in dictionary, it's NOT suspicious (e.g., "William", "Still")
+                if is_known_word(word):
+                    candidate.is_unknown = False
+                    candidate.is_suspicious = False
+                else:
+                    candidate.is_unknown = True
+                    candidate.is_suspicious = True
+                    candidate.suspicious_reason = reason
+            else:
+                # Non-suspicious words: mark as unknown (not in our known_vocab whitelist)
+                candidate.is_unknown = True
+                candidate.is_suspicious = False
+
             candidates[key] = candidate
         else:
             candidate = candidates[key]
