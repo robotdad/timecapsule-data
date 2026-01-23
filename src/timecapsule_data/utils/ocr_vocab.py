@@ -694,6 +694,25 @@ def cmd_extract(args):
             )
         print(f"{'=' * 60}", file=sys.stderr)
 
+        # Post-process: dictionary check for suspicious words (Rust skips this for speed)
+        # Only check words that meet frequency threshold and are marked suspicious
+        if not _interrupted and HAS_ENCHANT:
+            suspicious_to_check = [
+                c for c in candidates.values() if c.is_suspicious and c.frequency >= args.min_freq
+            ]
+            if suspicious_to_check:
+                print(
+                    f"\nDictionary check for {len(suspicious_to_check):,} suspicious candidates...",
+                    file=sys.stderr,
+                )
+                cleared = 0
+                for c in suspicious_to_check:
+                    if is_known_word(c.word):
+                        c.is_suspicious = False
+                        c.is_unknown = False
+                        cleared += 1
+                print(f"  Cleared {cleared:,} as known English words", file=sys.stderr)
+
         # Generate output (skip if interrupted)
         if not _interrupted:
             output = format_output(
