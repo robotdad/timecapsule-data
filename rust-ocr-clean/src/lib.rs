@@ -698,6 +698,12 @@ pub struct CleanupResult {
     pub substitutions_by_category: std::collections::HashMap<String, u64>,
 }
 
+/// Get the number of loaded OCR patterns (for debugging)
+#[pyfunction]
+fn pattern_count() -> usize {
+    OCR_PATTERNS.len()
+}
+
 /// Clean OCR errors in text using pre-compiled patterns
 #[pyfunction]
 fn clean_text(text: String) -> PyResult<(String, u64)> {
@@ -1745,6 +1751,7 @@ fn rust_ocr_clean(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(preprocess_text, m)?)?;
     m.add_function(wrap_pyfunction!(preprocess_file, m)?)?;
     // Dictionary functions
+    m.add_function(wrap_pyfunction!(pattern_count, m)?)?;
     m.add_function(wrap_pyfunction!(init_dictionaries, m)?)?;
     m.add_function(wrap_pyfunction!(is_known_word, m)?)?;
     m.add_function(wrap_pyfunction!(word_languages, m)?)?;
