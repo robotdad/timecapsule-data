@@ -123,7 +123,7 @@ def clean_text_with_categories(text: str) -> CleanupResult:
     ...
 
 
-def clean_file_to_file(input_path: str, output_path: str) -> tuple[bool, int, int]:
+def clean_file_to_file(input_path: str, output_path: str) -> tuple[bool, int, int, dict[str, int]]:
     """Clean a file and write result to output path.
 
     Args:
@@ -131,7 +131,8 @@ def clean_file_to_file(input_path: str, output_path: str) -> tuple[bool, int, in
         output_path: Path to write cleaned output.
 
     Returns:
-        Tuple of (was_modified, substitution_count, bytes_read).
+        Tuple of (was_modified, substitution_count, bytes_read, categories_dict).
+        categories_dict maps category names (e.g., 'long_s', 'li_h_confusion') to counts.
     """
     ...
 

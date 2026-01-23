@@ -46,21 +46,15 @@ class Dictionary:
         self._load_dictionary()
 
     def _load_dictionary(self):
-        """Load dictionary using Rust module (ONE PATH - no Python dictionary libs)."""
+        """Load dictionary using Rust module (required - no fallback)."""
         from pathlib import Path
 
-        # Use Rust dictionaries (en, de, fr, la) - ONE PATH
-        try:
-            import rust_ocr_clean  # type: ignore[import-not-found]
+        import rust_ocr_clean  # type: ignore[import-not-found]
 
-            dict_dir = (
-                Path(__file__).parent.parent.parent.parent / "rust-ocr-clean" / "dictionaries"
-            )
-            if dict_dir.exists():
-                rust_ocr_clean.init_dictionaries(str(dict_dir))
-                self._rust_dict_loaded = rust_ocr_clean.dictionaries_loaded()
-        except ImportError:
-            print("Warning: rust_ocr_clean module not available", file=sys.stderr)
+        dict_dir = Path(__file__).parent.parent.parent.parent / "rust-ocr-clean" / "dictionaries"
+        if dict_dir.exists():
+            rust_ocr_clean.init_dictionaries(str(dict_dir))
+            self._rust_dict_loaded = rust_ocr_clean.dictionaries_loaded()
 
         # Still load supplementary word sets for historical/domain terms
         self._add_common_words()
@@ -501,6 +495,8 @@ class Dictionary:
 
     def is_word(self, word: str) -> bool:
         """Check if a word is in the dictionary."""
+        import rust_ocr_clean  # type: ignore[import-not-found]
+
         word_lower = word.lower()
 
         # Fast check against known word set first
@@ -509,12 +505,7 @@ class Dictionary:
 
         # Use Rust dictionaries for comprehensive check (en, de, fr, la)
         if self._rust_dict_loaded:
-            try:
-                import rust_ocr_clean  # type: ignore[import-not-found]
-
-                return rust_ocr_clean.is_known_word(word)
-            except Exception:
-                pass
+            return rust_ocr_clean.is_known_word(word)
 
         return False
 

@@ -248,22 +248,16 @@ class VocabCandidate:
 
 def is_known_word(word: str) -> bool:
     """Check if word is in the dictionary (uses Rust multi-language dictionaries)."""
-    try:
-        import rust_ocr_clean  # type: ignore[import-not-found]
+    import rust_ocr_clean  # type: ignore[import-not-found]
 
-        return rust_ocr_clean.is_known_word(word)
-    except ImportError:
-        return False
+    return rust_ocr_clean.is_known_word(word)
 
 
 def get_word_languages(word: str) -> list[str]:
     """Get list of languages that recognize this word."""
-    try:
-        import rust_ocr_clean  # type: ignore[import-not-found]
+    import rust_ocr_clean  # type: ignore[import-not-found]
 
-        return rust_ocr_clean.word_languages(word)
-    except ImportError:
-        return []
+    return rust_ocr_clean.word_languages(word)
 
 
 def extract_context(text: str, match_start: int, match_end: int, context_chars: int = 40) -> str:
