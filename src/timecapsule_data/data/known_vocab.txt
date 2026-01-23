@@ -1477,3 +1477,63 @@ argyll
 forsyth
 smyth
 smythe
+
+# =============================================================================
+# Medical/Scientific Terms (common in 19th-early 20th century texts)
+# =============================================================================
+dyspnoea
+parenchyma
+parenchymatous
+symphysis
+strychnia
+colocynth
+ecchymosis
+anchylosis
+
+# =============================================================================
+# German Academic Abbreviations (common in scholarly references)
+# =============================================================================
+zeitschr
+zeitschrift
+wochenschr
+ztschr
+psychol
+psychiat
+
+# =============================================================================
+# Additional Proper Names (historical figures, places)
+# =============================================================================
+mcclellan
+mcdowell
+macclean
+maclean
+humphry
+bartsch
+wyndham
+conyngham
+mcnaughton
+gruffydd
+gruffydh
+wickliffe
+radclyffe
+redclyffe
+mcduffie
+mccaffrey
+mccafferty
+mcgiffert
+banffshire
+
+# =============================================================================
+# Historical/Archaic Spellings
+# =============================================================================
+scythians
+draughtsman
+draughtsmen
+
+# =============================================================================
+# Latin Abbreviations (common in scholarly texts)
+# =============================================================================
+svo
+lchdm
+chauc
+chrys
