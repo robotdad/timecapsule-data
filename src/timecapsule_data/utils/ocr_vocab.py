@@ -103,21 +103,9 @@ except ImportError:
 
 WORD_PATTERN = re.compile(r"\b([a-zA-Z][a-zA-Z']*[a-zA-Z]|[a-zA-Z])\b")
 
-# Patterns that suggest OCR errors (suspicious words)
-# NOTE: These are checked AFTER dictionary lookup - if a word matches a pattern
-# but is in the dictionary, it's NOT flagged as suspicious.
-SUSPICIOUS_PATTERNS = [
-    re.compile(r"[a-z][A-Z]"),  # camelCase in middle (OCR mixing)
-    re.compile(r"(.)\1{2,}"),  # Triple+ repeated chars
-    re.compile(r"[^aeiouAEIOU]{5,}"),  # 5+ consonants in a row
-    re.compile(r"^[bcdfghjklmnpqrstvwxz]{4,}$", re.I),  # All consonants, 4+ chars
-    # Confusable char sequences - tightened to require actual OCR confusion markers
-    # Old pattern r"[il1|]{3,}" caught legitimate words like "Still", "William", "Military"
-    # New patterns require digits or pipe chars that indicate actual OCR confusion
-    re.compile(r"[1|][il1|]+"),  # Starts with digit/pipe (Wi1liam, fi|l)
-    re.compile(r"[il1|]+[1|]"),  # Ends with digit/pipe (Will1, fil|)
-    re.compile(r"[rnm]{4,}"),  # Multiple similar chars (rn looks like m)
-]
+# NOTE: Suspicious pattern checking is now done exclusively in Rust (rust_ocr_clean module).
+# The Rust implementation handles patterns for: camelCase, triple repeats, consonant runs,
+# confusable chars (requiring actual digits/pipes), and rn/m confusion.
 
 # =============================================================================
 # Pattern-based whitelist (skip these patterns during extraction)
@@ -264,14 +252,6 @@ class VocabCandidate:
                 self.contexts.append(context)
 
 
-def is_suspicious(word: str) -> tuple[bool, str]:
-    """Check if a word looks like an OCR error."""
-    for pattern in SUSPICIOUS_PATTERNS:
-        if pattern.search(word):
-            return True, pattern.pattern
-    return False, ""
-
-
 def is_known_word(word: str) -> bool:
     """Check if word is in the dictionary."""
     if not HAS_ENCHANT or DICT is None:
@@ -302,89 +282,6 @@ def extract_context(text: str, match_start: int, match_end: int, context_chars: 
         context = context + "..."
 
     return context
-
-
-def process_file(
-    file_path: Path,
-    candidates: dict[str, VocabCandidate],
-    context_chars: int = 40,
-    max_contexts: int = 3,
-    known_vocab: set[str] | None = None,
-) -> int:
-    """Process a single file and update candidates dict."""
-    if known_vocab is None:
-        known_vocab = KNOWN_VOCAB
-
-    try:
-        text = file_path.read_text(encoding="utf-8", errors="replace")
-    except Exception as e:
-        print(f"  Error reading {file_path}: {e}", file=sys.stderr)
-        return 0
-
-    word_count = 0
-    for match in WORD_PATTERN.finditer(text):
-        word = match.group(1)
-        word_lower = word.lower()
-
-        # Skip common words
-        if word_lower in SKIP_WORDS:
-            continue
-
-        # Skip known vocabulary (British spellings, Latin terms, etc.)
-        if word_lower in known_vocab:
-            continue
-
-        # Skip pattern-based whitelist (Roman numerals, Mc/Mac names, -ville places)
-        if matches_skip_pattern(word):
-            continue
-
-        # Skip very short words
-        if len(word) < 2:
-            continue
-
-        word_count += 1
-
-        # Get or create candidate
-        key = word_lower
-        if key not in candidates:
-            candidate = VocabCandidate(word=word)
-            candidate.is_capitalized = word[0].isupper()
-
-            # Check if word matches suspicious patterns first
-            suspicious, reason = is_suspicious(word)
-
-            if suspicious:
-                # Only do dictionary lookup for suspicious words (performance optimization)
-                # If word is in dictionary, it's NOT suspicious (e.g., "William", "Still")
-                if is_known_word(word):
-                    candidate.is_unknown = False
-                    candidate.is_suspicious = False
-                else:
-                    candidate.is_unknown = True
-                    candidate.is_suspicious = True
-                    candidate.suspicious_reason = reason
-            else:
-                # Non-suspicious words: mark as unknown (not in our known_vocab whitelist)
-                candidate.is_unknown = True
-                candidate.is_suspicious = False
-
-            candidates[key] = candidate
-        else:
-            candidate = candidates[key]
-            # Update capitalization if we see a capitalized version
-            if word[0].isupper():
-                candidate.is_capitalized = True
-                # Prefer capitalized form for display
-                if not candidate.word[0].isupper():
-                    candidate.word = word
-
-        candidate.frequency += 1
-        candidate.add_context(
-            extract_context(text, match.start(), match.end(), context_chars),
-            max_contexts,
-        )
-
-    return word_count
 
 
 def format_output(
@@ -512,16 +409,10 @@ def cmd_extract(args):
     old_handler = signal.signal(signal.SIGINT, handle_interrupt)
 
     try:
-        # Try to use Rust for speed
-        rust_available = False
-        rust_extract_batch = None
-        try:
-            import rust_ocr_clean  # type: ignore[import-not-found]
+        # Rust module is required - no Python fallback
+        import rust_ocr_clean  # type: ignore[import-not-found]
 
-            rust_extract_batch = rust_ocr_clean.extract_vocab_batch
-            rust_available = True
-        except ImportError:
-            print("Note: Rust module not available, using Python (slower)", file=sys.stderr)
+        rust_extract_batch = rust_ocr_clean.extract_vocab_batch
 
         if not HAS_ENCHANT:
             print(
@@ -573,10 +464,7 @@ def cmd_extract(args):
             sys.exit(1)
 
         print(f"\n{'=' * 60}", file=sys.stderr)
-        print(
-            f"Vocabulary Extraction - {'Rust' if rust_available else 'Python'} engine",
-            file=sys.stderr,
-        )
+        print("Vocabulary Extraction - Rust engine", file=sys.stderr)
         print(f"{'=' * 60}", file=sys.stderr)
         print(f"  Files to process: {total_files:,}", file=sys.stderr)
         print(f"{'=' * 60}\n", file=sys.stderr)
@@ -585,95 +473,70 @@ def cmd_extract(args):
         total_words = 0
         start_time = time.time()
 
-        if rust_available and rust_extract_batch is not None:
-            # Process in batches with Rust
-            batch_size = 500
-            for batch_start in range(0, total_files, batch_size):
-                if _interrupted:
-                    break
+        # Process in batches with Rust
+        batch_size = 500
+        for batch_start in range(0, total_files, batch_size):
+            if _interrupted:
+                break
 
-                batch_end = min(batch_start + batch_size, total_files)
-                batch_files = [str(f) for f in files[batch_start:batch_end]]
+            batch_end = min(batch_start + batch_size, total_files)
+            batch_files = [str(f) for f in files[batch_start:batch_end]]
 
-                batch_words, batch_results = rust_extract_batch(batch_files, args.context_chars)
-                total_words += batch_words
+            batch_words, batch_results = rust_extract_batch(batch_files, args.context_chars)
+            total_words += batch_words
 
-                # Merge batch results into candidates
-                for word_lower, (
-                    word,
-                    count,
-                    is_cap,
-                    is_susp,
-                    reason,
-                    context,
-                ) in batch_results.items():
-                    if word_lower in candidates:
-                        c = candidates[word_lower]
-                        c.frequency += count
-                        if is_cap:
-                            c.is_capitalized = True
-                            if not c.word[0].isupper():
-                                c.word = word
-                    else:
-                        # Skip dictionary lookup in hot path - too slow
-                        # is_unknown will be set in post-processing if needed
-                        candidates[word_lower] = VocabCandidate(
-                            word=word,
-                            frequency=count,
-                            contexts=[context] if context else [],
-                            is_capitalized=is_cap,
-                            is_unknown=True,  # Default to unknown, filter by suspicious instead
-                            is_suspicious=is_susp,
-                            suspicious_reason=reason,
-                        )
-
-                # Progress update
-                elapsed = time.time() - start_time
-                files_done = batch_end
-                files_per_sec = files_done / elapsed if elapsed > 0 else 0
-                pct = (files_done / total_files) * 100
-                remaining = (total_files - files_done) / files_per_sec if files_per_sec > 0 else 0
-
-                if remaining >= 3600:
-                    eta = f"{remaining / 3600:.1f}h"
-                elif remaining >= 60:
-                    eta = f"{remaining / 60:.1f}m"
+            # Merge batch results into candidates
+            for word_lower, (
+                word,
+                count,
+                is_cap,
+                is_susp,
+                reason,
+                context,
+            ) in batch_results.items():
+                if word_lower in candidates:
+                    c = candidates[word_lower]
+                    c.frequency += count
+                    if is_cap:
+                        c.is_capitalized = True
+                        if not c.word[0].isupper():
+                            c.word = word
                 else:
-                    eta = f"{remaining:.0f}s"
-
-                # Count candidates meeting frequency threshold
-                above_threshold = sum(
-                    1 for c in candidates.values() if c.frequency >= args.min_freq
-                )
-
-                print(
-                    f"  [{pct:5.1f}%] {files_done:,}/{total_files:,} files | "
-                    f"{files_per_sec:.1f} files/s | ETA: {eta} | "
-                    f"vocab: {above_threshold:,}",
-                    file=sys.stderr,
-                )
-        else:
-            # Fall back to Python
-            for i, file_path in enumerate(files, 1):
-                if _interrupted:
-                    break
-
-                if i % 500 == 0 or i == total_files:
-                    elapsed = time.time() - start_time
-                    files_per_sec = i / elapsed if elapsed > 0 else 0
-                    pct = (i / total_files) * 100
-                    print(
-                        f"  [{pct:5.1f}%] {i:,}/{total_files:,} files | "
-                        f"{files_per_sec:.1f} files/s | unique: {len(candidates):,}",
-                        file=sys.stderr,
+                    # Skip dictionary lookup in hot path - too slow
+                    # is_unknown will be set in post-processing if needed
+                    candidates[word_lower] = VocabCandidate(
+                        word=word,
+                        frequency=count,
+                        contexts=[context] if context else [],
+                        is_capitalized=is_cap,
+                        is_unknown=True,  # Default to unknown, filter by suspicious instead
+                        is_suspicious=is_susp,
+                        suspicious_reason=reason,
                     )
 
-                total_words += process_file(
-                    file_path,
-                    candidates,
-                    context_chars=args.context_chars,
-                    max_contexts=args.max_contexts,
-                )
+            # Progress update
+            elapsed = time.time() - start_time
+            files_done = batch_end
+            files_per_sec = files_done / elapsed if elapsed > 0 else 0
+            pct = (files_done / total_files) * 100
+            remaining = (total_files - files_done) / files_per_sec if files_per_sec > 0 else 0
+
+            if remaining >= 3600:
+                eta = f"{remaining / 3600:.1f}h"
+            elif remaining >= 60:
+                eta = f"{remaining / 60:.1f}m"
+            else:
+                eta = f"{remaining:.0f}s"
+
+            # Count candidates meeting frequency threshold
+            above_threshold = sum(1 for c in candidates.values() if c.frequency >= args.min_freq)
+
+            print(
+                f"  [{pct:5.1f}%] {files_done:,}/{total_files:,} files | "
+                f"{files_per_sec:.1f} files/s | ETA: {eta} | "
+                f"vocab: {above_threshold:,}",
+                file=sys.stderr,
+            )
 
         elapsed = time.time() - start_time
         print(f"\n{'=' * 60}", file=sys.stderr)

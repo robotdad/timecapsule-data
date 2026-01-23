@@ -1853,11 +1853,13 @@ def clean_batch(
             try:
                 if rust_available and rust_clean_file is not None:
                     # Use Rust for all file I/O (fast!)
-                    was_modified, sub_count, file_bytes = rust_clean_file(
+                    was_modified, sub_count, file_bytes, categories = rust_clean_file(
                         str(input_path), str(output_path)
                     )
                     bytes_processed += file_bytes
                     garbage = []  # Skip garbage check for speed
+                    # Aggregate category counts from Rust
+                    stats.long_s_fixes += categories.get("long_s", 0)
                 else:
                     # Fall back to Python
                     was_modified, sub_count, garbage, was_skipped = clean_file(

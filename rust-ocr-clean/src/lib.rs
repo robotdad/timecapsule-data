@@ -667,9 +667,10 @@ fn count_context_patterns_batch(file_paths: Vec<String>) -> PyResult<std::collec
 }
 
 /// Clean a single file, reading and writing entirely in Rust
-/// Returns: (was_modified, substitution_count, bytes_read)
+/// Returns: (was_modified, substitution_count, bytes_read, categories)
+/// where categories is a HashMap of category_name -> count
 #[pyfunction]
-fn clean_file_to_file(input_path: String, output_path: String) -> PyResult<(bool, u64, u64)> {
+fn clean_file_to_file(input_path: String, output_path: String) -> PyResult<(bool, u64, u64, std::collections::HashMap<String, u64>)> {
     use std::fs;
     use std::path::Path;
 
@@ -680,7 +681,7 @@ fn clean_file_to_file(input_path: String, output_path: String) -> PyResult<(bool
     let bytes_read = content.len() as u64;
     
     // Clean content (reuse internal logic)
-    let (cleaned, subs, _categories) = clean_text_internal(&content);
+    let (cleaned, subs, categories) = clean_text_internal(&content);
     let was_modified = subs > 0;
 
     // Ensure parent directory exists
@@ -694,7 +695,7 @@ fn clean_file_to_file(input_path: String, output_path: String) -> PyResult<(bool
     fs::write(out_path, &cleaned)
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Failed to write {}: {}", output_path, e)))?;
 
-    Ok((was_modified, subs, bytes_read))
+    Ok((was_modified, subs, bytes_read, categories))
 }
 
 /// Internal clean function (not exposed to Python, avoids string copies)
@@ -752,7 +753,10 @@ lazy_static! {
         (Regex::new(r"(?i)(aaa|bbb|ccc|ddd|eee|fff|ggg|hhh|iii|jjj|kkk|lll|mmm|nnn|ooo|ppp|qqq|rrr|sss|ttt|uuu|vvv|www|xxx|yyy|zzz)").unwrap(), "triple_repeat"),
         (Regex::new(r"[^aeiouAEIOU]{5,}").unwrap(), "consonant_run"), // 5+ consonants
         (Regex::new(r"(?i)^[bcdfghjklmnpqrstvwxz]{4,}$").unwrap(), "all_consonants"), // All consonants 4+
-        (Regex::new(r"[il1|]{3,}").unwrap(), "confusable_chars"),    // l/1/|/i confusion
+        // Confusable char sequences - require actual OCR confusion markers (digits or pipe)
+        // Old pattern r"[il1|]{3,}" caught legitimate words like "Still", "William", "Military"
+        (Regex::new(r"[1|][il1|]+").unwrap(), "confusable_starts_digit"),  // Starts with digit/pipe (Wi1liam, fi|l)
+        (Regex::new(r"[il1|]+[1|]").unwrap(), "confusable_ends_digit"),    // Ends with digit/pipe (Will1, fil|)
         (Regex::new(r"[rnm]{4,}").unwrap(), "rn_m_confusion"),       // rn/m confusion
     ];
     
