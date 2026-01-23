@@ -240,6 +240,23 @@ vide
 vita
 viz
 
+# Latin scholarly terms (common in academic/bibliographic texts)
+foliis
+filiis
+operibus
+rebus
+libris
+verbis
+literis
+annis
+diebus
+mensibus
+ecclesiae
+historiae
+philosophiae
+theologiae
+bibliothecae
+
 # =============================================================================
 # Latin Phrases (as single words when hyphenated or joined)
 # =============================================================================
@@ -443,6 +460,32 @@ wanderlust
 weltanschauung
 wunderkind
 zeitgeist
+
+# German scholarly terms (common in academic/historical texts)
+durchschnittlichen
+handschriftlichen
+landwirtschaftlichen
+wirtschaftlichen
+gesellschaftlichen
+wissenschaftlichen
+geschichtlichen
+staatlichen
+kirchlichen
+bürgerlichen
+
+# German names/titles (common in scholarly citations)
+müller
+mueller
+könig
+schmidt
+schwarz
+weiss
+gross
+klein
+herrn
+frau
+fräulein
+herr
 
 # =============================================================================
 # Historical/Archaic English
