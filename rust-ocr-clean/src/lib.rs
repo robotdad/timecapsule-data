@@ -1176,6 +1176,33 @@ fn clean_text_internal(text: &str) -> (String, u64, std::collections::HashMap<St
 // Vocabulary Extraction
 // =============================================================================
 
+// User-provided whitelist (known good words to skip)
+static WHITELIST: std::sync::LazyLock<std::sync::RwLock<std::collections::HashSet<String>>> = 
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashSet::new()));
+
+/// Initialize the whitelist with known good words (called from Python)
+#[pyfunction]
+fn init_whitelist(words: Vec<String>) -> PyResult<usize> {
+    let mut whitelist = WHITELIST.write().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to acquire whitelist lock: {}", e))
+    })?;
+    whitelist.clear();
+    for word in &words {
+        whitelist.insert(word.to_lowercase());
+    }
+    let count = whitelist.len();
+    Ok(count)
+}
+
+/// Check if a word is in the whitelist
+fn is_whitelisted(word: &str) -> bool {
+    if let Ok(whitelist) = WHITELIST.read() {
+        whitelist.contains(&word.to_lowercase())
+    } else {
+        false
+    }
+}
+
 lazy_static! {
     // Word extraction pattern
     static ref WORD_PATTERN: Regex = Regex::new(r"\b([a-zA-Z][a-zA-Z']*[a-zA-Z]|[a-zA-Z])\b").unwrap();
@@ -1318,8 +1345,8 @@ fn extract_vocab_from_file(
         let word = cap.as_str();
         let word_lower = word.to_lowercase();
         
-        // Skip common words and very short words
-        if word.len() < 2 || SKIP_WORDS.contains(word_lower.as_str()) {
+        // Skip common words, very short words, and whitelisted words
+        if word.len() < 2 || SKIP_WORDS.contains(word_lower.as_str()) || is_whitelisted(&word_lower) {
             continue;
         }
         
@@ -1377,7 +1404,8 @@ fn extract_vocab_batch(
             let word = cap.as_str();
             let word_lower = word.to_lowercase();
             
-            if word.len() < 2 || SKIP_WORDS.contains(word_lower.as_str()) {
+            // Skip common words, very short words, and whitelisted words
+            if word.len() < 2 || SKIP_WORDS.contains(word_lower.as_str()) || is_whitelisted(&word_lower) {
                 continue;
             }
             
@@ -2070,6 +2098,7 @@ fn rust_ocr_clean(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Dictionary functions
     m.add_function(wrap_pyfunction!(pattern_count, m)?)?;
     m.add_function(wrap_pyfunction!(init_dictionaries, m)?)?;
+    m.add_function(wrap_pyfunction!(init_whitelist, m)?)?;
     m.add_function(wrap_pyfunction!(is_known_word, m)?)?;
     m.add_function(wrap_pyfunction!(word_languages, m)?)?;
     m.add_function(wrap_pyfunction!(dictionaries_loaded, m)?)?;

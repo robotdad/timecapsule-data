@@ -431,6 +431,10 @@ def cmd_extract(args):
             known_vocab = KNOWN_VOCAB
             if known_vocab:
                 print(f"Using {len(known_vocab):,} words from built-in whitelist", file=sys.stderr)
+        
+        # Initialize Rust whitelist (for skipping during extraction)
+        if known_vocab:
+            rust_ocr_clean.init_whitelist(list(known_vocab))
 
         # Fast file discovery
         print(f"Scanning {input_dir} for {args.pattern} files...", end="", flush=True)

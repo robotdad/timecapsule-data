@@ -431,3 +431,18 @@ def dictionaries_loaded() -> bool:
         True if init_dictionaries() has been called and at least one dictionary loaded.
     """
     ...
+
+
+def init_whitelist(words: list[str]) -> int:
+    """Initialize the whitelist with known good words to skip during vocab extraction.
+
+    Words in the whitelist will be skipped during vocabulary extraction.
+    Comparison is case-insensitive.
+
+    Args:
+        words: List of words to whitelist.
+
+    Returns:
+        Number of unique words added to the whitelist.
+    """
+    ...
