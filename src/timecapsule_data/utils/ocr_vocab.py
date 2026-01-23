@@ -256,6 +256,16 @@ def is_known_word(word: str) -> bool:
         return False
 
 
+def get_word_languages(word: str) -> list[str]:
+    """Get list of languages that recognize this word."""
+    try:
+        import rust_ocr_clean  # type: ignore[import-not-found]
+
+        return rust_ocr_clean.word_languages(word)
+    except ImportError:
+        return []
+
+
 def extract_context(text: str, match_start: int, match_end: int, context_chars: int = 40) -> str:
     """Extract context around a match."""
     start = max(0, match_start - context_chars)
@@ -566,12 +576,21 @@ def cmd_extract(args):
                     file=sys.stderr,
                 )
                 cleared = 0
+                lang_counts: dict[str, int] = {}
                 for c in suspicious_to_check:
                     if is_known_word(c.word):
                         c.is_suspicious = False
                         c.is_unknown = False
                         cleared += 1
-                print(f"  Cleared {cleared:,} as known English words", file=sys.stderr)
+                        # Track which languages recognized this word
+                        for lang in get_word_languages(c.word):
+                            lang_counts[lang] = lang_counts.get(lang, 0) + 1
+                print(f"  Cleared {cleared:,} as known dictionary words", file=sys.stderr)
+                if lang_counts:
+                    # Sort by count descending
+                    sorted_langs = sorted(lang_counts.items(), key=lambda x: -x[1])
+                    lang_summary = ", ".join(f"{lang}: {count}" for lang, count in sorted_langs)
+                    print(f"  By language: {lang_summary}", file=sys.stderr)
 
         # Generate output (skip if interrupted)
         if not _interrupted:

@@ -1647,17 +1647,10 @@ def clean_batch(
     old_handler = signal.signal(signal.SIGINT, handle_interrupt)
 
     try:
-        # Try to import Rust module
-        rust_available = False
-        rust_clean_file = None  # Will hold the Rust function if available
-        if use_rust:
-            try:
-                import rust_ocr_clean  # type: ignore[import-not-found]
+        # Import Rust module (required - no Python fallback)
+        import rust_ocr_clean  # type: ignore[import-not-found]
 
-                rust_clean_file = rust_ocr_clean.clean_file_to_file
-                rust_available = True
-            except ImportError:
-                print("Note: Rust module not available, using Python (slower)")
+        rust_clean_file = rust_ocr_clean.clean_file_to_file
 
         # Discover files using os.scandir (faster than glob)
         print(f"Scanning {input_dir} for {file_pattern} files...", end="", flush=True)
@@ -1827,7 +1820,7 @@ def clean_batch(
         print("(Size will be calculated during processing)")
 
         print(f"\n{'=' * 60}")
-        print(f"OCR Cleanup - {'Rust' if rust_available else 'Python'} engine")
+        print("OCR Cleanup - Rust engine")
         print(f"{'=' * 60}")
         print(f"  Files to process: {len(files_to_process):,}")
         if not skip_triage:
@@ -1851,31 +1844,17 @@ def clean_batch(
                 output_path = input_path  # in-place
 
             try:
-                if rust_available and rust_clean_file is not None:
-                    # Use Rust for all file I/O (fast!)
-                    was_modified, sub_count, file_bytes, categories = rust_clean_file(
-                        str(input_path), str(output_path)
-                    )
-                    bytes_processed += file_bytes
-                    garbage = []  # Skip garbage check for speed
-                    # Aggregate category counts from Rust
-                    stats.long_s_fixes += categories.get("long_s", 0)
-                else:
-                    # Fall back to Python
-                    was_modified, sub_count, garbage, was_skipped = clean_file(
-                        input_path, output_path, stats
-                    )
-                    if was_skipped:
-                        continue  # Skip non-English files
-                    bytes_processed += input_path.stat().st_size
+                # Use Rust for all file I/O
+                was_modified, sub_count, file_bytes, categories = rust_clean_file(
+                    str(input_path), str(output_path)
+                )
+                bytes_processed += file_bytes
+                # Aggregate category counts from Rust
+                stats.long_s_fixes += categories.get("long_s", 0)
 
                 if was_modified:
                     stats.files_modified += 1
                     stats.total_substitutions += sub_count
-
-                if garbage:
-                    stats.files_flagged += 1
-                    stats.flagged_files.append({"file": str(input_path), "issues": garbage})
 
             except Exception as e:
                 print(f"\n  Error processing {input_path}: {e}", file=sys.stderr)
