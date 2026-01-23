@@ -5,6 +5,7 @@ Cross-platform build script for timecapsule-data.
 Handles:
 - git pull
 - cargo clean + maturin build (Rust module)
+- Manual .so/.pyd copy (maturin lies about installing)
 - pip install -e . (Python package)
 - Verification that patterns work
 
@@ -14,6 +15,7 @@ Usage:
     uv run scripts/build.py --verify # Just verify current install works
 """
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -96,15 +98,66 @@ def main():
 
     # Step 2: Clean and build Rust module
     if not args.quick:
-        print("\n[2/4] Cleaning Rust build cache...")
+        print("\n[2/4] Cleaning Rust and UV caches...")
         run(["cargo", "clean"], cwd=rust_dir, check=False)
+        run(["uv", "cache", "clean"], check=False)  # Clear UV's cached wheels
 
     print("\n[3/4] Building Rust module...")
     if not run(["maturin", "develop", "--release"], cwd=rust_dir):
         print("\n✗ Rust build failed!")
         sys.exit(1)
 
-    # Step 3: Install Python package
+    # Maturin lies about installing - manually copy the .so/.pyd file
+    print("  Copying built library to venv...")
+    venv_pkg_dir = root / ".venv" / "lib"
+
+    # Find the site-packages directory (handles python version differences)
+    site_packages = None
+    if venv_pkg_dir.exists():
+        for pydir in venv_pkg_dir.iterdir():
+            candidate = pydir / "site-packages" / "rust_ocr_clean"
+            if candidate.exists():
+                site_packages = candidate
+                break
+
+    # Windows: .venv/Lib/site-packages
+    if not site_packages:
+        win_candidate = root / ".venv" / "Lib" / "site-packages" / "rust_ocr_clean"
+        if win_candidate.exists():
+            site_packages = win_candidate
+
+    if site_packages:
+        # Find the built library
+        if sys.platform == "win32":
+            src_lib = rust_dir / "target" / "release" / "rust_ocr_clean.pyd"
+            dst_pattern = "*.pyd"
+        else:
+            src_lib = rust_dir / "target" / "release" / "librust_ocr_clean.so"
+            dst_pattern = "*.so"
+
+        if src_lib.exists():
+            # Find and replace the installed library
+            for old_lib in site_packages.glob(dst_pattern):
+                old_lib.unlink()
+
+            # Determine target filename
+            if sys.platform == "win32":
+                dst_name = "rust_ocr_clean.pyd"
+            else:
+                # Get Python version for .so name
+                import sysconfig
+
+                ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
+                dst_name = f"rust_ocr_clean{ext_suffix}"
+
+            shutil.copy2(src_lib, site_packages / dst_name)
+            print(f"  ✓ Copied {src_lib.name} to {site_packages}")
+        else:
+            print(f"  ✗ Built library not found at {src_lib}")
+    else:
+        print("  ✗ Could not find venv site-packages directory")
+
+    # Step 4: Install Python package
     print("\n[3/4] Installing Python package...")
     if not run(["uv", "pip", "install", "-e", "."], cwd=root):
         print("\n✗ Python install failed!")
