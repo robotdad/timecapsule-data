@@ -36,6 +36,7 @@ test_corpus_*/
 *.txt
 !README.md
 !src/timecapsule_data/data/known_vocab.txt
+!rust-ocr-clean/dictionaries/la_words.txt
 
 # Metadata files (can be large)
 metadata.json
