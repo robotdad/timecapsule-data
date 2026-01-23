@@ -539,52 +539,33 @@ lazy_static! {
             (Regex::new(r"(?i)\b[I1]H\b").unwrap(), "", None, "ff_ligature"),
             
             // Word run-togethers (missing spaces between common words)
-            // These are OCR artifacts where word boundaries were lost
-            (Regex::new(r"\bOFTHE\b").unwrap(), "OF THE", None, "word_runtogether"),
-            (Regex::new(r"\bofthe\b").unwrap(), "of the", None, "word_runtogether"),
-            (Regex::new(r"\bOfthe\b").unwrap(), "Of the", None, "word_runtogether"),
-            (Regex::new(r"\bTOTHE\b").unwrap(), "TO THE", None, "word_runtogether"),
-            (Regex::new(r"\btothe\b").unwrap(), "to the", None, "word_runtogether"),
-            (Regex::new(r"\bTothe\b").unwrap(), "To the", None, "word_runtogether"),
-            (Regex::new(r"\bINTHE\b").unwrap(), "IN THE", None, "word_runtogether"),
-            (Regex::new(r"\binthe\b").unwrap(), "in the", None, "word_runtogether"),
-            (Regex::new(r"\bInthe\b").unwrap(), "In the", None, "word_runtogether"),
-            (Regex::new(r"\bFORTHE\b").unwrap(), "FOR THE", None, "word_runtogether"),
-            (Regex::new(r"\bforthe\b").unwrap(), "for the", None, "word_runtogether"),
-            (Regex::new(r"\bForthe\b").unwrap(), "For the", None, "word_runtogether"),
-            (Regex::new(r"\bONTHE\b").unwrap(), "ON THE", None, "word_runtogether"),
-            (Regex::new(r"\bonthe\b").unwrap(), "on the", None, "word_runtogether"),
-            (Regex::new(r"\bOnthe\b").unwrap(), "On the", None, "word_runtogether"),
-            (Regex::new(r"\bATTHE\b").unwrap(), "AT THE", None, "word_runtogether"),
-            (Regex::new(r"\batthe\b").unwrap(), "at the", None, "word_runtogether"),
-            (Regex::new(r"\bAtthe\b").unwrap(), "At the", None, "word_runtogether"),
-            (Regex::new(r"\bBYTHE\b").unwrap(), "BY THE", None, "word_runtogether"),
-            (Regex::new(r"\bbythe\b").unwrap(), "by the", None, "word_runtogether"),
-            (Regex::new(r"\bBythe\b").unwrap(), "By the", None, "word_runtogether"),
-            (Regex::new(r"\bISTHE\b").unwrap(), "IS THE", None, "word_runtogether"),
-            (Regex::new(r"\bisthe\b").unwrap(), "is the", None, "word_runtogether"),
-            (Regex::new(r"\bIsthe\b").unwrap(), "Is the", None, "word_runtogether"),
-            (Regex::new(r"\bANDTHE\b").unwrap(), "AND THE", None, "word_runtogether"),
-            (Regex::new(r"\bandthe\b").unwrap(), "and the", None, "word_runtogether"),
-            (Regex::new(r"\bAndthe\b").unwrap(), "And the", None, "word_runtogether"),
-            (Regex::new(r"\bWITHTHE\b").unwrap(), "WITH THE", None, "word_runtogether"),
-            (Regex::new(r"\bwiththe\b").unwrap(), "with the", None, "word_runtogether"),
-            (Regex::new(r"\bWiththe\b").unwrap(), "With the", None, "word_runtogether"),
-            (Regex::new(r"\bFROMTHE\b").unwrap(), "FROM THE", None, "word_runtogether"),
-            (Regex::new(r"\bfromthe\b").unwrap(), "from the", None, "word_runtogether"),
-            (Regex::new(r"\bFromthe\b").unwrap(), "From the", None, "word_runtogether"),
+            // Case-insensitive to catch OCR variants like "oFthe"
+            (Regex::new(r"(?i)\bofthe\b").unwrap(), "of the", None, "word_runtogether"),
+            (Regex::new(r"(?i)\btothe\b").unwrap(), "to the", None, "word_runtogether"),
+            (Regex::new(r"(?i)\binthe\b").unwrap(), "in the", None, "word_runtogether"),
+            (Regex::new(r"(?i)\bforthe\b").unwrap(), "for the", None, "word_runtogether"),
+            (Regex::new(r"(?i)\bonthe\b").unwrap(), "on the", None, "word_runtogether"),
+            (Regex::new(r"(?i)\batthe\b").unwrap(), "at the", None, "word_runtogether"),
+            (Regex::new(r"(?i)\bbythe\b").unwrap(), "by the", None, "word_runtogether"),
+            (Regex::new(r"(?i)\bisthe\b").unwrap(), "is the", None, "word_runtogether"),
+            (Regex::new(r"(?i)\bandthe\b").unwrap(), "and the", None, "word_runtogether"),
+            (Regex::new(r"(?i)\bwiththe\b").unwrap(), "with the", None, "word_runtogether"),
+            (Regex::new(r"(?i)\bfromthe\b").unwrap(), "from the", None, "word_runtogether"),
             
             // =================================================================
             // Long-s (ſ) OCR errors - f misread as long-s or vice versa
             // These are safe substitutions that are clearly OCR errors
+            // Case-insensitive to catch OCR variants
             // =================================================================
             
             // Symptom family (very common in medical texts)
-            (Regex::new(r"(?i)\bfymptoms?\b").unwrap(), "symptom", None, "long_s"),
+            (Regex::new(r"(?i)\bfymptom\b").unwrap(), "symptom", None, "long_s"),
+            (Regex::new(r"(?i)\bfymptoms\b").unwrap(), "symptoms", None, "long_s"),
             (Regex::new(r"(?i)\bfymptomatic\b").unwrap(), "symptomatic", None, "long_s"),
-            (Regex::new(r"(?i)\bfymptomatick?\b").unwrap(), "symptomatic", None, "long_s"),
+            (Regex::new(r"(?i)\bfymptomatick\b").unwrap(), "symptomatic", None, "long_s"),
             (Regex::new(r"(?i)\bfymptomatical\b").unwrap(), "symptomatical", None, "long_s"),
-            (Regex::new(r"(?i)\bfymptomes?\b").unwrap(), "symptome", None, "long_s"),
+            (Regex::new(r"(?i)\bfymptome\b").unwrap(), "symptome", None, "long_s"),
+            (Regex::new(r"(?i)\bfymptomes\b").unwrap(), "symptomes", None, "long_s"),
             (Regex::new(r"(?i)\bfymptoma\b").unwrap(), "symptoma", None, "long_s"),
             
             // System family
@@ -594,13 +575,9 @@ lazy_static! {
             (Regex::new(r"(?i)\bfyftcm\b").unwrap(), "system", None, "long_s"),
             
             // Majesty (common in historical/political texts)
-            (Regex::new(r"\bMajefty\b").unwrap(), "Majesty", None, "long_s"),
-            (Regex::new(r"\bMajefty's\b").unwrap(), "Majesty's", None, "long_s"),
-            (Regex::new(r"\bmajefty\b").unwrap(), "majesty", None, "long_s"),
-            (Regex::new(r"\bmajefty's\b").unwrap(), "majesty's", None, "long_s"),
-            (Regex::new(r"\bMAJEFTY\b").unwrap(), "MAJESTY", None, "long_s"),
-            (Regex::new(r"\bJefty\b").unwrap(), "Jesty", None, "long_s"),
-            (Regex::new(r"\bJefty's\b").unwrap(), "Jesty's", None, "long_s"),
+            (Regex::new(r"(?i)\bmajefty\b").unwrap(), "majesty", None, "long_s"),
+            (Regex::new(r"(?i)\bmajefty's\b").unwrap(), "majesty's", None, "long_s"),
+            (Regex::new(r"(?i)\bmajefties\b").unwrap(), "majesties", None, "long_s"),
             
             // Suffer family
             (Regex::new(r"(?i)\bfuffer\b").unwrap(), "suffer", None, "long_s"),
@@ -657,10 +634,8 @@ lazy_static! {
             (Regex::new(r"(?i)\bftrength\b").unwrap(), "strength", None, "long_s"),
             
             // First (common OCR error)
-            (Regex::new(r"\bFyrft\b").unwrap(), "First", None, "long_s"),
-            (Regex::new(r"\bfyrft\b").unwrap(), "first", None, "long_s"),
-            (Regex::new(r"\bFirft\b").unwrap(), "First", None, "long_s"),
-            (Regex::new(r"\bfirft\b").unwrap(), "first", None, "long_s"),
+            (Regex::new(r"(?i)\bfyrft\b").unwrap(), "first", None, "long_s"),
+            (Regex::new(r"(?i)\bfirft\b").unwrap(), "first", None, "long_s"),
             
             // Themselves, himself, herself, etc. with long-s corruption
             (Regex::new(r"(?i)\bthemfelves\b").unwrap(), "themselves", None, "long_s"),
