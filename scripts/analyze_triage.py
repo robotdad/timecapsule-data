@@ -43,9 +43,13 @@ def analyze_triage(path: Path, limit: int | None = None) -> dict:
         action = record.get("action", "unknown")
         stats["by_action"][action] += 1
 
-        # Track reasons
-        reason = record.get("reason", "none")
-        stats["reasons"][action][reason] += 1
+        # Track reasons (stored in "problems" array)
+        problems = record.get("problems", [])
+        if problems:
+            for problem in problems:
+                stats["reasons"][action][problem] += 1
+        else:
+            stats["reasons"][action]["none"] += 1
 
         # Track scores if available
         if "score" in record:

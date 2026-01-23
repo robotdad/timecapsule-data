@@ -1316,7 +1316,7 @@ GARBAGE_PATTERNS = [
 
 
 # Threshold for flagging high-substitution documents (substitutions per 1000 chars)
-HIGH_SUBSTITUTION_THRESHOLD = 50.0
+HIGH_SUBSTITUTION_THRESHOLD = 10.0
 
 
 @dataclass

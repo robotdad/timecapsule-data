@@ -83,11 +83,89 @@ def analyze_summary(report: dict) -> None:
 
 def analyze_per_document(report: dict, top_n: int = 20, high_sub_threshold: int = 500) -> None:
     """Analyze per-document substitution data."""
-    docs = report.get("documents", [])
-    if not docs:
-        print("\nNo per-document data available.")
+    # Handle nested structure (stats under 'stats' key) or flat structure
+    stats = report.get("stats", report)
+
+    # Check for high substitution documents (new format)
+    high_sub_data = stats.get("high_substitution_documents", {})
+    long_s_data = stats.get("long_s_documents", {})
+
+    if not high_sub_data and not long_s_data:
+        # Fall back to old format
+        docs = report.get("documents", [])
+        if not docs:
+            print("\nNo per-document data available.")
+            return
+        _analyze_legacy_documents(docs, top_n, high_sub_threshold)
         return
 
+    print("\n" + "=" * 70)
+    print("PER-DOCUMENT ANALYSIS")
+    print("=" * 70)
+
+    # High substitution documents
+    if high_sub_data:
+        total_count = high_sub_data.get("total_count", 0)
+        threshold = high_sub_data.get("threshold_per_1000_chars", "N/A")
+        sample_files = high_sub_data.get("sample_files", [])
+
+        print(f"\nHIGH SUBSTITUTION DOCUMENTS: {total_count:,} total")
+        print(f"  (threshold: {threshold} substitutions per 1000 chars)")
+        print("-" * 70)
+
+        if sample_files:
+            # Sort by substitution rate
+            sorted_files = sorted(
+                sample_files, key=lambda x: x.get("substitution_rate", 0), reverse=True
+            )
+            print(f"\nTOP {min(top_n, len(sorted_files))} BY SUBSTITUTION RATE:")
+            for i, doc in enumerate(sorted_files[:top_n], 1):
+                rate = doc.get("substitution_rate", 0)
+                total_subs = doc.get("total_substitutions", 0)
+                filename = doc.get("filename", "unknown")
+                # Truncate filename for display
+                if len(filename) > 45:
+                    filename = "..." + filename[-42:]
+                print(f"  {i:3}. {rate:>6.1f}/1k chars  {total_subs:>6,} subs  {filename}")
+
+            # Category breakdown from sample files
+            category_totals = Counter()
+            for doc in sample_files:
+                cats = doc.get("categories", {})
+                for cat, count in cats.items():
+                    category_totals[cat] += count
+
+            if category_totals:
+                print(f"\nCATEGORY BREAKDOWN (from {len(sample_files)} sampled docs):")
+                print("-" * 50)
+                total = sum(category_totals.values())
+                for cat, count in category_totals.most_common():
+                    pct = (count / total * 100) if total else 0
+                    print(f"  {cat:20} {count:>10,}  ({pct:5.1f}%)")
+
+    # Long-s documents
+    if long_s_data:
+        total_count = long_s_data.get("total_count", 0)
+        sample_files = long_s_data.get("sample_files", [])
+
+        print(f"\nLONG-S DOCUMENTS: {total_count:,} total")
+        print("-" * 70)
+
+        if sample_files:
+            sorted_files = sorted(
+                sample_files, key=lambda x: x.get("long_s_fixes", 0), reverse=True
+            )
+            print(f"\nTOP {min(top_n, len(sorted_files))} BY LONG-S FIXES:")
+            for i, doc in enumerate(sorted_files[:top_n], 1):
+                fixes = doc.get("long_s_fixes", 0)
+                filename = doc.get("filename", "unknown")
+                if len(filename) > 50:
+                    filename = "..." + filename[-47:]
+                print(f"  {i:3}. {fixes:>6,} fixes  {filename}")
+
+
+def _analyze_legacy_documents(docs: list, top_n: int, high_sub_threshold: int) -> None:
+    """Analyze legacy per-document format (flat list)."""
     print("\n" + "=" * 70)
     print(f"PER-DOCUMENT ANALYSIS ({len(docs):,} documents)")
     print("=" * 70)

@@ -372,3 +372,61 @@ def preprocess_file(
         PreprocessResult with preprocessing info.
     """
     ...
+
+
+# =============================================================================
+# Dictionary Functions (Multi-language word lookup)
+# =============================================================================
+
+
+def init_dictionaries(dict_dir: str) -> bool:
+    """Initialize multi-language dictionaries from a directory.
+
+    Loads Hunspell dictionaries for English, German, French, and Latin.
+    Dictionaries are loaded once globally and reused across calls.
+
+    Args:
+        dict_dir: Path to directory containing .aff and .dic files.
+
+    Returns:
+        True if at least one dictionary was loaded successfully.
+    """
+    ...
+
+
+def is_known_word(word: str) -> bool:
+    """Check if a word exists in any loaded dictionary.
+
+    Checks English, German, French, and Latin dictionaries.
+    Also tries lowercase version of the word.
+
+    Args:
+        word: Word to check.
+
+    Returns:
+        True if word is found in any dictionary.
+    """
+    ...
+
+
+def word_languages(word: str) -> list[str]:
+    """Get list of languages that recognize a word.
+
+    Useful for debugging which dictionary matched.
+
+    Args:
+        word: Word to check.
+
+    Returns:
+        List of language codes (e.g., ['en', 'de']) that recognize the word.
+    """
+    ...
+
+
+def dictionaries_loaded() -> bool:
+    """Check if dictionaries have been initialized.
+
+    Returns:
+        True if init_dictionaries() has been called and at least one dictionary loaded.
+    """
+    ...

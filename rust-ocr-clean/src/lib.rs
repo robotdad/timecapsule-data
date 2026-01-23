@@ -4,6 +4,8 @@ use lazy_static::lazy_static;
 use unicode_normalization::UnicodeNormalization;
 use whatlang::{detect, Lang};
 
+mod dictionary;
+
 // Pre-compile all OCR patterns at module load time
 // Each pattern is: (regex, replacement, optional_context_regex, category)
 lazy_static! {
@@ -780,6 +782,11 @@ lazy_static! {
 fn check_suspicious(word: &str) -> Option<&'static str> {
     for (pattern, reason) in SUSPICIOUS_PATTERNS.iter() {
         if pattern.is_match(word) {
+            // If dictionaries are loaded, check if word is known
+            // Known words are NOT suspicious even if they match patterns
+            if dictionary::dictionaries_loaded() && dictionary::is_known_word(word) {
+                return None;
+            }
             return Some(reason);
         }
     }
@@ -1585,6 +1592,27 @@ fn preprocess_file(
     Ok(result)
 }
 
+// Python bindings for dictionary functions
+#[pyfunction]
+fn init_dictionaries(dict_dir: &str) -> bool {
+    dictionary::init_dictionaries(dict_dir)
+}
+
+#[pyfunction]
+fn is_known_word(word: &str) -> bool {
+    dictionary::is_known_word(word)
+}
+
+#[pyfunction]
+fn word_languages(word: &str) -> Vec<&'static str> {
+    dictionary::word_languages(word)
+}
+
+#[pyfunction]
+fn dictionaries_loaded() -> bool {
+    dictionary::dictionaries_loaded()
+}
+
 #[pymodule]
 fn rust_ocr_clean(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(clean_text, m)?)?;
@@ -1606,6 +1634,11 @@ fn rust_ocr_clean(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fix_unicode_file, m)?)?;
     m.add_function(wrap_pyfunction!(preprocess_text, m)?)?;
     m.add_function(wrap_pyfunction!(preprocess_file, m)?)?;
+    // Dictionary functions
+    m.add_function(wrap_pyfunction!(init_dictionaries, m)?)?;
+    m.add_function(wrap_pyfunction!(is_known_word, m)?)?;
+    m.add_function(wrap_pyfunction!(word_languages, m)?)?;
+    m.add_function(wrap_pyfunction!(dictionaries_loaded, m)?)?;
     m.add_class::<WordInfo>()?;
     m.add_class::<TriageResult>()?;
     m.add_class::<LangDetectResult>()?;

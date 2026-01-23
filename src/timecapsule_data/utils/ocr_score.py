@@ -37,69 +37,36 @@ class Dictionary:
     """
     Multi-source dictionary for OCR error detection.
 
-    Prefers pyenchant (handles inflections) over NLTK (base forms only).
+    Uses Rust multi-language dictionaries (en, de, fr, la) via rust_ocr_clean module.
     """
 
     def __init__(self):
         self.words: set[str] = set()
-        self._enchant_dict = None
-        self._use_enchant = False
+        self._rust_dict_loaded = False
         self._load_dictionary()
 
     def _load_dictionary(self):
-        """Load dictionary, preferring enchant for inflection support."""
+        """Load dictionary using Rust module (ONE PATH - no Python dictionary libs)."""
+        from pathlib import Path
 
-        # 1. Try enchant first (handles inflections like "students", "has", etc.)
+        # Use Rust dictionaries (en, de, fr, la) - ONE PATH
         try:
-            import enchant
+            import rust_ocr_clean  # type: ignore[import-not-found]
 
-            self._enchant_dict = enchant.Dict("en_US")
-            self._use_enchant = True
-            # Still load word set for fast common word checks
-            self._add_common_words()
-            self._add_historical_vocabulary()
-            self._add_common_names()
-            return
-        except ImportError:
-            pass
-        except enchant.errors.DictNotFoundError:
-            print("Warning: enchant en_US dictionary not found", file=sys.stderr)
-
-        # 2. Fallback to NLTK (base forms only - less accurate for inflections)
-        try:
-            import nltk
-
-            try:
-                from nltk.corpus import words
-
-                self.words.update(w.lower() for w in words.words())
-            except LookupError:
-                nltk.download("words", quiet=True)
-                from nltk.corpus import words
-
-                self.words.update(w.lower() for w in words.words())
-
-            # Add inflected forms manually for common words
-            self._add_common_inflections()
-            self._add_historical_vocabulary()
-            self._add_common_names()
-            print(
-                "Note: Using NLTK dictionary. Install pyenchant for better accuracy.",
-                file=sys.stderr,
+            dict_dir = (
+                Path(__file__).parent.parent.parent.parent / "rust-ocr-clean" / "dictionaries"
             )
-            return
+            if dict_dir.exists():
+                rust_ocr_clean.init_dictionaries(str(dict_dir))
+                self._rust_dict_loaded = rust_ocr_clean.dictionaries_loaded()
         except ImportError:
-            pass
+            print("Warning: rust_ocr_clean module not available", file=sys.stderr)
 
-        # 3. Minimal fallback
+        # Still load supplementary word sets for historical/domain terms
         self._add_common_words()
         self._add_common_inflections()
         self._add_historical_vocabulary()
         self._add_common_names()
-        print(
-            "Warning: Using minimal fallback dictionary. Install pyenchant for best results.",
-            file=sys.stderr,
-        )
 
     def _add_common_words(self):
         """Add most common English words."""
@@ -540,10 +507,12 @@ class Dictionary:
         if word_lower in self.words:
             return True
 
-        # Use enchant for comprehensive check (handles inflections)
-        if self._use_enchant and self._enchant_dict:
+        # Use Rust dictionaries for comprehensive check (en, de, fr, la)
+        if self._rust_dict_loaded:
             try:
-                return self._enchant_dict.check(word)
+                import rust_ocr_clean  # type: ignore[import-not-found]
+
+                return rust_ocr_clean.is_known_word(word)
             except Exception:
                 pass
 
@@ -553,8 +522,8 @@ class Dictionary:
         return self.is_word(word)
 
     def __len__(self) -> int:
-        if self._use_enchant:
-            return len(self.words) + 200000  # Approximate enchant size
+        if self._rust_dict_loaded:
+            return len(self.words) + 500000  # Approximate multi-lang dict size
         return len(self.words)
 
 

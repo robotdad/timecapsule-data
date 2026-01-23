@@ -86,15 +86,9 @@ def load_known_vocab(filepath: Path | None = None) -> set[str]:
 # Load known vocab at module import time
 KNOWN_VOCAB: set[str] = load_known_vocab()
 
-# Try to import dictionary for unknown word detection (optional)
-try:
-    import enchant  # type: ignore[import-not-found]
-
-    DICT = enchant.Dict("en_US")
-    HAS_ENCHANT = True
-except ImportError:
-    HAS_ENCHANT = False
-    DICT = None
+# Dictionary lookup is now handled in Rust (rust_ocr_clean module)
+# The Rust module provides multi-language dictionary support (en, de, fr, la)
+# via the is_known_word() function. No Python dictionary needed.
 
 
 # =============================================================================
@@ -253,12 +247,12 @@ class VocabCandidate:
 
 
 def is_known_word(word: str) -> bool:
-    """Check if word is in the dictionary."""
-    if not HAS_ENCHANT or DICT is None:
-        return False
+    """Check if word is in the dictionary (uses Rust multi-language dictionaries)."""
     try:
-        return DICT.check(word) or DICT.check(word.lower())
-    except Exception:
+        import rust_ocr_clean  # type: ignore[import-not-found]
+
+        return rust_ocr_clean.is_known_word(word)
+    except ImportError:
         return False
 
 
@@ -414,11 +408,13 @@ def cmd_extract(args):
 
         rust_extract_batch = rust_ocr_clean.extract_vocab_batch
 
-        if not HAS_ENCHANT:
-            print(
-                "Warning: pyenchant not available, all words will be marked as unknown",
-                file=sys.stderr,
-            )
+        # Initialize Rust dictionaries for multi-language word lookup (en, de, fr, la)
+        # This is done once per run; dictionaries are loaded globally in the Rust module
+        dict_dir = Path(__file__).parent.parent.parent.parent / "rust-ocr-clean" / "dictionaries"
+        if dict_dir.exists():
+            rust_ocr_clean.init_dictionaries(str(dict_dir))
+        else:
+            print(f"Warning: Dictionary directory not found: {dict_dir}", file=sys.stderr)
 
         # Load known vocab whitelist
         if hasattr(args, "no_whitelist") and args.no_whitelist:
@@ -557,9 +553,10 @@ def cmd_extract(args):
             )
         print(f"{'=' * 60}", file=sys.stderr)
 
-        # Post-process: dictionary check for suspicious words (Rust skips this for speed)
-        # Only check words that meet frequency threshold and are marked suspicious
-        if not _interrupted and HAS_ENCHANT:
+        # Post-process: dictionary check for suspicious words
+        # NOTE: Rust now does dictionary checks during extraction, but we do a final pass
+        # here to catch any edge cases with the is_known_word function
+        if not _interrupted and rust_ocr_clean.dictionaries_loaded():
             suspicious_to_check = [
                 c for c in candidates.values() if c.is_suspicious and c.frequency >= args.min_freq
             ]

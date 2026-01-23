@@ -27,7 +27,6 @@ dependencies = [
     "datasketch>=1.6.0",
     "xxhash>=3.0.0",
     "rust-ocr-clean",
-    "pyenchant>=3.3.0",
 ]
 
 [tool.uv.sources]
