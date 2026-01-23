@@ -770,6 +770,80 @@ lazy_static! {
             (Regex::new(r"(?i)\bDght\b").unwrap(), "Dight", None, "missing_li"),
             (Regex::new(r"(?i)\bfight\b").unwrap(), "sight", None, "missing_li"),
             
+            // Combined Ull + mg patterns (double ligature break)
+            (Regex::new(r"(?i)\bFoUowmg\b").unwrap(), "Following", None, "ull_mg_combined"),
+            (Regex::new(r"(?i)\bFoUowiug\b").unwrap(), "Following", None, "ull_iug_combined"),
+            (Regex::new(r"(?i)\bWiUmg\b").unwrap(), "Willing", None, "ull_mg_combined"),
+            (Regex::new(r"(?i)\bKiUmg\b").unwrap(), "Killing", None, "ull_mg_combined"),
+            (Regex::new(r"(?i)\bFiUmg\b").unwrap(), "Filling", None, "ull_mg_combined"),
+            (Regex::new(r"(?i)\bPuUmg\b").unwrap(), "Pulling", None, "ull_mg_combined"),
+            (Regex::new(r"(?i)\bCaUmg\b").unwrap(), "Calling", None, "ull_mg_combined"),
+            (Regex::new(r"(?i)\bFaUmg\b").unwrap(), "Falling", None, "ull_mg_combined"),
+            (Regex::new(r"(?i)\bTeUmg\b").unwrap(), "Telling", None, "ull_mg_combined"),
+            (Regex::new(r"(?i)\bSeUmg\b").unwrap(), "Selling", None, "ull_mg_combined"),
+            (Regex::new(r"(?i)\bDweUmg\b").unwrap(), "Dwelling", None, "ull_mg_combined"),
+            (Regex::new(r"(?i)\bSweUmg\b").unwrap(), "Swelling", None, "ull_mg_combined"),
+            
+            // 'ing' showing as 'mg' (broken ligature)
+            (Regex::new(r"(?i)\bThmg\b").unwrap(), "Thing", None, "ing_mg"),
+            (Regex::new(r"(?i)\bThmgs\b").unwrap(), "Things", None, "ing_mg"),
+            (Regex::new(r"(?i)\bBrmg\b").unwrap(), "Bring", None, "ing_mg"),
+            (Regex::new(r"(?i)\bBrmgs\b").unwrap(), "Brings", None, "ing_mg"),
+            (Regex::new(r"(?i)\bSprmg\b").unwrap(), "Spring", None, "ing_mg"),
+            (Regex::new(r"(?i)\bAnythmg\b").unwrap(), "Anything", None, "ing_mg"),
+            (Regex::new(r"(?i)\bEverythmg\b").unwrap(), "Everything", None, "ing_mg"),
+            (Regex::new(r"(?i)\bSomethmg\b").unwrap(), "Something", None, "ing_mg"),
+            (Regex::new(r"(?i)\bNothmg\b").unwrap(), "Nothing", None, "ing_mg"),
+            (Regex::new(r"(?i)\bStnmg\b").unwrap(), "String", None, "ing_mg"),
+            (Regex::new(r"(?i)\bStrmg\b").unwrap(), "String", None, "ing_mg"),
+            (Regex::new(r"(?i)\bCarrymg\b").unwrap(), "Carrying", None, "ing_mg"),
+            (Regex::new(r"(?i)\bFlymg\b").unwrap(), "Flying", None, "ing_mg"),
+            (Regex::new(r"(?i)\bDymg\b").unwrap(), "Dying", None, "ing_mg"),
+            (Regex::new(r"(?i)\bLymg\b").unwrap(), "Lying", None, "ing_mg"),
+            (Regex::new(r"(?i)\bTrymg\b").unwrap(), "Trying", None, "ing_mg"),
+            (Regex::new(r"(?i)\bCrymg\b").unwrap(), "Crying", None, "ing_mg"),
+            (Regex::new(r"(?i)\bBegmnmg\b").unwrap(), "Beginning", None, "ing_mg"),
+            (Regex::new(r"(?i)\bMornmg\b").unwrap(), "Morning", None, "ing_mg"),
+            (Regex::new(r"(?i)\bEvenmg\b").unwrap(), "Evening", None, "ing_mg"),
+            (Regex::new(r"(?i)\bMeanmg\b").unwrap(), "Meaning", None, "ing_mg"),
+            (Regex::new(r"(?i)\bFeelmg\b").unwrap(), "Feeling", None, "ing_mg"),
+            (Regex::new(r"(?i)\bMeetmg\b").unwrap(), "Meeting", None, "ing_mg"),
+            (Regex::new(r"(?i)\bSaymg\b").unwrap(), "Saying", None, "ing_mg"),
+            (Regex::new(r"(?i)\bPaymg\b").unwrap(), "Paying", None, "ing_mg"),
+            (Regex::new(r"(?i)\bPlaymg\b").unwrap(), "Playing", None, "ing_mg"),
+            (Regex::new(r"(?i)\bStaymg\b").unwrap(), "Staying", None, "ing_mg"),
+            (Regex::new(r"(?i)\bLaymg\b").unwrap(), "Laying", None, "ing_mg"),
+            
+            // 'ing' showing as 'iiig' (broken ligature)
+            (Regex::new(r"(?i)\bBeiiig\b").unwrap(), "Being", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bKiiig\b").unwrap(), "King", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bKiiigs\b").unwrap(), "Kings", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bThiiig\b").unwrap(), "Thing", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bThiiigs\b").unwrap(), "Things", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bBriiig\b").unwrap(), "Bring", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bMakiiig\b").unwrap(), "Making", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bTakiiig\b").unwrap(), "Taking", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bHaviiig\b").unwrap(), "Having", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bGiviiig\b").unwrap(), "Giving", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bLiviiig\b").unwrap(), "Living", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bDuriiig\b").unwrap(), "During", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bWritiiig\b").unwrap(), "Writing", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bFollowiiig\b").unwrap(), "Following", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bAccordiiig\b").unwrap(), "According", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bNothiiig\b").unwrap(), "Nothing", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bAnythiiig\b").unwrap(), "Anything", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bEverythiiig\b").unwrap(), "Everything", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bSomethiiig\b").unwrap(), "Something", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bMorniiig\b").unwrap(), "Morning", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bEveniiig\b").unwrap(), "Evening", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bMeaniiig\b").unwrap(), "Meaning", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bFeeliiig\b").unwrap(), "Feeling", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bMeetiiig\b").unwrap(), "Meeting", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bSeeiiig\b").unwrap(), "Seeing", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bGoiiig\b").unwrap(), "Going", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bDoiiig\b").unwrap(), "Doing", None, "ing_iiig"),
+            (Regex::new(r"(?i)\bSayiiig\b").unwrap(), "Saying", None, "ing_iiig"),
+            
             // cl/d confusion
             (
                 Regex::new(r"(?i)\bclo\b").unwrap(),
@@ -1236,6 +1310,11 @@ lazy_static! {
         ];
         words.iter().cloned().collect()
     };
+    
+    // Roman numeral pattern (skip these - they're period-appropriate)
+    static ref ROMAN_NUMERAL_PATTERN: Regex = Regex::new(
+        r"(?i)^[IVXLCDM]+$"
+    ).unwrap();
 }
 
 /// Check if a word looks suspicious (likely OCR error)
@@ -1345,8 +1424,8 @@ fn extract_vocab_from_file(
         let word = cap.as_str();
         let word_lower = word.to_lowercase();
         
-        // Skip common words, very short words, and whitelisted words
-        if word.len() < 2 || SKIP_WORDS.contains(word_lower.as_str()) || is_whitelisted(&word_lower) {
+        // Skip common words, short words (<3 chars), whitelisted words, and Roman numerals
+        if word.len() < 3 || SKIP_WORDS.contains(word_lower.as_str()) || is_whitelisted(&word_lower) || ROMAN_NUMERAL_PATTERN.is_match(word) {
             continue;
         }
         
@@ -1405,7 +1484,8 @@ fn extract_vocab_batch(
             let word_lower = word.to_lowercase();
             
             // Skip common words, very short words, and whitelisted words
-            if word.len() < 2 || SKIP_WORDS.contains(word_lower.as_str()) || is_whitelisted(&word_lower) {
+            // Skip common words, short words (<3 chars), whitelisted words, and Roman numerals
+            if word.len() < 3 || SKIP_WORDS.contains(word_lower.as_str()) || is_whitelisted(&word_lower) || ROMAN_NUMERAL_PATTERN.is_match(word) {
                 continue;
             }
             
