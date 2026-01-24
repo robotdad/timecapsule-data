@@ -445,12 +445,14 @@ def clean_batch(
     skip_triage: bool = False,
     triage_output: Optional[Path] = None,
     boilerplate_log: Optional[Path] = None,
+    parallel: bool = True,
+    num_threads: int = 24,
 ) -> CleanupStats:
     """
     Clean all text files in a directory.
 
     Uses Rust for file I/O when available (much faster).
-    Single-threaded for clean Ctrl+C handling.
+    With parallel=True (default), uses Rayon for multi-threaded processing.
 
     Args:
         input_dir: Directory containing input files
@@ -459,6 +461,9 @@ def clean_batch(
         use_rust: Use Rust engine for speed
         skip_triage: If True, skip document triage and process all files
         triage_output: If set, write triage results to this JSONL file
+        boilerplate_log: If set, write boilerplate audit log to this JSONL file
+        parallel: If True, use multi-threaded Rayon processing (default: True)
+        num_threads: Number of threads for parallel processing (default: 24)
     """
     import signal
     import sys
@@ -651,12 +656,14 @@ def clean_batch(
         print("(Size will be calculated during processing)")
 
         print(f"\n{'=' * 60}")
-        print("OCR Cleanup - Rust engine")
+        print(f"OCR Cleanup - Rust engine {'(parallel)' if parallel else '(sequential)'}")
         print(f"{'=' * 60}")
         print(f"  Files to process: {len(files_to_process):,}")
         if not skip_triage:
             print(f"  (Skipped by triage: {stats.triage_quarantined + stats.triage_rejected:,})")
         print(f"  Output: {output_dir or 'in-place'}")
+        if parallel:
+            print(f"  Threads: {num_threads}")
         print(f"{'=' * 60}\n")
 
         start_time = time.time()
@@ -669,61 +676,42 @@ def clean_batch(
         if boilerplate_log:
             boilerplate_log_file = open(boilerplate_log, "w")
 
-        for i, input_path in enumerate(files_to_process, 1):
-            if interrupted:
-                break
-
+        # Build file pairs list (needed for both parallel and sequential)
+        file_pairs = []
+        for input_path in files_to_process:
             if output_dir:
                 relative = input_path.relative_to(input_dir)
                 output_path = output_dir / relative
             else:
                 output_path = input_path  # in-place
+            file_pairs.append((str(input_path), str(output_path)))
 
-            try:
-                # Use Rust for all file I/O (pipeline: strip boilerplate -> OCR cleanup)
-                was_modified, sub_count, file_bytes, categories, boilerplate_regions = (
-                    rust_clean_file(str(input_path), str(output_path))
-                )
-                bytes_processed += file_bytes
-                # Aggregate category counts from Rust
-                stats.long_s_fixes += categories.get("long_s", 0)
+        if parallel and not interrupted:
+            # ===== PARALLEL PROCESSING WITH RAYON =====
+            total_to_process = len(file_pairs)
+            BATCH_SIZE = 1000  # Process in batches for progress reporting
 
-                if was_modified:
-                    stats.files_modified += 1
-                    stats.total_substitutions += sub_count
+            for batch_start in range(0, total_to_process, BATCH_SIZE):
+                if interrupted:
+                    break
 
-                # Track boilerplate stripping
-                if boilerplate_regions:
-                    stats.files_with_boilerplate += 1
-                    for cat, pattern, start_line, end_line, char_count in boilerplate_regions:
-                        stats.total_boilerplate_chars += char_count
-                        stats.boilerplate_by_category[cat] += 1
+                batch_end = min(batch_start + BATCH_SIZE, total_to_process)
+                batch = file_pairs[batch_start:batch_end]
 
-                    # Write to boilerplate audit log if enabled
-                    if boilerplate_log_file:
-                        relative = input_path.relative_to(input_dir)
-                        log_entry = {
-                            "file": str(relative),
-                            "stripped": [
-                                {
-                                    "category": cat,
-                                    "pattern": pattern,
-                                    "lines": [start_line, end_line],
-                                    "chars": char_count,
-                                }
-                                for cat, pattern, start_line, end_line, char_count in boilerplate_regions
-                            ],
-                        }
-                        boilerplate_log_file.write(json.dumps(log_entry) + "\n")
+                # Process batch in parallel using Rust/Rayon
+                batch_stats = rust_ocr_clean.clean_batch_parallel(batch, num_threads)
 
-            except Exception as e:
-                print(f"\n  Error processing {input_path}: {e}", file=sys.stderr)
-                continue
+                # Aggregate stats
+                i = batch_end
+                stats.files_modified += batch_stats.files_modified
+                stats.total_substitutions += batch_stats.total_substitutions
+                stats.long_s_fixes += batch_stats.long_s_fixes
+                stats.files_with_boilerplate += batch_stats.boilerplate_files
+                stats.total_boilerplate_chars += batch_stats.boilerplate_chars
+                bytes_processed += batch_stats.total_bytes
 
-            # Progress update every 2 seconds or every 500 files
-            now = time.time()
-            total_to_process = len(files_to_process)
-            if now - last_update >= 2.0 or i % 500 == 0:
+                # Progress update
+                now = time.time()
                 elapsed = now - start_time
                 files_per_sec = i / elapsed if elapsed > 0 else 0
                 mb_per_sec = (bytes_processed / (1024 * 1024)) / elapsed if elapsed > 0 else 0
@@ -743,7 +731,80 @@ def clean_batch(
                     f"{files_per_sec:.1f} files/s | {mb_per_sec:.1f} MB/s | "
                     f"ETA: {eta} | subs: {stats.total_substitutions:,}"
                 )
-                last_update = now
+
+        else:
+            # ===== SEQUENTIAL PROCESSING (for Ctrl+C support or when parallel=False) =====
+            for i, (input_path_str, output_path_str) in enumerate(file_pairs, 1):
+                if interrupted:
+                    break
+
+                input_path = Path(input_path_str)
+
+                try:
+                    # Use Rust for all file I/O (pipeline: strip boilerplate -> OCR cleanup)
+                    was_modified, sub_count, file_bytes, categories, boilerplate_regions = (
+                        rust_clean_file(input_path_str, output_path_str)
+                    )
+                    bytes_processed += file_bytes
+                    # Aggregate category counts from Rust
+                    stats.long_s_fixes += categories.get("long_s", 0)
+
+                    if was_modified:
+                        stats.files_modified += 1
+                        stats.total_substitutions += sub_count
+
+                    # Track boilerplate stripping
+                    if boilerplate_regions:
+                        stats.files_with_boilerplate += 1
+                        for cat, pattern, start_line, end_line, char_count in boilerplate_regions:
+                            stats.total_boilerplate_chars += char_count
+                            stats.boilerplate_by_category[cat] += 1
+
+                        # Write to boilerplate audit log if enabled
+                        if boilerplate_log_file:
+                            relative = input_path.relative_to(input_dir)
+                            log_entry = {
+                                "file": str(relative),
+                                "stripped": [
+                                    {
+                                        "category": cat,
+                                        "pattern": pattern,
+                                        "lines": [start_line, end_line],
+                                        "chars": char_count,
+                                    }
+                                    for cat, pattern, start_line, end_line, char_count in boilerplate_regions
+                                ],
+                            }
+                            boilerplate_log_file.write(json.dumps(log_entry) + "\n")
+
+                except Exception as e:
+                    print(f"\n  Error processing {input_path}: {e}", file=sys.stderr)
+                    continue
+
+                # Progress update every 2 seconds or every 500 files
+                now = time.time()
+                total_to_process = len(file_pairs)
+                if now - last_update >= 2.0 or i % 500 == 0:
+                    elapsed = now - start_time
+                    files_per_sec = i / elapsed if elapsed > 0 else 0
+                    mb_per_sec = (bytes_processed / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                    remaining = (total_to_process - i) / files_per_sec if files_per_sec > 0 else 0
+
+                    # Format remaining time
+                    if remaining >= 3600:
+                        eta = f"{remaining / 3600:.1f}h"
+                    elif remaining >= 60:
+                        eta = f"{remaining / 60:.1f}m"
+                    else:
+                        eta = f"{remaining:.0f}s"
+
+                    pct = (i / total_to_process) * 100 if total_to_process > 0 else 100
+                    print(
+                        f"  [{pct:5.1f}%] {i:,}/{total_to_process:,} files | "
+                        f"{files_per_sec:.1f} files/s | {mb_per_sec:.1f} MB/s | "
+                        f"ETA: {eta} | subs: {stats.total_substitutions:,}"
+                    )
+                    last_update = now
 
         # Final stats
         elapsed = time.time() - start_time

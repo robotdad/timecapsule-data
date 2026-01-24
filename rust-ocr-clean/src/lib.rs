@@ -3,6 +3,8 @@ use regex::Regex;
 use lazy_static::lazy_static;
 use unicode_normalization::UnicodeNormalization;
 use whatlang::{detect, Lang};
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 mod dictionary;
 
@@ -1435,6 +1437,162 @@ fn clean_file_to_file(input_path: String, output_path: String) -> PyResult<(bool
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Failed to write {}: {}", output_path, e)))?;
 
     Ok((was_modified, subs, bytes_read, categories, boilerplate_tuples))
+}
+
+/// Statistics for a batch of files processed in parallel
+#[pyclass]
+#[derive(Clone)]
+struct BatchStats {
+    #[pyo3(get)]
+    files_processed: usize,
+    #[pyo3(get)]
+    files_modified: usize,
+    #[pyo3(get)]
+    files_failed: usize,
+    #[pyo3(get)]
+    total_substitutions: u64,
+    #[pyo3(get)]
+    total_bytes: u64,
+    #[pyo3(get)]
+    long_s_fixes: u64,
+    #[pyo3(get)]
+    boilerplate_files: usize,
+    #[pyo3(get)]
+    boilerplate_chars: u64,
+}
+
+#[pymethods]
+impl BatchStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "BatchStats(processed={}, modified={}, failed={}, subs={}, bytes={})",
+            self.files_processed, self.files_modified, self.files_failed,
+            self.total_substitutions, self.total_bytes
+        )
+    }
+}
+
+/// Process multiple files in parallel using Rayon
+/// 
+/// Args:
+///     file_pairs: List of (input_path, output_path) tuples
+///     num_threads: Number of threads to use (default: 24)
+/// 
+/// Returns:
+///     BatchStats with aggregated statistics
+#[pyfunction]
+#[pyo3(signature = (file_pairs, num_threads=None))]
+fn clean_batch_parallel(
+    file_pairs: Vec<(String, String)>,
+    num_threads: Option<usize>,
+) -> PyResult<BatchStats> {
+    use std::fs;
+    use std::path::Path;
+    use std::collections::HashSet;
+    
+    let threads = num_threads.unwrap_or(24);
+    
+    // Configure thread pool (only if not already set)
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+        .ok(); // Ignore error if already initialized
+    
+    // Pre-create all output directories (single-threaded to avoid races)
+    let output_dirs: HashSet<_> = file_pairs
+        .iter()
+        .filter_map(|(_, output)| Path::new(output).parent().map(|p| p.to_path_buf()))
+        .collect();
+    
+    for dir in &output_dirs {
+        fs::create_dir_all(dir).ok();
+    }
+    
+    // Atomic counters for thread-safe aggregation
+    let files_processed = AtomicUsize::new(0);
+    let files_modified = AtomicUsize::new(0);
+    let files_failed = AtomicUsize::new(0);
+    let total_substitutions = AtomicU64::new(0);
+    let total_bytes = AtomicU64::new(0);
+    let long_s_fixes = AtomicU64::new(0);
+    let boilerplate_files = AtomicUsize::new(0);
+    let boilerplate_chars = AtomicU64::new(0);
+    
+    // Process files in parallel
+    file_pairs.par_iter().for_each(|(input_path, output_path)| {
+        match clean_file_internal(input_path, output_path) {
+            Ok((was_modified, subs, bytes, categories, bp_regions)) => {
+                files_processed.fetch_add(1, Ordering::Relaxed);
+                total_bytes.fetch_add(bytes, Ordering::Relaxed);
+                total_substitutions.fetch_add(subs, Ordering::Relaxed);
+                
+                if was_modified {
+                    files_modified.fetch_add(1, Ordering::Relaxed);
+                }
+                
+                if let Some(ls) = categories.get("long_s") {
+                    long_s_fixes.fetch_add(*ls, Ordering::Relaxed);
+                }
+                
+                if !bp_regions.is_empty() {
+                    boilerplate_files.fetch_add(1, Ordering::Relaxed);
+                    let bp_chars: usize = bp_regions.iter().map(|r| r.char_count).sum();
+                    boilerplate_chars.fetch_add(bp_chars as u64, Ordering::Relaxed);
+                }
+            }
+            Err(e) => {
+                files_failed.fetch_add(1, Ordering::Relaxed);
+                eprintln!("Error processing {}: {}", input_path, e);
+            }
+        }
+    });
+    
+    Ok(BatchStats {
+        files_processed: files_processed.load(Ordering::Relaxed),
+        files_modified: files_modified.load(Ordering::Relaxed),
+        files_failed: files_failed.load(Ordering::Relaxed),
+        total_substitutions: total_substitutions.load(Ordering::Relaxed),
+        total_bytes: total_bytes.load(Ordering::Relaxed),
+        long_s_fixes: long_s_fixes.load(Ordering::Relaxed),
+        boilerplate_files: boilerplate_files.load(Ordering::Relaxed),
+        boilerplate_chars: boilerplate_chars.load(Ordering::Relaxed),
+    })
+}
+
+/// Internal file processing (returns Result for error handling in parallel context)
+fn clean_file_internal(
+    input_path: &str,
+    output_path: &str,
+) -> Result<(bool, u64, u64, std::collections::HashMap<String, u64>, Vec<StrippedRegion>), String> {
+    use std::fs;
+    use std::path::Path;
+    
+    // Read file
+    let content = fs::read_to_string(input_path)
+        .map_err(|e| format!("Failed to read {}: {}", input_path, e))?;
+    
+    let bytes_read = content.len() as u64;
+    
+    // Step 1: Strip boilerplate
+    let (stripped_content, boilerplate_regions) = strip_boilerplate_internal(&content);
+    
+    // Step 2: OCR cleanup
+    let (cleaned, subs, categories) = clean_text_internal(&stripped_content);
+    
+    let was_modified = !boilerplate_regions.is_empty() || subs > 0;
+    
+    // Ensure parent directory exists (should already exist from pre-creation, but be safe)
+    let out_path = Path::new(output_path);
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create directory: {}", e))?;
+    }
+    
+    // Write output
+    fs::write(out_path, &cleaned)
+        .map_err(|e| format!("Failed to write {}: {}", output_path, e))?;
+    
+    Ok((was_modified, subs, bytes_read, categories, boilerplate_regions))
 }
 
 /// Internal clean function (not exposed to Python, avoids string copies)
@@ -3120,7 +3278,9 @@ fn rust_ocr_clean(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(clean_text, m)?)?;
     m.add_function(wrap_pyfunction!(clean_text_with_categories, m)?)?;
     m.add_function(wrap_pyfunction!(clean_file_to_file, m)?)?;
+    m.add_function(wrap_pyfunction!(clean_batch_parallel, m)?)?;
     m.add_class::<CleanupResult>()?;
+    m.add_class::<BatchStats>()?;
     m.add_function(wrap_pyfunction!(extract_vocab_from_file, m)?)?;
     m.add_function(wrap_pyfunction!(extract_vocab_batch, m)?)?;
     m.add_function(wrap_pyfunction!(count_context_patterns, m)?)?;
