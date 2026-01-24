@@ -2558,9 +2558,15 @@ lazy_static! {
         r"(?im)^.*Digitized\s+(?:by\s+)?(?:the\s+)?(?:Internet\s+)?Archive.*$"
     ).unwrap();
     
-    // Internet Archive URL line
+    // Internet Archive URL line (clean)
     static ref IA_URL_LINE: Regex = Regex::new(
         r"(?im)^\s*(?:https?://)?(?:www\.)?archive\.org/details/\S+\s*$"
+    ).unwrap();
+    
+    // Internet Archive URL line (OCR-damaged with spaces inserted)
+    // Matches: "https ://arch i ve . o rg/detai Is/..." 
+    static ref IA_URL_LINE_OCR: Regex = Regex::new(
+        r"(?im)^.*https?\s*:\s*//\s*a\s*r\s*c\s*h\s*i\s*v\s*e\s*\.\s*o\s*r\s*g.*$"
     ).unwrap();
     
     // Microsoft digitization (you mentioned seeing OCR-damaged Microsoft attribution)
@@ -2571,6 +2577,12 @@ lazy_static! {
     // University library stamps (end of document)
     static ref UNIVERSITY_LIBRARY: Regex = Regex::new(
         r"(?is)(?:THE\s+)?UNIVERSITY\s+OF\s+\w+\s*[\n\r]+\s*(?:GRADUATE\s+)?LIBRARY"
+    ).unwrap();
+    
+    // Leeds University Library stamp (start of document)
+    // Pattern: LEEDS UNIVERSITY LIBRARY + Classmark block
+    static ref LEEDS_LIBRARY: Regex = Regex::new(
+        r"(?is)LEEDS\s+UNIVERSITY\s+LIBRARY\s*[\n\r]+\s*(?:Classmark:)?(?:.*[\n\r]+){0,10}(?:The\s+University\s+Library\s+Leeds|Medical\s+and\s+Dental\s+Library)"
     ).unwrap();
     
     // Library "DATE DUE" cards
@@ -2655,8 +2667,10 @@ fn strip_boilerplate_internal(text: &str) -> (String, Vec<StrippedRegion>) {
     add_matches(&IA_HEADER_BLOCK, "internet_archive", "ia_header_block", 0, start_boundary);
     add_matches(&IA_DIGITIZED_LINE, "internet_archive", "ia_digitized_line", 0, start_boundary);
     add_matches(&IA_URL_LINE, "internet_archive", "ia_url_line", 0, start_boundary);
+    add_matches(&IA_URL_LINE_OCR, "internet_archive", "ia_url_line_ocr", 0, start_boundary);
     add_matches(&MICROSOFT_DIGITIZED, "microsoft", "microsoft_digitized", 0, start_boundary);
     add_matches(&YALE_LIBRARY, "library_stamp", "yale_library", 0, start_boundary);
+    add_matches(&LEEDS_LIBRARY, "library_stamp", "leeds_library", 0, start_boundary);
     add_matches(&HATHITRUST, "hathitrust", "hathitrust", 0, start_boundary);
     add_matches(&GENERIC_DIGITIZED, "generic", "generic_digitized", 0, start_boundary);
     
@@ -2669,6 +2683,20 @@ fn strip_boilerplate_internal(text: &str) -> (String, Vec<StrippedRegion>) {
     }
     
     // Sort regions by start position
+    regions_to_remove.sort_by_key(|r| r.0);
+    
+    // KEY OPTIMIZATION: If boilerplate is detected in the first 15KB, extend strip region
+    // back to document start. Rationale: anything before digitization notices (Google Books
+    // disclaimer, "Digitized in 2016", etc.) is almost certainly OCR garbage from cover
+    // pages, binding artifacts, or library stamps - not legitimate content.
+    for region in regions_to_remove.iter_mut() {
+        if region.0 < start_boundary && region.0 > 0 {
+            // This boilerplate starts in the first 15KB - extend back to start
+            region.0 = 0;
+        }
+    }
+    
+    // Re-sort after potential modifications
     regions_to_remove.sort_by_key(|r| r.0);
     
     // Merge overlapping regions
