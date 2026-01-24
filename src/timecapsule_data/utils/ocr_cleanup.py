@@ -531,116 +531,84 @@ def clean_batch(
         # Document triage - filter out problematic content before OCR cleanup
         files_to_process = input_files
         if not skip_triage:
-            print("Running document triage...")
+            print(f"Running document triage (parallel, {num_threads} threads)...")
             try:
                 import rust_ocr_clean  # type: ignore[import-not-found]
 
-                # Process in chunks for progress and cancel support
-                chunk_size = 1000
                 total_files = len(input_files)
+                paths = [str(f) for f in input_files]
+                triage_start = time.time()
+
+                # Single parallel call does structural triage + language detection
+                triage_results, triage_stats = rust_ocr_clean.triage_batch_parallel(
+                    paths,
+                    num_threads,
+                    0.5,  # lang confidence threshold
+                )
+
+                triage_elapsed = time.time() - triage_start
+                triage_rate = total_files / triage_elapsed if triage_elapsed > 0 else 0
+
+                # Process results
                 pass_files = []
                 language_counts: dict[str, int] = {}
-                non_english_count = 0
-                triage_start = time.time()
-                last_triage_update = triage_start
 
-                for chunk_start in range(0, total_files, chunk_size):
-                    if interrupted:
-                        print("\n  Triage interrupted!")
-                        break
+                for r in triage_results:
+                    triage_record = {
+                        "path": r.path,
+                        "action": r.action,
+                        "problems": list(r.problems),
+                        "signals": {
+                            "alpha_ratio": round(r.alpha_ratio, 4),
+                            "line_length_cv": round(r.line_length_cv, 4),
+                            "mean_words_per_line": round(r.mean_words_per_line, 2),
+                            "fragment_ratio": round(r.fragment_ratio, 4),
+                        },
+                    }
 
-                    chunk_end = min(chunk_start + chunk_size, total_files)
-                    chunk_files = input_files[chunk_start:chunk_end]
-                    paths = [str(f) for f in chunk_files]
-
-                    # Batch triage with Rust
-                    triage_results = rust_ocr_clean.triage_batch(paths)
-
-                    for r in triage_results:
-                        if interrupted:
-                            break
-
-                        triage_record = {
-                            "path": r.path,
-                            "action": r.action,
-                            "problems": list(r.problems),
-                            "signals": {
-                                "alpha_ratio": round(r.alpha_ratio, 4),
-                                "line_length_cv": round(r.line_length_cv, 4),
-                                "mean_words_per_line": round(r.mean_words_per_line, 2),
-                                "fragment_ratio": round(r.fragment_ratio, 4),
-                            },
+                    # Add language info if detected
+                    if r.detected_lang:
+                        triage_record["language"] = {
+                            "detected": r.detected_lang,
+                            "confidence": round(r.lang_confidence, 4),
+                            "is_english": r.is_english,
                         }
+                        if not r.is_english:
+                            language_counts[r.detected_lang] = (
+                                language_counts.get(r.detected_lang, 0) + 1
+                            )
 
-                        # Language detection for files that pass structural checks
-                        if r.action == "pass":
-                            try:
-                                lang_result = rust_ocr_clean.detect_language_file(r.path, 0.5)
-                                triage_record["language"] = {
-                                    "detected": lang_result.detected_lang,
-                                    "confidence": round(lang_result.confidence, 4),
-                                    "is_english": lang_result.is_english,
-                                }
-                                if not lang_result.is_english:
-                                    triage_record["action"] = "reject"
-                                    triage_record["problems"] = list(triage_record["problems"]) + [
-                                        "non_english"
-                                    ]
-                                    non_english_count += 1
-                                    lang = lang_result.detected_lang
-                                    language_counts[lang] = language_counts.get(lang, 0) + 1
-                            except Exception:
-                                pass  # Assume English if detection fails
+                    stats.triage_results.append(triage_record)
 
-                        stats.triage_results.append(triage_record)
+                    if r.action == "pass":
+                        pass_files.append(Path(r.path))
 
-                        if triage_record["action"] == "pass":
-                            pass_files.append(Path(r.path))
-                            stats.triage_passed += 1
-                        elif triage_record["action"] == "quarantine":
-                            stats.triage_quarantined += 1
-                        else:  # reject
-                            stats.triage_rejected += 1
-
-                    # Progress update
-                    now = time.time()
-                    processed = chunk_end
-                    if now - last_triage_update >= 1.0 or processed == total_files or interrupted:
-                        elapsed = now - triage_start
-                        files_per_sec = processed / elapsed if elapsed > 0 else 0
-                        remaining = (
-                            (total_files - processed) / files_per_sec if files_per_sec > 0 else 0
-                        )
-
-                        if remaining >= 3600:
-                            eta = f"{remaining / 3600:.1f}h"
-                        elif remaining >= 60:
-                            eta = f"{remaining / 60:.1f}m"
-                        else:
-                            eta = f"{remaining:.0f}s"
-
-                        pct = (processed / total_files) * 100
-                        print(
-                            f"  [{pct:5.1f}%] {processed:,}/{total_files:,} | "
-                            f"{files_per_sec:.0f} files/s | ETA: {eta} | "
-                            f"pass: {stats.triage_passed:,}, "
-                            f"quarantine: {stats.triage_quarantined:,}, "
-                            f"reject: {stats.triage_rejected:,}"
-                        )
-                        last_triage_update = now
+                # Update stats from Rust
+                stats.triage_passed = triage_stats.passed
+                stats.triage_quarantined = triage_stats.quarantined
+                stats.triage_rejected = triage_stats.rejected
 
                 files_to_process = pass_files
 
+                # Print summary
+                print(
+                    f"  Triage complete: {total_files:,} files in {triage_elapsed:.1f}s "
+                    f"({triage_rate:.0f} files/s)"
+                )
+                print(
+                    f"  Results: pass={triage_stats.passed:,}, "
+                    f"quarantine={triage_stats.quarantined:,}, "
+                    f"reject={triage_stats.rejected:,}"
+                )
+
                 # Show language stats
-                if language_counts:
-                    print(f"\n  Non-English detected: {non_english_count:,} files")
+                if triage_stats.non_english > 0:
+                    print(f"\n  Non-English detected: {triage_stats.non_english:,} files")
                     sorted_langs = sorted(language_counts.items(), key=lambda x: -x[1])[:10]
                     for lang, count in sorted_langs:
                         print(f"    {lang}: {count:,}")
                     if len(language_counts) > 10:
                         print(f"    ... and {len(language_counts) - 10} more languages")
-                else:
-                    print("\n  Language check: all files English (or detection inconclusive)")
 
                 # Write triage results to JSONL if requested
                 if triage_output:

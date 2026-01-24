@@ -2242,7 +2242,197 @@ fn triage_file(path: &str) -> PyResult<TriageResult> {
     triage_text(&content, path)
 }
 
-/// Triage multiple files in batch (parallel processing)
+/// Extended triage result with language detection
+#[pyclass]
+#[derive(Clone)]
+pub struct TriageResultWithLang {
+    #[pyo3(get)]
+    pub path: String,
+    #[pyo3(get)]
+    pub action: String,  // "pass", "quarantine", "reject"
+    #[pyo3(get)]
+    pub problems: Vec<String>,
+    #[pyo3(get)]
+    pub alpha_ratio: f64,
+    #[pyo3(get)]
+    pub line_length_cv: f64,
+    #[pyo3(get)]
+    pub mean_words_per_line: f64,
+    #[pyo3(get)]
+    pub fragment_ratio: f64,
+    #[pyo3(get)]
+    pub list_pattern_ratio: f64,
+    #[pyo3(get)]
+    pub line_count: usize,
+    #[pyo3(get)]
+    pub char_count: usize,
+    // Language detection fields
+    #[pyo3(get)]
+    pub detected_lang: String,
+    #[pyo3(get)]
+    pub lang_confidence: f64,
+    #[pyo3(get)]
+    pub is_english: bool,
+}
+
+/// Triage batch stats for progress tracking
+#[pyclass]
+#[derive(Clone)]
+pub struct TriageBatchStats {
+    #[pyo3(get)]
+    pub total: usize,
+    #[pyo3(get)]
+    pub passed: usize,
+    #[pyo3(get)]
+    pub quarantined: usize,
+    #[pyo3(get)]
+    pub rejected: usize,
+    #[pyo3(get)]
+    pub non_english: usize,
+}
+
+/// Triage multiple files in parallel with integrated language detection (Rayon)
+/// 
+/// This combines structural triage AND language detection in one parallel pass,
+/// eliminating the Python loop bottleneck.
+#[pyfunction]
+#[pyo3(signature = (paths, num_threads=None, lang_confidence_threshold=None))]
+fn triage_batch_parallel(
+    paths: Vec<String>,
+    num_threads: Option<usize>,
+    lang_confidence_threshold: Option<f64>,
+) -> PyResult<(Vec<TriageResultWithLang>, TriageBatchStats)> {
+    let threads = num_threads.unwrap_or(24);
+    let lang_threshold = lang_confidence_threshold.unwrap_or(0.5);
+    
+    // Configure thread pool
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+        .ok();
+    
+    // Atomic counters for stats
+    let passed = AtomicUsize::new(0);
+    let quarantined = AtomicUsize::new(0);
+    let rejected = AtomicUsize::new(0);
+    let non_english = AtomicUsize::new(0);
+    
+    // Process all files in parallel
+    let results: Vec<TriageResultWithLang> = paths
+        .par_iter()
+        .map(|path| {
+            match std::fs::read_to_string(path) {
+                Ok(content) => {
+                    // Step 1: Structural triage
+                    let (alpha_ratio, line_length_cv, mean_words_per_line, 
+                         fragment_ratio, list_pattern_ratio, line_count, char_count) 
+                        = compute_triage_signals(&content);
+                    
+                    let (mut action, mut problems) = determine_triage(
+                        alpha_ratio, line_length_cv, mean_words_per_line,
+                        fragment_ratio, list_pattern_ratio, line_count
+                    );
+                    
+                    // Step 2: Language detection (only for files that pass structural triage)
+                    let (detected_lang, lang_confidence, is_english) = if action == "pass" {
+                        let lang_result = detect_language_internal(&content, lang_threshold);
+                        if !lang_result.is_english {
+                            action = "reject".to_string();
+                            problems.push("non_english".to_string());
+                            non_english.fetch_add(1, Ordering::Relaxed);
+                        }
+                        (lang_result.detected_lang, lang_result.confidence, lang_result.is_english)
+                    } else {
+                        ("".to_string(), 0.0, true) // Not checked
+                    };
+                    
+                    // Update stats
+                    match action.as_str() {
+                        "pass" => { passed.fetch_add(1, Ordering::Relaxed); }
+                        "quarantine" => { quarantined.fetch_add(1, Ordering::Relaxed); }
+                        _ => { rejected.fetch_add(1, Ordering::Relaxed); }
+                    }
+                    
+                    TriageResultWithLang {
+                        path: path.clone(),
+                        action,
+                        problems,
+                        alpha_ratio,
+                        line_length_cv,
+                        mean_words_per_line,
+                        fragment_ratio,
+                        list_pattern_ratio,
+                        line_count,
+                        char_count,
+                        detected_lang,
+                        lang_confidence,
+                        is_english,
+                    }
+                }
+                Err(e) => {
+                    rejected.fetch_add(1, Ordering::Relaxed);
+                    TriageResultWithLang {
+                        path: path.clone(),
+                        action: "reject".to_string(),
+                        problems: vec![format!("read_error: {}", e)],
+                        alpha_ratio: 0.0,
+                        line_length_cv: 0.0,
+                        mean_words_per_line: 0.0,
+                        fragment_ratio: 0.0,
+                        list_pattern_ratio: 0.0,
+                        line_count: 0,
+                        char_count: 0,
+                        detected_lang: "".to_string(),
+                        lang_confidence: 0.0,
+                        is_english: false,
+                    }
+                }
+            }
+        })
+        .collect();
+    
+    let stats = TriageBatchStats {
+        total: paths.len(),
+        passed: passed.load(Ordering::Relaxed),
+        quarantined: quarantined.load(Ordering::Relaxed),
+        rejected: rejected.load(Ordering::Relaxed),
+        non_english: non_english.load(Ordering::Relaxed),
+    };
+    
+    Ok((results, stats))
+}
+
+/// Internal language detection (reusable, not exposed to Python)
+fn detect_language_internal(text: &str, threshold: f64) -> LangDetectResult {
+    // Use first 10k chars for speed
+    let sample: String = text.chars().take(10000).collect();
+    
+    if sample.len() < 20 {
+        return LangDetectResult {
+            is_english: true,
+            detected_lang: "unknown".to_string(),
+            confidence: 0.0,
+        };
+    }
+    
+    match detect(&sample) {
+        Some(info) => {
+            let is_english = info.lang() == Lang::Eng && info.confidence() >= threshold;
+            LangDetectResult {
+                is_english,
+                detected_lang: format!("{:?}", info.lang()).to_lowercase(),
+                confidence: info.confidence(),
+            }
+        }
+        None => LangDetectResult {
+            is_english: true,
+            detected_lang: "unknown".to_string(),
+            confidence: 0.0,
+        },
+    }
+}
+
+/// Triage multiple files in batch (parallel processing) - legacy version
 #[pyfunction]
 fn triage_batch(paths: Vec<String>) -> PyResult<Vec<TriageResult>> {
     use std::sync::{Arc, Mutex};
@@ -3279,8 +3469,11 @@ fn rust_ocr_clean(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(clean_text_with_categories, m)?)?;
     m.add_function(wrap_pyfunction!(clean_file_to_file, m)?)?;
     m.add_function(wrap_pyfunction!(clean_batch_parallel, m)?)?;
+    m.add_function(wrap_pyfunction!(triage_batch_parallel, m)?)?;
     m.add_class::<CleanupResult>()?;
     m.add_class::<BatchStats>()?;
+    m.add_class::<TriageResultWithLang>()?;
+    m.add_class::<TriageBatchStats>()?;
     m.add_function(wrap_pyfunction!(extract_vocab_from_file, m)?)?;
     m.add_function(wrap_pyfunction!(extract_vocab_batch, m)?)?;
     m.add_function(wrap_pyfunction!(count_context_patterns, m)?)?;
