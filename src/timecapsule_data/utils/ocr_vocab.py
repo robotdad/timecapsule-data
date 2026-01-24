@@ -414,11 +414,39 @@ def cmd_extract(args):
 
         # Initialize Rust dictionaries for multi-language word lookup (en, de, fr, la)
         # This is done once per run; dictionaries are loaded globally in the Rust module
-        dict_dir = Path(__file__).parent.parent.parent.parent / "rust-ocr-clean" / "dictionaries"
-        if dict_dir.exists():
+        # Try multiple possible locations for the dictionaries
+        possible_dict_dirs = [
+            # Development: relative to source file
+            Path(__file__).parent.parent.parent.parent / "rust-ocr-clean" / "dictionaries",
+            # Development: relative to cwd
+            Path.cwd() / "rust-ocr-clean" / "dictionaries",
+            # Installed: next to the rust module
+            Path(rust_ocr_clean.__file__).parent / "dictionaries"
+            if hasattr(rust_ocr_clean, "__file__")
+            else None,
+        ]
+
+        dict_dir = None
+        for candidate in possible_dict_dirs:
+            if candidate and candidate.exists():
+                dict_dir = candidate
+                break
+
+        if dict_dir:
             rust_ocr_clean.init_dictionaries(str(dict_dir))
+            if rust_ocr_clean.dictionaries_loaded():
+                print(f"Dictionaries loaded from: {dict_dir}", file=sys.stderr)
+            else:
+                print(
+                    "WARNING: Dictionary init called but dictionaries_loaded() is False!",
+                    file=sys.stderr,
+                )
         else:
-            print(f"Warning: Dictionary directory not found: {dict_dir}", file=sys.stderr)
+            print("WARNING: Dictionary directory not found! Tried:", file=sys.stderr)
+            for p in possible_dict_dirs:
+                if p:
+                    print(f"  - {p}", file=sys.stderr)
+            print("Capitalized English words will NOT be filtered from output.", file=sys.stderr)
 
         # Load known vocab whitelist
         if hasattr(args, "no_whitelist") and args.no_whitelist:
@@ -431,7 +459,7 @@ def cmd_extract(args):
             known_vocab = KNOWN_VOCAB
             if known_vocab:
                 print(f"Using {len(known_vocab):,} words from built-in whitelist", file=sys.stderr)
-        
+
         # Initialize Rust whitelist (for skipping during extraction)
         if known_vocab:
             rust_ocr_clean.init_whitelist(list(known_vocab))
