@@ -1394,7 +1394,11 @@ fn clean_file_to_file(input_path: String, output_path: String) -> PyResult<(bool
 fn clean_text_internal(text: &str) -> (String, u64, std::collections::HashMap<String, u64>) {
     use std::collections::HashMap;
     
-    let mut result = text.to_string();
+    // Phase 0: Line unwrapping (dehyphenation + join cosmetic line breaks)
+    // This must run BEFORE OCR pattern substitutions so patterns can match complete words
+    let (unwrapped, _lines_joined, _words_dehyphenated, _spaces_normalized) = unwrap_lines_internal(text);
+    
+    let mut result = unwrapped;
     let mut total_subs: u64 = 0;
     let mut category_counts: HashMap<String, u64> = HashMap::new();
 
@@ -2365,6 +2369,246 @@ fn dictionaries_loaded() -> bool {
     dictionary::dictionaries_loaded()
 }
 
+// =============================================================================
+// LINE UNWRAPPING AND DEHYPHENATION
+// =============================================================================
+// Removes cosmetic line breaks while preserving paragraph structure.
+// Handles hyphenated word breaks at line endings.
+// Normalizes extra whitespace.
+
+/// Result of line unwrapping
+#[pyclass]
+#[derive(Clone)]
+pub struct UnwrapResult {
+    #[pyo3(get)]
+    pub text: String,
+    #[pyo3(get)]
+    pub lines_joined: u64,
+    #[pyo3(get)]
+    pub words_dehyphenated: u64,
+    #[pyo3(get)]
+    pub spaces_normalized: u64,
+}
+
+/// Check if a line appears to be a paragraph break or structural element
+fn is_paragraph_boundary(line: &str, next_line: Option<&str>) -> bool {
+    let trimmed = line.trim();
+    
+    // Empty or whitespace-only line = paragraph break
+    if trimmed.is_empty() {
+        return true;
+    }
+    
+    // Line is just a page number (digits only, possibly with punctuation)
+    if trimmed.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-') && trimmed.len() <= 10 {
+        return true;
+    }
+    
+    // Very short lines that look like headers/titles (ALL CAPS or Title Case with few words)
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    if words.len() <= 5 && trimmed.len() < 60 {
+        // Check if ALL CAPS
+        let alpha_chars: String = trimmed.chars().filter(|c| c.is_alphabetic()).collect();
+        if !alpha_chars.is_empty() && alpha_chars.chars().all(|c| c.is_uppercase()) {
+            return true;
+        }
+    }
+    
+    // Line ends with terminal punctuation AND next line starts with capital letter
+    // This suggests a natural sentence/paragraph boundary
+    if let Some(last_char) = trimmed.chars().last() {
+        if matches!(last_char, '.' | '!' | '?' | ':' | '"' | '\'' | ')' | ']') {
+            if let Some(next) = next_line {
+                let next_trimmed = next.trim();
+                if let Some(first_char) = next_trimmed.chars().find(|c| c.is_alphabetic()) {
+                    if first_char.is_uppercase() {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    
+    false
+}
+
+lazy_static! {
+    // Pattern to match hyphenated line breaks: word-\n followed by lowercase continuation
+    // Captures: (word before hyphen)(hyphen)(newline + optional space)(lowercase continuation)
+    static ref HYPHEN_LINEBREAK: Regex = Regex::new(r"([a-zA-Z]{2,})-[ \t]*\r?\n[ \t]*([a-z])").unwrap();
+}
+
+/// Phase 1: Dehyphenate - rejoin words split across lines with hyphens
+fn dehyphenate(text: &str) -> (String, u64) {
+    let mut count: u64 = 0;
+    let result = HYPHEN_LINEBREAK.replace_all(text, |caps: &regex::Captures| {
+        count += 1;
+        // Join word part + continuation letter (captures are 1-indexed)
+        format!("{}{}", &caps[1], &caps[2])
+    });
+    (result.into_owned(), count)
+}
+
+/// Internal function to unwrap lines (two-phase approach)
+fn unwrap_lines_internal(text: &str) -> (String, u64, u64, u64) {
+    // Phase 1: Dehyphenate (rejoin hyphenated words across line breaks)
+    let (dehyphenated, words_dehyphenated) = dehyphenate(text);
+    
+    // Phase 2: Join non-paragraph lines
+    let mut result = String::with_capacity(dehyphenated.len());
+    let mut lines_joined: u64 = 0;
+    let mut spaces_normalized: u64 = 0;
+    
+    let lines: Vec<&str> = dehyphenated.lines().collect();
+    
+    for (i, line) in lines.iter().enumerate() {
+        let next_line = lines.get(i + 1).copied();
+        
+        // Add the current line (trimmed)
+        result.push_str(line.trim_end());
+        
+        // Decide whether to join with next line or preserve line break
+        if let Some(next) = next_line {
+            if is_paragraph_boundary(line, Some(next)) {
+                // Preserve line break (paragraph boundary)
+                result.push('\n');
+            } else if next.trim().is_empty() {
+                // Next line is blank - preserve
+                result.push('\n');
+            } else {
+                // Join lines with a space
+                result.push(' ');
+                lines_joined += 1;
+            }
+        }
+    }
+    
+    // Normalize multiple spaces to single space
+    let mut normalized = String::with_capacity(result.len());
+    let mut prev_space = false;
+    let mut prev_newline = false;
+    
+    for c in result.chars() {
+        if c == ' ' {
+            if !prev_space && !prev_newline {
+                normalized.push(c);
+            } else if prev_space {
+                spaces_normalized += 1;
+            }
+            prev_space = true;
+            prev_newline = false;
+        } else if c == '\n' {
+            // Don't add space before newline, preserve newlines
+            if prev_space {
+                // Remove trailing space before newline
+                normalized.pop();
+            }
+            normalized.push(c);
+            prev_space = false;
+            prev_newline = true;
+        } else {
+            normalized.push(c);
+            prev_space = false;
+            prev_newline = false;
+        }
+    }
+    
+    (normalized, lines_joined, words_dehyphenated, spaces_normalized)
+}
+
+/// Unwrap cosmetic line breaks while preserving paragraph structure
+/// Returns UnwrapResult with text and statistics
+#[pyfunction]
+fn unwrap_lines(text: &str) -> UnwrapResult {
+    let (text, lines_joined, words_dehyphenated, spaces_normalized) = unwrap_lines_internal(text);
+    UnwrapResult {
+        text,
+        lines_joined,
+        words_dehyphenated,
+        spaces_normalized,
+    }
+}
+
+/// Unwrap lines in a file and write to output
+#[pyfunction]
+fn unwrap_lines_file(input_path: &str, output_path: &str) -> PyResult<UnwrapResult> {
+    let content = std::fs::read_to_string(input_path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read file: {}", e)))?;
+    
+    let (text, lines_joined, words_dehyphenated, spaces_normalized) = unwrap_lines_internal(&content);
+    
+    // Ensure parent directory exists
+    if let Some(parent) = std::path::Path::new(output_path).parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    
+    std::fs::write(output_path, &text)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to write file: {}", e)))?;
+    
+    Ok(UnwrapResult {
+        text,
+        lines_joined,
+        words_dehyphenated,
+        spaces_normalized,
+    })
+}
+
+/// Batch unwrap lines in multiple files
+#[pyfunction]
+fn unwrap_lines_batch(input_dir: &str, output_dir: &str) -> PyResult<(u64, u64, u64, u64)> {
+    use std::fs;
+    use std::path::Path;
+    
+    let input_path = Path::new(input_dir);
+    let output_path = Path::new(output_dir);
+    
+    // Create output directory
+    fs::create_dir_all(output_path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to create output dir: {}", e)))?;
+    
+    let mut total_files: u64 = 0;
+    let mut total_lines_joined: u64 = 0;
+    let mut total_words_dehyphenated: u64 = 0;
+    let mut total_spaces_normalized: u64 = 0;
+    
+    // Iterate over files in input directory
+    let entries = fs::read_dir(input_path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read input dir: {}", e)))?;
+    
+    for entry in entries {
+        let entry = entry.map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read entry: {}", e)))?;
+        let path = entry.path();
+        
+        // Only process .txt files
+        if path.extension().map(|e| e == "txt").unwrap_or(false) {
+            if let Some(filename) = path.file_name() {
+                let output_file = output_path.join(filename);
+                
+                match fs::read_to_string(&path) {
+                    Ok(content) => {
+                        let (text, lines_joined, words_dehyphenated, spaces_normalized) = unwrap_lines_internal(&content);
+                        
+                        if let Err(e) = fs::write(&output_file, &text) {
+                            eprintln!("Warning: Failed to write {}: {}", output_file.display(), e);
+                            continue;
+                        }
+                        
+                        total_files += 1;
+                        total_lines_joined += lines_joined;
+                        total_words_dehyphenated += words_dehyphenated;
+                        total_spaces_normalized += spaces_normalized;
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to read {}: {}", path.display(), e);
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok((total_files, total_lines_joined, total_words_dehyphenated, total_spaces_normalized))
+}
+
 #[pymodule]
 fn rust_ocr_clean(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(clean_text, m)?)?;
@@ -2397,5 +2641,10 @@ fn rust_ocr_clean(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TriageResult>()?;
     m.add_class::<LangDetectResult>()?;
     m.add_class::<PreprocessResult>()?;
+    // Line unwrapping functions
+    m.add_function(wrap_pyfunction!(unwrap_lines, m)?)?;
+    m.add_function(wrap_pyfunction!(unwrap_lines_file, m)?)?;
+    m.add_function(wrap_pyfunction!(unwrap_lines_batch, m)?)?;
+    m.add_class::<UnwrapResult>()?;
     Ok(())
 }
