@@ -1537,3 +1537,36 @@ svo
 lchdm
 chauc
 chrys
+
+# =============================================================================
+# Period-Appropriate Abbreviations (from corpus analysis 2026-01-24)
+# =============================================================================
+# These are legitimate abbreviations found in pre-WWI texts, not OCR errors
+chmn
+grms
+pts
+nitr
+pae
+coc
+inr
+fue
+apt
+disp
+difh
+ptd
+cmt
+ofer
+wdth
+
+# =============================================================================
+# Legitimate Historical Names (from corpus analysis 2026-01-24)
+# =============================================================================
+# These are real names/proper nouns that appear frequently in pre-WWI texts
+coningsby
+dalrymple
+langstroth
+dewitt
+gwynne
+mcgraw
+ichthyol
+dyspnea

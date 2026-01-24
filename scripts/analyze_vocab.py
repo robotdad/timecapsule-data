@@ -104,6 +104,93 @@ def analyze_patterns(vocab: list[dict]) -> dict:
     return results
 
 
+def analyze_by_category(vocab: list[dict]) -> dict:
+    """Analyze vocab by suspicious category codes from Rust extraction.
+
+    Category codes (from rust-ocr-clean):
+    - M: Mixed case OCR garbage (camelCase)
+    - R: Repeated characters (triple repeats)
+    - G: Garbage patterns (consonant runs)
+    - C: Confusable characters (digit/letter confusion)
+    - X: Modern contamination (URLs, tech terms)
+    - F: Fragments (truncated suffixes/prefixes)
+    """
+    categories = {
+        "M:mixed_case": [],
+        "R:repeated": [],
+        "G:garbage": [],
+        "C:confusable": [],
+        "X:modern": [],
+        "F:fragment": [],
+        "other": [],
+    }
+
+    # Map from suspicious_reason prefix to category
+    prefix_map = {
+        "M:": "M:mixed_case",
+        "R:": "R:repeated",
+        "G:": "G:garbage",
+        "C:": "C:confusable",
+        "X:": "X:modern",
+        "F:": "F:fragment",
+    }
+
+    for item in vocab:
+        context = item.get("context", "")
+        # Try to extract category from context (format: "...word... | M:mixed_case")
+        # Or check if the word itself suggests a category
+        categorized = False
+
+        # Check context for category code
+        if " | " in context:
+            parts = context.rsplit(" | ", 1)
+            if len(parts) == 2:
+                reason = parts[1].strip()
+                for prefix, cat in prefix_map.items():
+                    if reason.startswith(prefix):
+                        categories[cat].append(item)
+                        categorized = True
+                        break
+
+        if not categorized:
+            categories["other"].append(item)
+
+    return categories
+
+
+def print_category_analysis(categories: dict) -> None:
+    """Print category analysis results."""
+    print("\n" + "=" * 70)
+    print("CATEGORY ANALYSIS (from suspicious reason codes)")
+    print("=" * 70)
+
+    # Category descriptions
+    descriptions = {
+        "M:mixed_case": "Mixed case OCR garbage (KaL, WaA, DisP)",
+        "R:repeated": "Repeated characters (MEEE, Looo, YIII)",
+        "G:garbage": "Garbage patterns (consonant runs, unpronounceable)",
+        "C:confusable": "Character confusion (1/l/I, rn/m)",
+        "X:modern": "Modern contamination (URLs, tech terms, brands)",
+        "F:fragment": "Fragments (truncated words like -tion, -ment)",
+        "other": "Other suspicious (uncategorized)",
+    }
+
+    for cat, items in sorted(categories.items(), key=lambda x: -len(x[1])):
+        if not items:
+            continue
+        total_occ = sum(item["count"] for item in items)
+        desc = descriptions.get(cat, cat)
+        print(f"\n{cat}: {len(items):,} words ({total_occ:,} occurrences)")
+        print(f"  {desc}")
+
+        # Show top 5 examples
+        top = sorted(items, key=lambda x: -x["count"])[:5]
+        for item in top:
+            word = item["word"]
+            display = repr(word)[1:-1] if any(ord(c) > 127 for c in word) else word
+            print(f"    {item['count']:>8,}  {display}")
+
+
 def analyze_by_flags(vocab: list[dict]) -> dict:
     """Analyze vocab by flag types."""
     flag_groups = {

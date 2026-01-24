@@ -1464,18 +1464,36 @@ lazy_static! {
     static ref WORD_PATTERN: Regex = Regex::new(r"\b([a-zA-Z][a-zA-Z']*[a-zA-Z]|[a-zA-Z])\b").unwrap();
     
     // Suspicious patterns that suggest OCR errors
+    // Category codes: M=mixed_case, R=repeated, X=modern, F=fragment, G=garbage, C=confusable
     // Note: Rust regex doesn't support backreferences, so we enumerate repeated chars
     static ref SUSPICIOUS_PATTERNS: Vec<(Regex, &'static str)> = vec![
-        (Regex::new(r"[a-z][A-Z]").unwrap(), "camelCase"),           // camelCase in middle
-        // Triple+ repeated chars (expanded since no backreferences)
-        (Regex::new(r"(?i)(aaa|bbb|ccc|ddd|eee|fff|ggg|hhh|iii|jjj|kkk|lll|mmm|nnn|ooo|ppp|qqq|rrr|sss|ttt|uuu|vvv|www|xxx|yyy|zzz)").unwrap(), "triple_repeat"),
-        (Regex::new(r"[^aeiouAEIOU]{5,}").unwrap(), "consonant_run"), // 5+ consonants
-        (Regex::new(r"(?i)^[bcdfghjklmnpqrstvwxz]{4,}$").unwrap(), "all_consonants"), // All consonants 4+
-        // Confusable char sequences - require actual OCR confusion markers (digits or pipe)
-        // Old pattern r"[il1|]{3,}" caught legitimate words like "Still", "William", "Military"
-        (Regex::new(r"[1|][il1|]+").unwrap(), "confusable_starts_digit"),  // Starts with digit/pipe (Wi1liam, fi|l)
-        (Regex::new(r"[il1|]+[1|]").unwrap(), "confusable_ends_digit"),    // Ends with digit/pipe (Will1, fil|)
-        (Regex::new(r"[rnm]{4,}").unwrap(), "rn_m_confusion"),       // rn/m confusion
+        // M: Mixed case OCR garbage (camelCase in middle of word)
+        (Regex::new(r"[a-z][A-Z]").unwrap(), "M:mixed_case"),
+        
+        // R: Repeated characters (triple+ repeats)
+        (Regex::new(r"(?i)(aaa|bbb|ccc|ddd|eee|fff|ggg|hhh|iii|jjj|kkk|lll|mmm|nnn|ooo|ppp|qqq|rrr|sss|ttt|uuu|vvv|www|xxx|yyy|zzz)").unwrap(), "R:triple_repeat"),
+        
+        // G: Garbage patterns (consonant runs, all consonants)
+        (Regex::new(r"[^aeiouAEIOU]{5,}").unwrap(), "G:consonant_run"),
+        (Regex::new(r"(?i)^[bcdfghjklmnpqrstvwxz]{4,}$").unwrap(), "G:all_consonants"),
+        
+        // C: Confusable char sequences - require actual OCR confusion markers (digits or pipe)
+        (Regex::new(r"[1|][il1|]+").unwrap(), "C:digit_confusion"),
+        (Regex::new(r"[il1|]+[1|]").unwrap(), "C:digit_confusion"),
+        (Regex::new(r"[rnm]{4,}").unwrap(), "C:rn_m_confusion"),
+        
+        // X: Modern contamination (URLs, tech terms that shouldn't be in pre-WWI texts)
+        (Regex::new(r"(?i)^https?$").unwrap(), "X:url_protocol"),
+        (Regex::new(r"(?i)^www$").unwrap(), "X:url_www"),
+        (Regex::new(r"(?i)\.com$|\.org$|\.net$|\.edu$|\.gov$").unwrap(), "X:url_domain"),
+        (Regex::new(r"(?i)@[a-z]+\.[a-z]+").unwrap(), "X:email"),
+        (Regex::new(r"(?i)^(javascript|html|xml|pdf|jpg|png|gif|php|asp|css)$").unwrap(), "X:file_ext"),
+        (Regex::new(r"(?i)^(google|facebook|twitter|youtube|wikipedia|amazon|ebay|paypal)$").unwrap(), "X:modern_brand"),
+        (Regex::new(r"(?i)^(digitized|digitised|scanned|uploaded|downloaded|online|offline|internet|website|webpage|email|smartphone|computer)$").unwrap(), "X:modern_tech"),
+        
+        // F: Fragments (truncated words - common suffixes/prefixes appearing alone)
+        (Regex::new(r"(?i)^(tion|tions|ment|ments|ness|ling|lings|ful|less|able|ible|ous|ious|ing|ings|ity|ities)$").unwrap(), "F:suffix_fragment"),
+        (Regex::new(r"(?i)^(pre|pro|anti|non|sub|super|trans|inter|intra|extra|ultra|semi|multi)$").unwrap(), "F:prefix_fragment"),
     ];
     
     // Common words to skip (too common to be interesting)
@@ -1611,6 +1629,14 @@ fn extract_vocab_from_file(
             continue;
         }
         
+        let is_cap = word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+        
+        // Skip capitalized common English words (sentence starters like "One", "There", "Time")
+        // These are just normal words that happen to start a sentence - not interesting
+        if is_cap && dictionary::dictionaries_loaded() && dictionary::is_known_word(&word_lower) {
+            continue;
+        }
+        
         total_words += 1;
         
         // Get or create entry
@@ -1665,15 +1691,20 @@ fn extract_vocab_batch(
             let word = cap.as_str();
             let word_lower = word.to_lowercase();
             
-            // Skip common words, very short words, and whitelisted words
             // Skip common words, short words (<3 chars), whitelisted words, and Roman numerals
             if word.len() < 3 || SKIP_WORDS.contains(word_lower.as_str()) || is_whitelisted(&word_lower) || ROMAN_NUMERAL_PATTERN.is_match(word) {
                 continue;
             }
             
-            total_words += 1;
-            
             let is_cap = word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+            
+            // Skip capitalized common English words (sentence starters like "One", "There", "Time")
+            // These are just normal words that happen to start a sentence - not interesting
+            if is_cap && dictionary::dictionaries_loaded() && dictionary::is_known_word(&word_lower) {
+                continue;
+            }
+            
+            total_words += 1;
             
             if let Some(entry) = global_counts.get_mut(&word_lower) {
                 entry.1 += 1;  // Increment count
