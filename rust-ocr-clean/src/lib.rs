@@ -2506,68 +2506,16 @@ lazy_static! {
     static ref HYPHEN_LINEBREAK: Regex = Regex::new(r"([a-zA-Z]{2,})-[ \t]*\r?\n[ \t]*([a-z])").unwrap();
     
     // ==========================================================================
-    // FRAGMENT REJOINING PATTERNS
+    // FRAGMENT REJOINING PATTERN (single optimized regex)
     // ==========================================================================
-    // These catch cases where a hyphen was OCR'd as a comma or space, leaving
+    // Catches cases where a hyphen was OCR'd as a comma or space, leaving
     // orphaned suffixes like "accord, ing" or "judg ment"
-    // Pattern: word + comma/space + common suffix
+    // Uses alternation for all suffixes in ONE regex scan (not 30 separate scans)
     // ==========================================================================
     
-    // Common suffixes that appear as fragments when hyphen is misread
-    static ref FRAGMENT_REJOIN_PATTERNS: Vec<(Regex, &'static str)> = vec![
-        // -ing fragments (most common)
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ing)\b").unwrap(), "ing"),
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ings)\b").unwrap(), "ings"),
-        
-        // -tion/-sion fragments
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(tion)\b").unwrap(), "tion"),
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(tions)\b").unwrap(), "tions"),
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(sion)\b").unwrap(), "sion"),
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(sions)\b").unwrap(), "sions"),
-        
-        // -ment fragments
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ment)\b").unwrap(), "ment"),
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ments)\b").unwrap(), "ments"),
-        
-        // -ness fragments
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ness)\b").unwrap(), "ness"),
-        
-        // -ly fragments
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ly)\b").unwrap(), "ly"),
-        
-        // -ed fragments
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ed)\b").unwrap(), "ed"),
-        
-        // -er/-est fragments
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(er)\b").unwrap(), "er"),
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ers)\b").unwrap(), "ers"),
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(est)\b").unwrap(), "est"),
-        
-        // -ful/-less fragments
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ful)\b").unwrap(), "ful"),
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(fully)\b").unwrap(), "fully"),
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(less)\b").unwrap(), "less"),
-        
-        // -able/-ible fragments
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(able)\b").unwrap(), "able"),
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ible)\b").unwrap(), "ible"),
-        
-        // -ity fragments
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ity)\b").unwrap(), "ity"),
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ities)\b").unwrap(), "ities"),
-        
-        // -ous/-ious fragments
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ous)\b").unwrap(), "ous"),
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ious)\b").unwrap(), "ious"),
-        
-        // -ance/-ence fragments
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ance)\b").unwrap(), "ance"),
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ence)\b").unwrap(), "ence"),
-        
-        // -ive fragments
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ive)\b").unwrap(), "ive"),
-        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ively)\b").unwrap(), "ively"),
-    ];
+    static ref FRAGMENT_REJOIN: Regex = Regex::new(
+        r"(?i)\b([a-z]{2,})[,\s]+\b(ings?|tions?|sions?|ments?|ness|ly|ed|ers?|est|fully?|less|[ai]ble|ity|ities|i?ous|[ae]nce|ively?)\b"
+    ).unwrap();
 }
 
 /// Phase 1: Dehyphenate - rejoin words split across lines with hyphens
@@ -2584,23 +2532,13 @@ fn dehyphenate(text: &str) -> (String, u64) {
 /// Phase 1b: Rejoin fragments where hyphen was OCR'd as comma or space
 /// e.g., "accord, ing" -> "according", "judg ment" -> "judgment"
 fn rejoin_fragments(text: &str) -> (String, u64) {
-    let mut result = text.to_string();
-    let mut total_count: u64 = 0;
-    
-    for (pattern, _suffix) in FRAGMENT_REJOIN_PATTERNS.iter() {
-        let mut match_count: u64 = 0;
-        result = pattern.replace_all(&result, |caps: &regex::Captures| {
-            match_count += 1;
-            // caps[1] = word stem, caps[2] = suffix (captured by the pattern)
-            // We need to get the actual matched suffix text to preserve case
-            let stem = &caps[1];
-            let suffix = &caps[2];
-            format!("{}{}", stem, suffix)
-        }).into_owned();
-        total_count += match_count;
-    }
-    
-    (result, total_count)
+    let mut count: u64 = 0;
+    let result = FRAGMENT_REJOIN.replace_all(text, |caps: &regex::Captures| {
+        count += 1;
+        // caps[1] = word stem, caps[2] = suffix
+        format!("{}{}", &caps[1], &caps[2])
+    });
+    (result.into_owned(), count)
 }
 
 /// Internal function to unwrap lines (multi-phase approach)
