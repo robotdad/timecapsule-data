@@ -350,14 +350,19 @@ def format_output(
 
     if suspicious:
         lines.append("# ⚠️  SUSPICIOUS - Review carefully (likely OCR errors)")
+        lines.append(
+            "# Category codes: M=mixed_case, R=repeated, G=garbage, C=confusable, X=modern, F=fragment"
+        )
         lines.append("#" + "-" * 78)
         for c in suspicious:
             flags = ""
             flags += "C" if c.is_capitalized else " "
             flags += "U" if c.is_unknown else " "
             flags += "?"
+            # Extract category code from suspicious_reason (e.g., "M:mixed_case" -> "M")
+            cat = c.suspicious_reason.split(":")[0] if c.suspicious_reason else "-"
             context = c.contexts[0] if c.contexts else ""
-            lines.append(f"{c.frequency:6d} | {flags} | {c.word:20s} | {context}")
+            lines.append(f"{c.frequency:6d} | {flags} | {cat:2s} | {c.word:20s} | {context}")
         lines.append("")
 
     if normal:
