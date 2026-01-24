@@ -36,6 +36,7 @@ Usage:
 import argparse
 import json
 import re
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -243,6 +244,10 @@ class CleanupStats:
     triage_rejected: int = 0
     triage_results: list = field(default_factory=list)  # Full triage results for JSONL export
     elapsed_seconds: float = 0.0  # Total processing time
+    # Boilerplate stripping stats
+    files_with_boilerplate: int = 0
+    total_boilerplate_chars: int = 0
+    boilerplate_by_category: Counter = field(default_factory=Counter)  # category -> count
 
     def track_document(
         self,
@@ -333,6 +338,12 @@ class CleanupStats:
             "triage_skipped_files": [r for r in self.triage_results if r["action"] != "pass"][
                 :500
             ],  # Cap at 500 to avoid huge reports
+            # Boilerplate stripping stats
+            "boilerplate": {
+                "files_with_boilerplate": self.files_with_boilerplate,
+                "total_chars_stripped": self.total_boilerplate_chars,
+                "by_category": dict(self.boilerplate_by_category),
+            },
         }
 
 
@@ -433,6 +444,7 @@ def clean_batch(
     use_rust: bool = True,
     skip_triage: bool = False,
     triage_output: Optional[Path] = None,
+    boilerplate_log: Optional[Path] = None,
 ) -> CleanupStats:
     """
     Clean all text files in a directory.
@@ -627,8 +639,6 @@ def clean_batch(
 
                 # Write triage results to JSONL if requested
                 if triage_output:
-                    import json
-
                     with open(triage_output, "w") as f:
                         for record in stats.triage_results:
                             f.write(json.dumps(record) + "\n")
@@ -653,6 +663,11 @@ def clean_batch(
         bytes_processed = 0
         last_update = start_time
         i = 0  # Track progress even if loop is empty or interrupted
+        boilerplate_log_file = None
+
+        # Open boilerplate audit log if path provided
+        if boilerplate_log:
+            boilerplate_log_file = open(boilerplate_log, "w")
 
         for i, input_path in enumerate(files_to_process, 1):
             if interrupted:
@@ -665,9 +680,9 @@ def clean_batch(
                 output_path = input_path  # in-place
 
             try:
-                # Use Rust for all file I/O
-                was_modified, sub_count, file_bytes, categories = rust_clean_file(
-                    str(input_path), str(output_path)
+                # Use Rust for all file I/O (pipeline: strip boilerplate -> OCR cleanup)
+                was_modified, sub_count, file_bytes, categories, boilerplate_regions = (
+                    rust_clean_file(str(input_path), str(output_path))
                 )
                 bytes_processed += file_bytes
                 # Aggregate category counts from Rust
@@ -676,6 +691,30 @@ def clean_batch(
                 if was_modified:
                     stats.files_modified += 1
                     stats.total_substitutions += sub_count
+
+                # Track boilerplate stripping
+                if boilerplate_regions:
+                    stats.files_with_boilerplate += 1
+                    for cat, pattern, start_line, end_line, char_count in boilerplate_regions:
+                        stats.total_boilerplate_chars += char_count
+                        stats.boilerplate_by_category[cat] += 1
+
+                    # Write to boilerplate audit log if enabled
+                    if boilerplate_log_file:
+                        relative = input_path.relative_to(input_dir)
+                        log_entry = {
+                            "file": str(relative),
+                            "stripped": [
+                                {
+                                    "category": cat,
+                                    "pattern": pattern,
+                                    "lines": [start_line, end_line],
+                                    "chars": char_count,
+                                }
+                                for cat, pattern, start_line, end_line, char_count in boilerplate_regions
+                            ],
+                        }
+                        boilerplate_log_file.write(json.dumps(log_entry) + "\n")
 
             except Exception as e:
                 print(f"\n  Error processing {input_path}: {e}", file=sys.stderr)
@@ -731,7 +770,16 @@ def clean_batch(
         print(f"  Throughput:      {files_per_sec:.1f} files/s, {mb_per_sec:.1f} MB/s")
         if stats.files_flagged > 0:
             print(f"  Files flagged:   {stats.files_flagged:,} (garbage patterns)")
+        if stats.files_with_boilerplate > 0:
+            print(
+                f"  Boilerplate:     {stats.files_with_boilerplate:,} files, "
+                f"{stats.total_boilerplate_chars:,} chars stripped"
+            )
         print(f"{'=' * 60}")
+
+        # Close boilerplate log file
+        if boilerplate_log_file:
+            boilerplate_log_file.close()
 
     finally:
         # Restore original signal handler
@@ -835,6 +883,27 @@ Examples:
         action="store_true",
         help="Skip document triage and process all files",
     )
+    batch_parser.add_argument(
+        "--skip-boilerplate",
+        action="store_true",
+        help="Skip boilerplate stripping (Google Books, Internet Archive, etc.)",
+    )
+    batch_parser.add_argument(
+        "--boilerplate-log",
+        type=Path,
+        help="Override boilerplate audit log location (default: {output_parent}/_boilerplate_stripped.jsonl)",
+    )
+
+    # Strip boilerplate only (standalone command)
+    strip_parser = subparsers.add_parser(
+        "strip-boilerplate", help="Strip digitization boilerplate from files"
+    )
+    strip_parser.add_argument("input", type=Path, help="Input file or directory")
+    strip_parser.add_argument("-o", "--output", type=Path, help="Output file or directory")
+    strip_parser.add_argument(
+        "--pattern", default="*.txt", help="File pattern for directory mode (default: *.txt)"
+    )
+    strip_parser.add_argument("--log", type=Path, help="Write stripped regions to JSONL audit log")
 
     # Analyze
     analyze_parser = subparsers.add_parser("analyze", help="Analyze corpus for OCR errors")
@@ -871,6 +940,11 @@ Examples:
         triage_path = (
             args.triage_output if args.triage_output else output_parent / "_triage_results.jsonl"
         )
+        boilerplate_path = (
+            args.boilerplate_log
+            if args.boilerplate_log
+            else output_parent / "_boilerplate_stripped.jsonl"
+        )
 
         # Don't overwrite existing files - add numeric suffix
         if report_path:
@@ -882,6 +956,11 @@ Examples:
         if args.no_report:
             report_path = None
             triage_path = None
+            boilerplate_path = None
+
+        # Disable boilerplate stripping if requested
+        if args.skip_boilerplate:
+            boilerplate_path = None
 
         stats = clean_batch(
             args.input_dir,
@@ -889,6 +968,7 @@ Examples:
             args.pattern,
             skip_triage=args.skip_triage,
             triage_output=triage_path,
+            boilerplate_log=boilerplate_path,
         )
 
         run_end = datetime.now()
@@ -961,6 +1041,119 @@ Examples:
             print("    (Reports disabled with --no-report)")
 
         print(f"{'=' * 60}")
+
+    elif args.command == "strip-boilerplate":
+        import fnmatch
+        import os
+
+        input_path = args.input
+        output_path = args.output
+        log_path = args.log
+
+        if input_path.is_file():
+            # Single file mode
+            result = rust_ocr_clean.strip_boilerplate_file(
+                str(input_path), str(output_path) if output_path else None
+            )
+
+            if result.stripped_regions:
+                print(f"Stripped {len(result.stripped_regions)} region(s) from {input_path}")
+                for region in result.stripped_regions:
+                    print(
+                        f"  - {region.category}/{region.pattern_name}: "
+                        f"lines {region.start_line}-{region.end_line} ({region.char_count} chars)"
+                    )
+                if output_path:
+                    print(f"Output written to: {output_path}")
+            else:
+                print(f"No boilerplate found in {input_path}")
+
+            # Write audit log if requested
+            if log_path:
+                log_entry = {
+                    "file": str(input_path),
+                    "stripped": [
+                        {
+                            "category": r.category,
+                            "pattern": r.pattern_name,
+                            "lines": [r.start_line, r.end_line],
+                            "chars": r.char_count,
+                        }
+                        for r in result.stripped_regions
+                    ],
+                }
+                with open(log_path, "w") as f:
+                    f.write(json.dumps(log_entry) + "\n")
+                print(f"Audit log written to: {log_path}")
+
+        elif input_path.is_dir():
+            # Directory mode
+            if not output_path:
+                print("Error: --output is required for directory mode", file=sys.stderr)
+                sys.exit(1)
+
+            output_path.mkdir(parents=True, exist_ok=True)
+
+            # Find files
+            files = []
+            for root, dirs, filenames in os.walk(input_path):
+                for filename in filenames:
+                    if fnmatch.fnmatch(filename, args.pattern):
+                        files.append(Path(root) / filename)
+
+            print(f"Processing {len(files)} files...")
+
+            files_with_boilerplate = 0
+            total_chars_stripped = 0
+            log_file = None
+
+            if log_path:
+                log_file = open(log_path, "w")
+
+            try:
+                for i, file_path in enumerate(files, 1):
+                    relative = file_path.relative_to(input_path)
+                    out_file = output_path / relative
+                    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+                    result = rust_ocr_clean.strip_boilerplate_file(str(file_path), str(out_file))
+
+                    if result.stripped_regions:
+                        files_with_boilerplate += 1
+                        total_chars_stripped += result.total_chars_stripped
+
+                        if log_file:
+                            log_entry = {
+                                "file": str(relative),
+                                "stripped": [
+                                    {
+                                        "category": r.category,
+                                        "pattern": r.pattern_name,
+                                        "lines": [r.start_line, r.end_line],
+                                        "chars": r.char_count,
+                                    }
+                                    for r in result.stripped_regions
+                                ],
+                            }
+                            log_file.write(json.dumps(log_entry) + "\n")
+
+                    if i % 500 == 0:
+                        print(f"  Processed {i}/{len(files)} files...")
+
+            finally:
+                if log_file:
+                    log_file.close()
+
+            print("\nComplete!")
+            print(f"  Files processed: {len(files)}")
+            print(f"  Files with boilerplate: {files_with_boilerplate}")
+            print(f"  Total chars stripped: {total_chars_stripped:,}")
+            if log_path:
+                print(f"  Audit log: {log_path}")
+
+        else:
+            print(f"Error: {input_path} does not exist", file=sys.stderr)
+            sys.exit(1)
 
     elif args.command == "analyze":
         report = analyze_corpus(args.corpus_dir, args.sample)

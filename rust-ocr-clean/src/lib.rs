@@ -1393,10 +1393,12 @@ fn count_context_patterns_batch(file_paths: Vec<String>) -> PyResult<std::collec
 }
 
 /// Clean a single file, reading and writing entirely in Rust
-/// Returns: (was_modified, substitution_count, bytes_read, categories)
+/// Pipeline: strip boilerplate -> OCR cleanup -> write output
+/// Returns: (was_modified, substitution_count, bytes_read, categories, boilerplate_regions)
 /// where categories is a HashMap of category_name -> count
+/// and boilerplate_regions is a list of (category, pattern_name, start_line, end_line, char_count)
 #[pyfunction]
-fn clean_file_to_file(input_path: String, output_path: String) -> PyResult<(bool, u64, u64, std::collections::HashMap<String, u64>)> {
+fn clean_file_to_file(input_path: String, output_path: String) -> PyResult<(bool, u64, u64, std::collections::HashMap<String, u64>, Vec<(String, String, usize, usize, usize)>)> {
     use std::fs;
     use std::path::Path;
 
@@ -1406,9 +1408,20 @@ fn clean_file_to_file(input_path: String, output_path: String) -> PyResult<(bool
     
     let bytes_read = content.len() as u64;
     
-    // Clean content (reuse internal logic)
-    let (cleaned, subs, categories) = clean_text_internal(&content);
-    let was_modified = subs > 0;
+    // Step 1: Strip boilerplate (digitization notices, library stamps, etc.)
+    let (stripped_content, boilerplate_regions) = strip_boilerplate_internal(&content);
+    
+    // Convert boilerplate regions to tuple format for Python
+    let boilerplate_tuples: Vec<(String, String, usize, usize, usize)> = boilerplate_regions
+        .iter()
+        .map(|r| (r.category.clone(), r.pattern_name.clone(), r.start_line, r.end_line, r.char_count))
+        .collect();
+    
+    // Step 2: OCR cleanup on stripped content
+    let (cleaned, subs, categories) = clean_text_internal(&stripped_content);
+    
+    // Document was modified if we stripped boilerplate OR made OCR substitutions
+    let was_modified = !boilerplate_regions.is_empty() || subs > 0;
 
     // Ensure parent directory exists
     let out_path = Path::new(&output_path);
@@ -1421,7 +1434,7 @@ fn clean_file_to_file(input_path: String, output_path: String) -> PyResult<(bool
     fs::write(out_path, &cleaned)
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Failed to write {}: {}", output_path, e)))?;
 
-    Ok((was_modified, subs, bytes_read, categories))
+    Ok((was_modified, subs, bytes_read, categories, boilerplate_tuples))
 }
 
 /// Internal clean function (not exposed to Python, avoids string copies)
@@ -2473,6 +2486,340 @@ fn dictionaries_loaded() -> bool {
 }
 
 // =============================================================================
+// BOILERPLATE STRIPPING
+// =============================================================================
+// Removes digitization boilerplate from Google Books, Internet Archive, etc.
+// Should run BEFORE OCR cleanup since boilerplate is modern inserted text.
+// Logs what was stripped for audit purposes.
+
+/// A region that was stripped from the document
+#[pyclass]
+#[derive(Clone)]
+pub struct StrippedRegion {
+    #[pyo3(get)]
+    pub category: String,
+    #[pyo3(get)]
+    pub pattern_name: String,
+    #[pyo3(get)]
+    pub start_line: usize,
+    #[pyo3(get)]
+    pub end_line: usize,
+    #[pyo3(get)]
+    pub char_count: usize,
+}
+
+/// Result of boilerplate stripping
+#[pyclass]
+#[derive(Clone)]
+pub struct BoilerplateResult {
+    #[pyo3(get)]
+    pub text: String,
+    #[pyo3(get)]
+    pub stripped_regions: Vec<StrippedRegion>,
+    #[pyo3(get)]
+    pub total_chars_stripped: usize,
+}
+
+lazy_static! {
+    // =========================================================================
+    // BOILERPLATE PATTERNS
+    // =========================================================================
+    // Each pattern: (name, category, regex, search_location)
+    // search_location: "start" = first 15KB, "end" = last 10KB, "any" = full text
+    // Patterns are OCR-tolerant to handle damaged text
+    // =========================================================================
+    
+    // Google Books - main disclaimer block
+    // Matches from "This is a digital copy" through the end of the boilerplate
+    // Captures the full block including "You can search through..." and trailing URL
+    // OCR variants: "qooqle", "VjOOQ", "GoOglc", etc.
+    static ref GOOGLE_BOOKS_BLOCK: Regex = Regex::new(
+        r"(?is)This\s+is\s+a\s+digital\s+copy\s+of\s+a\s+book\s+that\s+was\s+preserved.*?(?:search\s+through\s+the\s+full\s+text\s+of\s+this\s+book\s+on\s+the\s+web|Book\s+Search\s+helps\s+readers).*?(?:h?t?t?p?\s*:?\s*/?/?\s*books\s*\.\s*(?:google|qooqle|[VLC]j?OOQ\w*|GoOglc)\s*\.\s*com\s*/?\s*|\n\s*\n)"
+    ).unwrap();
+    
+    // Google Books - shorter variant (mission statement)
+    static ref GOOGLE_BOOKS_MISSION: Regex = Regex::new(
+        r"(?is)'s\s+mission\s+is\s+to\s+organize\s+the\s+world's\s+information.*?Book\s+Search"
+    ).unwrap();
+    
+    // Google watermark URL line (standalone)
+    // OCR-tolerant: handles "jhttp", "littp", spaces around punctuation, etc.
+    static ref GOOGLE_URL_LINE: Regex = Regex::new(
+        r"(?im)^\s*(?:at\s+)?(?:[hjli]?https?|[hjli]ttp)\s*:\s*/?\s*/?\s*books\s*\.\s*(?:google|qooqle|[VLC]j?OOQ\w*|GoOglc)\s*\.\s*com\s*/?\s*$"
+    ).unwrap();
+    
+    // Internet Archive header - "Digitized by the Archive" + URL
+    static ref IA_HEADER_BLOCK: Regex = Regex::new(
+        r"(?is)Digitized\s+(?:by\s+)?(?:the\s+)?(?:Internet\s+)?Archive\s*[\n\r].*?(?:https?://)?archive\.org/details/\S+"
+    ).unwrap();
+    
+    // Internet Archive - simple one-liner
+    static ref IA_DIGITIZED_LINE: Regex = Regex::new(
+        r"(?im)^.*Digitized\s+(?:by\s+)?(?:the\s+)?(?:Internet\s+)?Archive.*$"
+    ).unwrap();
+    
+    // Internet Archive URL line
+    static ref IA_URL_LINE: Regex = Regex::new(
+        r"(?im)^\s*(?:https?://)?(?:www\.)?archive\.org/details/\S+\s*$"
+    ).unwrap();
+    
+    // Microsoft digitization (you mentioned seeing OCR-damaged Microsoft attribution)
+    static ref MICROSOFT_DIGITIZED: Regex = Regex::new(
+        r"(?im)^.*(?:Digitized|Scanned)\s+(?:by\s+)?(?:the\s+)?(?:Microsoft|[Mm]icros[oa]ft|Mlcrosoft).*$"
+    ).unwrap();
+    
+    // University library stamps (end of document)
+    static ref UNIVERSITY_LIBRARY: Regex = Regex::new(
+        r"(?is)(?:THE\s+)?UNIVERSITY\s+OF\s+\w+\s*[\n\r]+\s*(?:GRADUATE\s+)?LIBRARY"
+    ).unwrap();
+    
+    // Library "DATE DUE" cards
+    static ref DATE_DUE_CARD: Regex = Regex::new(
+        r"(?is)DATE\s+DUE\s*[\n\r]+(?:.*[\n\r]+){0,15}"
+    ).unwrap();
+    
+    // Library barcodes (pattern like "3 9015 030 7 4133")
+    static ref LIBRARY_BARCODE: Regex = Regex::new(
+        r"(?m)^\s*\d\s+\d{4}\s+\d{3}\s+\d+\s+\d+\s*$"
+    ).unwrap();
+    
+    // "CIRCULATE CARD" or OCR variant "IITILATE CARD"
+    static ref CIRCULATE_CARD: Regex = Regex::new(
+        r"(?im)(?:CIRCULATE|IITILATE)\s+CAR[DK]"
+    ).unwrap();
+    
+    // Yale/Harvard specific library stamps
+    static ref YALE_LIBRARY: Regex = Regex::new(
+        r"(?is)YALE\s+(?:MEDICAL\s+)?LIBRARY.*?(?:HISTORICAL\s+LIBRARY|Bequest\s+of\s+\w+)"
+    ).unwrap();
+    
+    // HathiTrust digitization notice
+    static ref HATHITRUST: Regex = Regex::new(
+        r"(?is)(?:Generated|Digitized)\s+(?:by|for)\s+HathiTrust.*?(?:www\.hathitrust\.org|public\s+domain)"
+    ).unwrap();
+    
+    // Generic digitization notice
+    static ref GENERIC_DIGITIZED: Regex = Regex::new(
+        r"(?im)^.*(?:This\s+book\s+was\s+)?[Dd]igitized\s+(?:by|from|at)\s+.*?(?:Library|Archive|University).*$"
+    ).unwrap();
+}
+
+/// Find line number for a character position
+fn char_to_line(text: &str, char_pos: usize) -> usize {
+    text[..char_pos.min(text.len())].matches('\n').count() + 1
+}
+
+/// Internal function to strip boilerplate from text
+fn strip_boilerplate_internal(text: &str) -> (String, Vec<StrippedRegion>) {
+    let mut stripped_regions: Vec<StrippedRegion> = Vec::new();
+    let mut regions_to_remove: Vec<(usize, usize, String, String)> = Vec::new(); // (start, end, category, pattern_name)
+    
+    let text_len = text.len();
+    
+    // Helper to find nearest valid UTF-8 char boundary at or before a byte index
+    let floor_char_boundary = |idx: usize| -> usize {
+        if idx >= text_len {
+            return text_len;
+        }
+        // Walk backwards to find a char boundary
+        let mut i = idx;
+        while i > 0 && !text.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
+    
+    // Search boundaries (adjusted to char boundaries)
+    let start_boundary = floor_char_boundary(text_len.min(15000)); // First ~15KB for start patterns
+    let end_boundary = floor_char_boundary(text_len.saturating_sub(10000)); // Last ~10KB for end patterns
+    
+    // Helper to add matches from a regex
+    let mut add_matches = |regex: &Regex, category: &str, pattern_name: &str, search_start: usize, search_end: usize| {
+        let safe_end = if text.is_char_boundary(search_end.min(text_len)) {
+            search_end.min(text_len)
+        } else {
+            floor_char_boundary(search_end.min(text_len))
+        };
+        let search_text = &text[search_start..safe_end];
+        for mat in regex.find_iter(search_text) {
+            let abs_start = search_start + mat.start();
+            let abs_end = search_start + mat.end();
+            regions_to_remove.push((abs_start, abs_end, category.to_string(), pattern_name.to_string()));
+        }
+    };
+    
+    // START patterns (first 15KB)
+    add_matches(&GOOGLE_BOOKS_BLOCK, "google_books", "google_books_disclaimer", 0, start_boundary);
+    add_matches(&GOOGLE_BOOKS_MISSION, "google_books", "google_books_mission", 0, start_boundary);
+    add_matches(&GOOGLE_URL_LINE, "google_books", "google_url_line", 0, start_boundary);
+    add_matches(&IA_HEADER_BLOCK, "internet_archive", "ia_header_block", 0, start_boundary);
+    add_matches(&IA_DIGITIZED_LINE, "internet_archive", "ia_digitized_line", 0, start_boundary);
+    add_matches(&IA_URL_LINE, "internet_archive", "ia_url_line", 0, start_boundary);
+    add_matches(&MICROSOFT_DIGITIZED, "microsoft", "microsoft_digitized", 0, start_boundary);
+    add_matches(&YALE_LIBRARY, "library_stamp", "yale_library", 0, start_boundary);
+    add_matches(&HATHITRUST, "hathitrust", "hathitrust", 0, start_boundary);
+    add_matches(&GENERIC_DIGITIZED, "generic", "generic_digitized", 0, start_boundary);
+    
+    // END patterns (last 10KB)
+    if end_boundary < text_len {
+        add_matches(&UNIVERSITY_LIBRARY, "library_stamp", "university_library", end_boundary, text_len);
+        add_matches(&DATE_DUE_CARD, "library_stamp", "date_due_card", end_boundary, text_len);
+        add_matches(&LIBRARY_BARCODE, "library_stamp", "library_barcode", end_boundary, text_len);
+        add_matches(&CIRCULATE_CARD, "library_stamp", "circulate_card", end_boundary, text_len);
+    }
+    
+    // Sort regions by start position
+    regions_to_remove.sort_by_key(|r| r.0);
+    
+    // Merge overlapping regions
+    let mut merged: Vec<(usize, usize, String, String)> = Vec::new();
+    for region in regions_to_remove {
+        if let Some(last) = merged.last_mut() {
+            if region.0 <= last.1 {
+                // Overlapping - extend the last region
+                last.1 = last.1.max(region.1);
+                // Keep the category of the larger match
+                continue;
+            }
+        }
+        merged.push(region);
+    }
+    
+    // Build stripped text and record what was removed
+    let mut result = String::with_capacity(text_len);
+    let mut last_end = 0;
+    
+    for (start, end, category, pattern_name) in merged {
+        // Add text before this region
+        if start > last_end {
+            result.push_str(&text[last_end..start]);
+        }
+        
+        // Record the stripped region
+        let start_line = char_to_line(text, start);
+        let end_line = char_to_line(text, end);
+        let char_count = end - start;
+        
+        stripped_regions.push(StrippedRegion {
+            category,
+            pattern_name,
+            start_line,
+            end_line,
+            char_count,
+        });
+        
+        last_end = end;
+    }
+    
+    // Add remaining text after last region
+    if last_end < text_len {
+        result.push_str(&text[last_end..]);
+    }
+    
+    // Trim leading/trailing whitespace that may have been exposed
+    let trimmed = result.trim().to_string();
+    
+    (trimmed, stripped_regions)
+}
+
+/// Strip boilerplate from text
+/// Returns BoilerplateResult with cleaned text and list of stripped regions
+#[pyfunction]
+fn strip_boilerplate(text: &str) -> BoilerplateResult {
+    let (cleaned, regions) = strip_boilerplate_internal(text);
+    let total_chars_stripped: usize = regions.iter().map(|r| r.char_count).sum();
+    
+    BoilerplateResult {
+        text: cleaned,
+        stripped_regions: regions,
+        total_chars_stripped,
+    }
+}
+
+/// Strip boilerplate from a file and optionally write to output
+/// Returns BoilerplateResult
+#[pyfunction]
+#[pyo3(signature = (input_path, output_path=None))]
+fn strip_boilerplate_file(input_path: &str, output_path: Option<&str>) -> PyResult<BoilerplateResult> {
+    let content = std::fs::read_to_string(input_path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read file: {}", e)))?;
+    
+    let (cleaned, regions) = strip_boilerplate_internal(&content);
+    let total_chars_stripped: usize = regions.iter().map(|r| r.char_count).sum();
+    
+    // Write output if path provided
+    if let Some(out_path) = output_path {
+        if let Some(parent) = std::path::Path::new(out_path).parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(out_path, &cleaned)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to write file: {}", e)))?;
+    }
+    
+    Ok(BoilerplateResult {
+        text: cleaned,
+        stripped_regions: regions,
+        total_chars_stripped,
+    })
+}
+
+/// Batch strip boilerplate from files in a directory
+/// Returns (files_processed, files_with_boilerplate, total_chars_stripped)
+#[pyfunction]
+fn strip_boilerplate_batch(input_dir: &str, output_dir: &str) -> PyResult<(u64, u64, u64)> {
+    use std::fs;
+    use std::path::Path;
+    
+    let input_path = Path::new(input_dir);
+    let output_path = Path::new(output_dir);
+    
+    // Create output directory
+    fs::create_dir_all(output_path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to create output dir: {}", e)))?;
+    
+    let mut files_processed: u64 = 0;
+    let mut files_with_boilerplate: u64 = 0;
+    let mut total_chars_stripped: u64 = 0;
+    
+    let entries = fs::read_dir(input_path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read input dir: {}", e)))?;
+    
+    for entry in entries {
+        let entry = entry.map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read entry: {}", e)))?;
+        let path = entry.path();
+        
+        // Only process .txt files
+        if path.extension().map(|e| e == "txt").unwrap_or(false) {
+            if let Some(filename) = path.file_name() {
+                let output_file = output_path.join(filename);
+                
+                match fs::read_to_string(&path) {
+                    Ok(content) => {
+                        let (cleaned, regions) = strip_boilerplate_internal(&content);
+                        
+                        if let Err(e) = fs::write(&output_file, &cleaned) {
+                            eprintln!("Warning: Failed to write {}: {}", output_file.display(), e);
+                            continue;
+                        }
+                        
+                        files_processed += 1;
+                        if !regions.is_empty() {
+                            files_with_boilerplate += 1;
+                            total_chars_stripped += regions.iter().map(|r| r.char_count as u64).sum::<u64>();
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to read {}: {}", path.display(), e);
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok((files_processed, files_with_boilerplate, total_chars_stripped))
+}
+
+// =============================================================================
 // LINE UNWRAPPING AND DEHYPHENATION
 // =============================================================================
 // Removes cosmetic line breaks while preserving paragraph structure.
@@ -2777,5 +3124,11 @@ fn rust_ocr_clean(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(unwrap_lines_file, m)?)?;
     m.add_function(wrap_pyfunction!(unwrap_lines_batch, m)?)?;
     m.add_class::<UnwrapResult>()?;
+    // Boilerplate stripping functions
+    m.add_function(wrap_pyfunction!(strip_boilerplate, m)?)?;
+    m.add_function(wrap_pyfunction!(strip_boilerplate_file, m)?)?;
+    m.add_function(wrap_pyfunction!(strip_boilerplate_batch, m)?)?;
+    m.add_class::<BoilerplateResult>()?;
+    m.add_class::<StrippedRegion>()?;
     Ok(())
 }

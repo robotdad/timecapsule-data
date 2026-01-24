@@ -123,16 +123,24 @@ def clean_text_with_categories(text: str) -> CleanupResult:
     ...
 
 
-def clean_file_to_file(input_path: str, output_path: str) -> tuple[bool, int, int, dict[str, int]]:
+def clean_file_to_file(
+    input_path: str, output_path: str
+) -> tuple[bool, int, int, dict[str, int], list[tuple[str, str, int, int, int]]]:
     """Clean a file and write result to output path.
+
+    Pipeline: strip boilerplate -> OCR cleanup -> write output.
 
     Args:
         input_path: Path to input file.
         output_path: Path to write cleaned output.
 
     Returns:
-        Tuple of (was_modified, substitution_count, bytes_read, categories_dict).
-        categories_dict maps category names (e.g., 'long_s', 'li_h_confusion') to counts.
+        Tuple of (was_modified, substitution_count, bytes_read, categories_dict, boilerplate_regions).
+        - was_modified: True if any changes were made (boilerplate or OCR cleanup)
+        - substitution_count: Number of OCR substitutions made
+        - bytes_read: Size of input file in bytes
+        - categories_dict: Maps category names (e.g., 'long_s', 'li_h_confusion') to counts
+        - boilerplate_regions: List of (category, pattern_name, start_line, end_line, char_count)
     """
     ...
 
@@ -444,5 +452,142 @@ def init_whitelist(words: list[str]) -> int:
 
     Returns:
         Number of unique words added to the whitelist.
+    """
+    ...
+
+
+# =============================================================================
+# Line Unwrapping Functions
+# =============================================================================
+
+
+class UnwrapResult:
+    """Result of line unwrapping."""
+
+    text: str
+    """The unwrapped text."""
+    lines_joined: int
+    """Number of lines that were joined."""
+    words_dehyphenated: int
+    """Number of hyphenated words that were rejoined."""
+    spaces_normalized: int
+    """Number of extra spaces that were normalized."""
+
+
+def unwrap_lines(text: str) -> UnwrapResult:
+    """Unwrap cosmetic line breaks while preserving paragraph structure.
+
+    Removes line breaks that were inserted for printing/display purposes,
+    rejoins hyphenated words split across lines, and normalizes whitespace.
+
+    Args:
+        text: Text to unwrap.
+
+    Returns:
+        UnwrapResult with unwrapped text and statistics.
+    """
+    ...
+
+
+def unwrap_lines_file(input_path: str, output_path: str) -> UnwrapResult:
+    """Unwrap lines in a file and write to output.
+
+    Args:
+        input_path: Path to input file.
+        output_path: Path to write output.
+
+    Returns:
+        UnwrapResult with statistics.
+    """
+    ...
+
+
+def unwrap_lines_batch(input_dir: str, output_dir: str) -> tuple[int, int, int, int]:
+    """Batch unwrap lines in multiple files.
+
+    Args:
+        input_dir: Directory containing input files.
+        output_dir: Directory to write output files.
+
+    Returns:
+        Tuple of (files_processed, lines_joined, words_dehyphenated, spaces_normalized).
+    """
+    ...
+
+
+# =============================================================================
+# Boilerplate Stripping Functions
+# =============================================================================
+
+
+class StrippedRegion:
+    """A region that was stripped from a document."""
+
+    category: str
+    """Category of boilerplate (e.g., 'google_books', 'internet_archive', 'library_stamp')."""
+    pattern_name: str
+    """Specific pattern that matched (e.g., 'google_books_disclaimer')."""
+    start_line: int
+    """Starting line number of the stripped region."""
+    end_line: int
+    """Ending line number of the stripped region."""
+    char_count: int
+    """Number of characters stripped."""
+
+
+class BoilerplateResult:
+    """Result of boilerplate stripping."""
+
+    text: str
+    """The text with boilerplate removed."""
+    stripped_regions: list[StrippedRegion]
+    """List of regions that were stripped."""
+    total_chars_stripped: int
+    """Total number of characters removed."""
+
+
+def strip_boilerplate(text: str) -> BoilerplateResult:
+    """Strip digitization boilerplate from text.
+
+    Removes boilerplate from Google Books, Internet Archive, HathiTrust,
+    Microsoft digitization, and library stamps.
+
+    Should run BEFORE OCR cleanup since boilerplate is modern inserted text.
+
+    Args:
+        text: Text to process.
+
+    Returns:
+        BoilerplateResult with cleaned text and list of stripped regions.
+    """
+    ...
+
+
+def strip_boilerplate_file(
+    input_path: str, output_path: Optional[str] = None
+) -> BoilerplateResult:
+    """Strip boilerplate from a file.
+
+    Args:
+        input_path: Path to input file.
+        output_path: Path to write output (optional).
+
+    Returns:
+        BoilerplateResult with cleaned text and stripped regions.
+    """
+    ...
+
+
+def strip_boilerplate_batch(
+    input_dir: str, output_dir: str
+) -> tuple[int, int, int]:
+    """Batch strip boilerplate from files in a directory.
+
+    Args:
+        input_dir: Directory containing input files.
+        output_dir: Directory to write output files.
+
+    Returns:
+        Tuple of (files_processed, files_with_boilerplate, total_chars_stripped).
     """
     ...
