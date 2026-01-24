@@ -1629,11 +1629,8 @@ fn extract_vocab_from_file(
             continue;
         }
         
-        let is_cap = word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
-        
-        // Skip capitalized common English words (sentence starters like "One", "There", "Time")
-        // These are just normal words that happen to start a sentence - not interesting
-        if is_cap && dictionary::dictionaries_loaded() && dictionary::is_known_word(&word_lower) {
+        // Skip ANY word that's in the dictionary - we only want unknown/suspicious candidates
+        if dictionary::dictionaries_loaded() && dictionary::is_known_word(&word_lower) {
             continue;
         }
         
@@ -1641,6 +1638,7 @@ fn extract_vocab_from_file(
         
         // Get or create entry
         if !word_counts.contains_key(&word_lower) {
+            let is_cap = word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
             let suspicious = check_suspicious(word);
             let context = extract_context(&content, cap.start(), cap.end(), context_chars);
             
@@ -1696,15 +1694,15 @@ fn extract_vocab_batch(
                 continue;
             }
             
-            let is_cap = word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
-            
-            // Skip capitalized common English words (sentence starters like "One", "There", "Time")
-            // These are just normal words that happen to start a sentence - not interesting
-            if is_cap && dictionary::dictionaries_loaded() && dictionary::is_known_word(&word_lower) {
+            // Skip ANY word (capitalized or not) that's in the dictionary
+            // We only want unknown/suspicious words as candidates
+            if dictionary::dictionaries_loaded() && dictionary::is_known_word(&word_lower) {
                 continue;
             }
             
             total_words += 1;
+            
+            let is_cap = word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
             
             if let Some(entry) = global_counts.get_mut(&word_lower) {
                 entry.1 += 1;  // Increment count
