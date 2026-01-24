@@ -951,6 +951,8 @@ Examples:
             report_path = get_unique_path(report_path)
         if triage_path:
             triage_path = get_unique_path(triage_path)
+        if boilerplate_path:
+            boilerplate_path = get_unique_path(boilerplate_path)
 
         # Disable reports if requested
         if args.no_report:
@@ -1037,6 +1039,9 @@ Examples:
 
         if triage_path and triage_path.exists():
             print(f"    Triage results: {triage_path}")
+
+        if boilerplate_path and boilerplate_path.exists():
+            print(f"    Boilerplate log: {boilerplate_path}")
         elif args.no_report:
             print("    (Reports disabled with --no-report)")
 
