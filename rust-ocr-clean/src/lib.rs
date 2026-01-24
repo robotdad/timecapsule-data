@@ -1454,13 +1454,35 @@ fn init_whitelist(words: Vec<String>) -> PyResult<usize> {
     Ok(count)
 }
 
-/// Check if a word is in the whitelist
+/// Check if a word is in the whitelist (HashSet or pattern-based)
 fn is_whitelisted(word: &str) -> bool {
+    let word_lower = word.to_lowercase();
+    
+    // 1. Check explicit whitelist (loaded from file)
     if let Ok(whitelist) = WHITELIST.read() {
-        whitelist.contains(&word.to_lowercase())
-    } else {
-        false
+        if whitelist.contains(&word_lower) {
+            return true;
+        }
     }
+    
+    // 2. Check pattern-based whitelist rules
+    
+    // Scottish/Irish names: McDonald, MacArthur, McIntyre
+    if WHITELIST_MC_NAMES.is_match(word) {
+        return true;
+    }
+    
+    // British -ise spelling variants
+    if WHITELIST_BRITISH_ISE.is_match(word) {
+        return true;
+    }
+    
+    // Chemical formulas (case-sensitive check)
+    if CHEMICAL_FORMULAS.contains(word) {
+        return true;
+    }
+    
+    false
 }
 
 lazy_static! {
@@ -1513,6 +1535,52 @@ lazy_static! {
             "very", "just", "also", "now", "i", "you", "we", "me", "us",
         ];
         words.iter().cloned().collect()
+    };
+    
+    // ==========================================================================
+    // WHITELIST PATTERNS (pattern-based whitelisting for vocab extraction)
+    // ==========================================================================
+    // These patterns match valid words that should NOT be flagged as suspicious
+    // ==========================================================================
+    
+    // Scottish/Irish names: McDonald, MacArthur, McIntyre, etc.
+    static ref WHITELIST_MC_NAMES: Regex = Regex::new(r"^(?i)M[ac]c?[A-Z][a-z]+$").unwrap();
+    
+    // British -ise spelling variants (vs American -ize)
+    static ref WHITELIST_BRITISH_ISE: Regex = Regex::new(r"(?i)^[a-z]+is(e|ed|es|ing|ation|ations)$").unwrap();
+    
+    // Chemical formulas - curated list of common compounds
+    // Pre-WWI era would have known these classical/inorganic compounds
+    static ref CHEMICAL_FORMULAS: std::collections::HashSet<&'static str> = {
+        let formulas = [
+            // Water and common oxides
+            "H2O", "CO2", "CO", "NO", "NO2", "SO2", "SO3",
+            // Common acids
+            "HCl", "HBr", "HI", "HF", "HNO3", "H2SO4", "H3PO4", "H2CO3", "HCN",
+            // Common bases
+            "NaOH", "KOH", "NH3", "NH4OH", "Ca(OH)2", "Mg(OH)2", "Ba(OH)2",
+            // Salts - chlorides
+            "NaCl", "KCl", "CaCl2", "MgCl2", "ZnCl2", "FeCl2", "FeCl3", "HgCl2", "BaCl2", "NH4Cl",
+            // Salts - sulfates
+            "Na2SO4", "K2SO4", "CaSO4", "MgSO4", "ZnSO4", "CuSO4", "FeSO4", "BaSO4", "Al2(SO4)3",
+            // Salts - nitrates
+            "NaNO3", "KNO3", "AgNO3", "Ca(NO3)2", "Pb(NO3)2", "Cu(NO3)2", "Zn(NO3)2",
+            // Salts - carbonates
+            "Na2CO3", "NaHCO3", "K2CO3", "CaCO3", "MgCO3", "BaCO3", "ZnCO3", "PbCO3",
+            // Oxides
+            "Na2O", "K2O", "CaO", "MgO", "ZnO", "CuO", "Cu2O", "Fe2O3", "Fe3O4", "FeO",
+            "Al2O3", "SiO2", "PbO", "PbO2", "Pb3O4", "MnO2", "HgO", "Ag2O", "BaO",
+            // Other common compounds
+            "CaF2", "NaF", "KI", "NaBr", "AgCl", "AgBr", "AgI",
+            "ZnS", "PbS", "CuS", "FeS", "FeS2", "H2S",
+            "PCl3", "PCl5", "POCl3", "CCl4", "CHCl3",
+            // Organic basics (period-appropriate)
+            "CH4", "C2H6", "C2H4", "C2H2", "C6H6", "CH3OH", "C2H5OH", "HCHO", "CH3COOH",
+            // Element symbols (when used alone in chemical context)
+            "Na", "K", "Ca", "Mg", "Fe", "Cu", "Zn", "Ag", "Au", "Pb", "Hg", "Sn",
+            "Al", "Si", "P", "S", "Cl", "Br", "I", "N", "O", "H", "C", "Ba", "Mn",
+        ];
+        formulas.iter().cloned().collect()
     };
     
     // Roman numeral pattern (skip these - they're period-appropriate)
@@ -2436,6 +2504,70 @@ lazy_static! {
     // Pattern to match hyphenated line breaks: word-\n followed by lowercase continuation
     // Captures: (word before hyphen)(hyphen)(newline + optional space)(lowercase continuation)
     static ref HYPHEN_LINEBREAK: Regex = Regex::new(r"([a-zA-Z]{2,})-[ \t]*\r?\n[ \t]*([a-z])").unwrap();
+    
+    // ==========================================================================
+    // FRAGMENT REJOINING PATTERNS
+    // ==========================================================================
+    // These catch cases where a hyphen was OCR'd as a comma or space, leaving
+    // orphaned suffixes like "accord, ing" or "judg ment"
+    // Pattern: word + comma/space + common suffix
+    // ==========================================================================
+    
+    // Common suffixes that appear as fragments when hyphen is misread
+    static ref FRAGMENT_REJOIN_PATTERNS: Vec<(Regex, &'static str)> = vec![
+        // -ing fragments (most common)
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ing)\b").unwrap(), "ing"),
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ings)\b").unwrap(), "ings"),
+        
+        // -tion/-sion fragments
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(tion)\b").unwrap(), "tion"),
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(tions)\b").unwrap(), "tions"),
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(sion)\b").unwrap(), "sion"),
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(sions)\b").unwrap(), "sions"),
+        
+        // -ment fragments
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ment)\b").unwrap(), "ment"),
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ments)\b").unwrap(), "ments"),
+        
+        // -ness fragments
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ness)\b").unwrap(), "ness"),
+        
+        // -ly fragments
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ly)\b").unwrap(), "ly"),
+        
+        // -ed fragments
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ed)\b").unwrap(), "ed"),
+        
+        // -er/-est fragments
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(er)\b").unwrap(), "er"),
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ers)\b").unwrap(), "ers"),
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(est)\b").unwrap(), "est"),
+        
+        // -ful/-less fragments
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ful)\b").unwrap(), "ful"),
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(fully)\b").unwrap(), "fully"),
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(less)\b").unwrap(), "less"),
+        
+        // -able/-ible fragments
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(able)\b").unwrap(), "able"),
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ible)\b").unwrap(), "ible"),
+        
+        // -ity fragments
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ity)\b").unwrap(), "ity"),
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ities)\b").unwrap(), "ities"),
+        
+        // -ous/-ious fragments
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ous)\b").unwrap(), "ous"),
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ious)\b").unwrap(), "ious"),
+        
+        // -ance/-ence fragments
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ance)\b").unwrap(), "ance"),
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ence)\b").unwrap(), "ence"),
+        
+        // -ive fragments
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ive)\b").unwrap(), "ive"),
+        (Regex::new(r"(?i)\b([a-z]{2,})[,\s]+\b(ively)\b").unwrap(), "ively"),
+    ];
 }
 
 /// Phase 1: Dehyphenate - rejoin words split across lines with hyphens
@@ -2449,17 +2581,43 @@ fn dehyphenate(text: &str) -> (String, u64) {
     (result.into_owned(), count)
 }
 
-/// Internal function to unwrap lines (two-phase approach)
+/// Phase 1b: Rejoin fragments where hyphen was OCR'd as comma or space
+/// e.g., "accord, ing" -> "according", "judg ment" -> "judgment"
+fn rejoin_fragments(text: &str) -> (String, u64) {
+    let mut result = text.to_string();
+    let mut total_count: u64 = 0;
+    
+    for (pattern, _suffix) in FRAGMENT_REJOIN_PATTERNS.iter() {
+        let mut match_count: u64 = 0;
+        result = pattern.replace_all(&result, |caps: &regex::Captures| {
+            match_count += 1;
+            // caps[1] = word stem, caps[2] = suffix (captured by the pattern)
+            // We need to get the actual matched suffix text to preserve case
+            let stem = &caps[1];
+            let suffix = &caps[2];
+            format!("{}{}", stem, suffix)
+        }).into_owned();
+        total_count += match_count;
+    }
+    
+    (result, total_count)
+}
+
+/// Internal function to unwrap lines (multi-phase approach)
 fn unwrap_lines_internal(text: &str) -> (String, u64, u64, u64) {
-    // Phase 1: Dehyphenate (rejoin hyphenated words across line breaks)
+    // Phase 1a: Dehyphenate (rejoin hyphenated words across line breaks)
     let (dehyphenated, words_dehyphenated) = dehyphenate(text);
     
+    // Phase 1b: Rejoin fragments (hyphen OCR'd as comma/space)
+    let (rejoined, fragments_rejoined) = rejoin_fragments(&dehyphenated);
+    let total_dehyphenated = words_dehyphenated + fragments_rejoined;
+    
     // Phase 2: Join non-paragraph lines
-    let mut result = String::with_capacity(dehyphenated.len());
+    let mut result = String::with_capacity(rejoined.len());
     let mut lines_joined: u64 = 0;
     let mut spaces_normalized: u64 = 0;
     
-    let lines: Vec<&str> = dehyphenated.lines().collect();
+    let lines: Vec<&str> = rejoined.lines().collect();
     
     for (i, line) in lines.iter().enumerate() {
         let next_line = lines.get(i + 1).copied();
@@ -2513,7 +2671,7 @@ fn unwrap_lines_internal(text: &str) -> (String, u64, u64, u64) {
         }
     }
     
-    (normalized, lines_joined, words_dehyphenated, spaces_normalized)
+    (normalized, lines_joined, total_dehyphenated, spaces_normalized)
 }
 
 /// Unwrap cosmetic line breaks while preserving paragraph structure

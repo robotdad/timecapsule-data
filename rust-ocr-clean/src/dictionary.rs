@@ -1,6 +1,6 @@
 //! Multi-language dictionary lookup for OCR vocab validation.
 //!
-//! Loads Hunspell dictionaries for English, German, French, and Latin
+//! Loads Hunspell dictionaries for English, German, French, Latin, and Medical
 //! to validate words during vocab extraction. Words matching ANY language
 //! are considered valid (not suspicious).
 
@@ -19,6 +19,7 @@ pub struct MultiLangDict {
     german: Option<Dictionary>,
     french: Option<Dictionary>,
     latin: HashSet<String>,  // Simple word list (Hunspell format incompatible with zspell)
+    medical: HashSet<String>,  // Medical terminology word list
 }
 
 impl MultiLangDict {
@@ -28,7 +29,8 @@ impl MultiLangDict {
             english: load_dict(dict_dir, "en_US"),
             german: load_dict(dict_dir, "de_DE"),
             french: load_dict(dict_dir, "fr_FR"),
-            latin: load_latin_wordlist(dict_dir),
+            latin: load_wordlist(dict_dir, "la_words.txt", "Latin"),
+            medical: load_wordlist(dict_dir, "en_med_words.txt", "Medical"),
         }
     }
 
@@ -65,6 +67,9 @@ impl MultiLangDict {
         if self.latin.contains(word) {
             return true;
         }
+        if self.medical.contains(word) {
+            return true;
+        }
         false
     }
 
@@ -91,27 +96,31 @@ impl MultiLangDict {
         if self.latin.contains(word) || self.latin.contains(&lower) {
             langs.push("la");
         }
+        if self.medical.contains(word) || self.medical.contains(&lower) {
+            langs.push("med");
+        }
         langs
     }
 
     /// Get stats about loaded dictionaries
     pub fn stats(&self) -> String {
         format!(
-            "Dictionaries loaded: en={}, de={}, fr={}, la={}",
+            "Dictionaries loaded: en={}, de={}, fr={}, la={}, med={}",
             self.english.is_some(),
             self.german.is_some(),
             self.french.is_some(),
-            !self.latin.is_empty()
+            !self.latin.is_empty(),
+            !self.medical.is_empty()
         )
     }
 }
 
-/// Load Latin as a simple word list (Hunspell format incompatible with zspell)
-fn load_latin_wordlist(dict_dir: &Path) -> HashSet<String> {
-    let wordlist_path = dict_dir.join("la_words.txt");
+/// Load a simple word list file (one word per line)
+fn load_wordlist(dict_dir: &Path, filename: &str, label: &str) -> HashSet<String> {
+    let wordlist_path = dict_dir.join(filename);
     
     if !wordlist_path.exists() {
-        eprintln!("Latin word list not found: la_words.txt");
+        eprintln!("{} word list not found: {}", label, filename);
         return HashSet::new();
     }
     
@@ -122,11 +131,11 @@ fn load_latin_wordlist(dict_dir: &Path) -> HashSet<String> {
                 .filter(|line| !line.is_empty() && !line.starts_with('#'))
                 .map(|line| line.to_string())
                 .collect();
-            eprintln!("Loaded Latin word list: {} words", words.len());
+            eprintln!("Loaded {} word list: {} words", label, words.len());
             words
         }
         Err(e) => {
-            eprintln!("Failed to read la_words.txt: {}", e);
+            eprintln!("Failed to read {}: {}", filename, e);
             HashSet::new()
         }
     }
