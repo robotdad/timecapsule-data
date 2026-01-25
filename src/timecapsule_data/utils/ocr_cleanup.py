@@ -1250,7 +1250,7 @@ Examples:
 
             # Get total count for progress
             total_pending = conn.execute(
-                "SELECT COUNT(*) FROM items WHERE downloaded_at IS NOT NULL AND triage_action IS NULL"
+                "SELECT COUNT(*) FROM items WHERE downloaded_at IS NOT NULL AND triage_action IS NULL AND text_filename IS NOT NULL"
             ).fetchone()[0]
 
             total_done = conn.execute(
@@ -1285,7 +1285,9 @@ Examples:
                     """
                     SELECT identifier, text_filename
                     FROM items
-                    WHERE downloaded_at IS NOT NULL AND triage_action IS NULL
+                    WHERE downloaded_at IS NOT NULL
+                      AND triage_action IS NULL
+                      AND text_filename IS NOT NULL
                     LIMIT ?
                     """,
                     (batch_size,),
