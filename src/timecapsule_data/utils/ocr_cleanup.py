@@ -1058,12 +1058,11 @@ Examples:
             ).fetchall()
             conn.close()
 
-            # Build file paths
+            # Build file paths (flat: {identifier}.txt)
             input_files = []
             for row in rows:
-                file_path = args.input_dir / row["identifier"] / row["text_filename"]
-                if file_path.exists():
-                    input_files.append(file_path)
+                file_path = args.input_dir / f"{row['identifier']}.txt"
+                input_files.append(file_path)
 
             print(f"  Found {len(input_files):,} files that passed triage")
             skip_triage = True  # Already triaged via DB
@@ -1352,12 +1351,12 @@ Examples:
                     break
 
                 # Build file paths (skip exists() check - let Rust handle missing files)
+                # Files are flat in raw_dir as {identifier}.txt
                 paths = []
                 id_map = {}
                 for row in rows:
                     identifier = row["identifier"]
-                    filename = row["text_filename"]
-                    file_path = raw_dir / identifier / filename
+                    file_path = raw_dir / f"{identifier}.txt"
                     path_str = str(file_path)
                     paths.append(path_str)
                     id_map[path_str] = identifier
