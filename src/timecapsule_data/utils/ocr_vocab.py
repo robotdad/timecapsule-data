@@ -512,47 +512,93 @@ def cmd_extract(args):
         print(f"  Files to process: {total_files:,}", file=sys.stderr)
         print(f"{'=' * 60}\n", file=sys.stderr)
 
+        candidates: dict[str, VocabCandidate] = {}
+        total_words = 0
+        total_bytes = 0
         start_time = time.time()
 
-        # Single parallel call processes all files
-        all_paths = [str(f) for f in files]
-        stats, batch_results = rust_extract_batch_parallel(
-            all_paths, args.context_chars, num_threads
-        )
+        # Process in chunks for progress updates (each chunk is parallel internally)
+        chunk_size = 5000  # Larger chunks for efficiency, progress every 5k files
+        for chunk_start in range(0, total_files, chunk_size):
+            if _interrupted:
+                break
 
-        elapsed = time.time() - start_time
+            chunk_end = min(chunk_start + chunk_size, total_files)
+            chunk_paths = [str(f) for f in files[chunk_start:chunk_end]]
 
-        # Convert results to VocabCandidate objects
-        candidates: dict[str, VocabCandidate] = {}
-        for word_lower, (
-            word,
-            count,
-            is_cap,
-            is_susp,
-            reason,
-            context,
-        ) in batch_results.items():
-            candidates[word_lower] = VocabCandidate(
-                word=word,
-                frequency=count,
-                contexts=[context] if context else [],
-                is_capitalized=is_cap,
-                is_unknown=True,  # Default to unknown, filter by suspicious instead
-                is_suspicious=is_susp,
-                suspicious_reason=reason,
+            # Parallel processing within chunk
+            stats, batch_results = rust_extract_batch_parallel(
+                chunk_paths, args.context_chars, num_threads
             )
 
-        # Calculate throughput
-        files_per_sec = stats.files_processed / elapsed if elapsed > 0 else 0
-        mb_per_sec = (stats.total_bytes / 1024 / 1024) / elapsed if elapsed > 0 else 0
+            total_words += stats.total_words
+            total_bytes += stats.total_bytes
+
+            # Merge results into candidates
+            for word_lower, (
+                word,
+                count,
+                is_cap,
+                is_susp,
+                reason,
+                context,
+            ) in batch_results.items():
+                if word_lower in candidates:
+                    c = candidates[word_lower]
+                    c.frequency += count
+                    if is_cap:
+                        c.is_capitalized = True
+                        if not c.word[0].isupper():
+                            c.word = word
+                else:
+                    candidates[word_lower] = VocabCandidate(
+                        word=word,
+                        frequency=count,
+                        contexts=[context] if context else [],
+                        is_capitalized=is_cap,
+                        is_unknown=True,
+                        is_suspicious=is_susp,
+                        suspicious_reason=reason,
+                    )
+
+            # Progress update
+            elapsed = time.time() - start_time
+            files_done = chunk_end
+            files_per_sec = files_done / elapsed if elapsed > 0 else 0
+            mb_per_sec = (total_bytes / 1024 / 1024) / elapsed if elapsed > 0 else 0
+            pct = (files_done / total_files) * 100
+            remaining = (total_files - files_done) / files_per_sec if files_per_sec > 0 else 0
+
+            if remaining >= 3600:
+                eta = f"{remaining / 3600:.1f}h"
+            elif remaining >= 60:
+                eta = f"{remaining / 60:.1f}m"
+            else:
+                eta = f"{remaining:.0f}s"
+
+            above_threshold = sum(1 for c in candidates.values() if c.frequency >= args.min_freq)
+
+            print(
+                f"  [{pct:5.1f}%] {files_done:,}/{total_files:,} files | "
+                f"{files_per_sec:.1f} files/s | {mb_per_sec:.1f} MB/s | ETA: {eta} | "
+                f"vocab: {above_threshold:,}",
+                file=sys.stderr,
+            )
+
+        elapsed = time.time() - start_time
+        files_per_sec = total_files / elapsed if elapsed > 0 else 0
+        mb_per_sec = (total_bytes / 1024 / 1024) / elapsed if elapsed > 0 else 0
 
         print(f"\n{'=' * 60}", file=sys.stderr)
-        print("COMPLETE", file=sys.stderr)
+        if _interrupted:
+            print("INTERRUPTED - showing partial results", file=sys.stderr)
+        else:
+            print("COMPLETE", file=sys.stderr)
         print(f"{'=' * 60}", file=sys.stderr)
         print(f"  Time elapsed: {elapsed:.1f}s", file=sys.stderr)
         print(f"  Throughput: {files_per_sec:.1f} files/s, {mb_per_sec:.1f} MB/s", file=sys.stderr)
-        print(f"  Total words processed: {stats.total_words:,}", file=sys.stderr)
-        print(f"  Unique candidates: {stats.unique_candidates:,}", file=sys.stderr)
+        print(f"  Total words processed: {total_words:,}", file=sys.stderr)
+        print(f"  Unique candidates: {len(candidates):,}", file=sys.stderr)
 
         above_threshold = sum(1 for c in candidates.values() if c.frequency >= args.min_freq)
         print(f"  Candidates >= {args.min_freq} occurrences: {above_threshold:,}", file=sys.stderr)
