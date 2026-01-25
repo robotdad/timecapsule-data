@@ -418,10 +418,7 @@ def cmd_extract(args):
         rust_extract_batch_parallel = rust_ocr_clean.extract_vocab_batch_parallel
 
         # Initialize Rust dictionaries for multi-language word lookup (en, de, fr, la)
-        # Dictionaries are always loaded for extraction-time filtering (skips known words)
-        # The --skip-dict-check flag only skips the post-processing validation loop
-        skip_dict_check = getattr(args, "skip_dict_check", False)
-
+        # Dictionaries are used for extraction-time filtering (skips known words in Rust)
         # This is done once per run; dictionaries are loaded globally in the Rust module
         # Try multiple possible locations for the dictionaries
         possible_dict_dirs = [
@@ -611,8 +608,7 @@ def cmd_extract(args):
         # Post-process: dictionary check for suspicious words
         # NOTE: Rust now does dictionary checks during extraction, but we do a final pass
         # here to catch any edge cases with the is_known_word function
-        # Skip if --skip-dict-check flag is set
-        if not _interrupted and not skip_dict_check and rust_ocr_clean.dictionaries_loaded():
+        if not _interrupted and rust_ocr_clean.dictionaries_loaded():
             suspicious_to_check = [
                 c for c in candidates.values() if c.is_suspicious and c.frequency >= args.min_freq
             ]
@@ -768,11 +764,6 @@ Examples:
         "--no-whitelist",
         action="store_true",
         help="Disable the built-in known vocabulary whitelist",
-    )
-    extract_parser.add_argument(
-        "--skip-dict-check",
-        action="store_true",
-        help="Skip post-processing dictionary validation (dicts still used for filtering)",
     )
 
     # Simplify command
