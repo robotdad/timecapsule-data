@@ -3594,6 +3594,214 @@ fn unwrap_lines_batch(input_dir: &str, output_dir: &str) -> PyResult<(u64, u64, 
     Ok((total_files, total_lines_joined, total_words_dehyphenated, total_spaces_normalized))
 }
 
+// ============================================================================
+// NOISE WORD STRIPPING
+// ============================================================================
+
+lazy_static! {
+    /// Global set of noise words to strip (populated from vocab candidates file)
+    static ref NOISE_WORDS: std::sync::RwLock<std::collections::HashSet<String>> = 
+        std::sync::RwLock::new(std::collections::HashSet::new());
+    
+    /// Regex for matching word boundaries
+    static ref WORD_BOUNDARY_RE: Regex = 
+        Regex::new(r"\b([a-zA-Z][a-zA-Z']*[a-zA-Z]|[a-zA-Z])\b").unwrap();
+    
+    /// Regex for collapsing multiple spaces
+    static ref MULTI_SPACE_RE: Regex = Regex::new(r"  +").unwrap();
+}
+
+/// Initialize noise word set from vocab candidates file.
+/// Filters to only G (garbage) and R (repeated) categories by default.
+/// Returns the count of noise words loaded.
+#[pyfunction]
+#[pyo3(signature = (vocab_path, categories=None))]
+fn init_noise_words(vocab_path: &str, categories: Option<Vec<String>>) -> PyResult<usize> {
+    let content = std::fs::read_to_string(vocab_path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
+            format!("Failed to read vocab file: {}", e)
+        ))?;
+    
+    // Default to G and R categories
+    let target_categories: std::collections::HashSet<&str> = categories
+        .as_ref()
+        .map(|cats| cats.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_else(|| ["G", "R"].iter().cloned().collect());
+    
+    let mut words = std::collections::HashSet::new();
+    
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        
+        // Parse format: FREQ | FLAGS | CAT | WORD | CONTEXT
+        let parts: Vec<&str> = line.split('|').collect();
+        if parts.len() >= 4 {
+            let cat = parts[2].trim();
+            let word = parts[3].trim();
+            
+            // Only include specified categories
+            if target_categories.contains(cat) && !word.is_empty() {
+                // Store lowercase for case-insensitive matching
+                words.insert(word.to_lowercase());
+            }
+        }
+    }
+    
+    let count = words.len();
+    *NOISE_WORDS.write().unwrap() = words;
+    Ok(count)
+}
+
+/// Get the count of currently loaded noise words
+#[pyfunction]
+fn noise_words_count() -> usize {
+    NOISE_WORDS.read().unwrap().len()
+}
+
+/// Strip noise words from text.
+/// Returns (cleaned_text, words_stripped)
+#[pyfunction]
+fn strip_noise_words(text: &str) -> (String, usize) {
+    let noise_words = NOISE_WORDS.read().unwrap();
+    if noise_words.is_empty() {
+        return (text.to_string(), 0);
+    }
+    
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+    let mut stripped = 0;
+    
+    for cap in WORD_BOUNDARY_RE.captures_iter(text) {
+        let m = cap.get(0).unwrap();
+        let word = m.as_str();
+        let word_lower = word.to_lowercase();
+        
+        // Copy text before this word
+        result.push_str(&text[last_end..m.start()]);
+        
+        if noise_words.contains(&word_lower) {
+            // Skip this word (replace with single space to avoid word collision)
+            result.push(' ');
+            stripped += 1;
+        } else {
+            // Keep this word
+            result.push_str(word);
+        }
+        
+        last_end = m.end();
+    }
+    
+    // Copy remaining text
+    result.push_str(&text[last_end..]);
+    
+    // Collapse multiple spaces
+    let collapsed = MULTI_SPACE_RE.replace_all(&result, " ");
+    
+    (collapsed.to_string(), stripped)
+}
+
+/// Strip noise words from a file and write to output.
+/// Returns (was_modified, words_stripped, bytes_processed)
+#[pyfunction]
+fn strip_noise_file(input_path: &str, output_path: &str) -> PyResult<(bool, usize, usize)> {
+    let content = std::fs::read_to_string(input_path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
+            format!("Failed to read file: {}", e)
+        ))?;
+    
+    let bytes = content.len();
+    let (cleaned, stripped) = strip_noise_words(&content);
+    
+    // Ensure parent directory exists
+    if let Some(parent) = std::path::Path::new(output_path).parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    
+    std::fs::write(output_path, &cleaned)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
+            format!("Failed to write file: {}", e)
+        ))?;
+    
+    Ok((stripped > 0, stripped, bytes))
+}
+
+/// Statistics from batch noise stripping
+#[pyclass]
+#[derive(Clone)]
+pub struct StripBatchStats {
+    #[pyo3(get)]
+    pub files_processed: u64,
+    #[pyo3(get)]
+    pub files_modified: u64,
+    #[pyo3(get)]
+    pub total_words_stripped: u64,
+    #[pyo3(get)]
+    pub total_bytes: u64,
+}
+
+/// Batch strip noise words with Rayon parallelization.
+/// Takes a list of (input_path, output_path) tuples.
+#[pyfunction]
+fn strip_noise_batch_parallel(
+    file_pairs: Vec<(String, String)>,
+    num_threads: usize,
+) -> PyResult<StripBatchStats> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    
+    // Configure thread pool
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build()
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            format!("Failed to create thread pool: {}", e)
+        ))?;
+    
+    let files_processed = AtomicU64::new(0);
+    let files_modified = AtomicU64::new(0);
+    let total_stripped = AtomicU64::new(0);
+    let total_bytes = AtomicU64::new(0);
+    
+    pool.install(|| {
+        file_pairs.par_iter().for_each(|(input_path, output_path)| {
+            // Read file
+            let content = match std::fs::read_to_string(input_path) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            
+            let bytes = content.len();
+            total_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+            
+            // Strip noise
+            let (cleaned, stripped) = strip_noise_words(&content);
+            
+            // Ensure parent directory exists
+            if let Some(parent) = std::path::Path::new(output_path.as_str()).parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            
+            // Write output
+            if std::fs::write(output_path, &cleaned).is_ok() {
+                files_processed.fetch_add(1, Ordering::Relaxed);
+                if stripped > 0 {
+                    files_modified.fetch_add(1, Ordering::Relaxed);
+                    total_stripped.fetch_add(stripped as u64, Ordering::Relaxed);
+                }
+            }
+        });
+    });
+    
+    Ok(StripBatchStats {
+        files_processed: files_processed.load(Ordering::Relaxed),
+        files_modified: files_modified.load(Ordering::Relaxed),
+        total_words_stripped: total_stripped.load(Ordering::Relaxed),
+        total_bytes: total_bytes.load(Ordering::Relaxed),
+    })
+}
+
 #[pymodule]
 fn rust_ocr_clean(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(clean_text, m)?)?;
@@ -3644,5 +3852,12 @@ fn rust_ocr_clean(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(strip_boilerplate_batch, m)?)?;
     m.add_class::<BoilerplateResult>()?;
     m.add_class::<StrippedRegion>()?;
+    // Noise stripping functions
+    m.add_function(wrap_pyfunction!(init_noise_words, m)?)?;
+    m.add_function(wrap_pyfunction!(noise_words_count, m)?)?;
+    m.add_function(wrap_pyfunction!(strip_noise_words, m)?)?;
+    m.add_function(wrap_pyfunction!(strip_noise_file, m)?)?;
+    m.add_function(wrap_pyfunction!(strip_noise_batch_parallel, m)?)?;
+    m.add_class::<StripBatchStats>()?;
     Ok(())
 }

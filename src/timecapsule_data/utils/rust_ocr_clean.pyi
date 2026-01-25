@@ -591,3 +591,83 @@ def strip_boilerplate_batch(
         Tuple of (files_processed, files_with_boilerplate, total_chars_stripped).
     """
     ...
+
+
+# =============================================================================
+# Noise Word Stripping Functions
+# =============================================================================
+
+
+class StripBatchStats:
+    """Statistics from batch noise stripping."""
+
+    files_processed: int
+    files_modified: int
+    total_words_stripped: int
+    total_bytes: int
+
+
+def init_noise_words(vocab_path: str, categories: list[str] | None = None) -> int:
+    """Initialize noise word set from vocab candidates file.
+
+    Filters to only specified categories (default: G and R).
+
+    Args:
+        vocab_path: Path to vocab candidates file.
+        categories: List of category codes to include (default: ["G", "R"]).
+
+    Returns:
+        Count of noise words loaded.
+    """
+    ...
+
+
+def noise_words_count() -> int:
+    """Get the count of currently loaded noise words.
+
+    Returns:
+        Number of noise words in the global set.
+    """
+    ...
+
+
+def strip_noise_words(text: str) -> tuple[str, int]:
+    """Strip noise words from text.
+
+    Args:
+        text: Text to process.
+
+    Returns:
+        Tuple of (cleaned_text, words_stripped).
+    """
+    ...
+
+
+def strip_noise_file(
+    input_path: str, output_path: str
+) -> tuple[bool, int, int]:
+    """Strip noise words from a file and write to output.
+
+    Args:
+        input_path: Path to input file.
+        output_path: Path to write output.
+
+    Returns:
+        Tuple of (was_modified, words_stripped, bytes_processed).
+    """
+    ...
+
+
+def strip_noise_batch_parallel(
+    file_pairs: list[tuple[str, str]], num_threads: int
+) -> StripBatchStats:
+    """Batch strip noise words with Rayon parallelization.
+
+    Args:
+        file_pairs: List of (input_path, output_path) tuples.
+        num_threads: Number of threads to use.
+
+    Returns:
+        StripBatchStats with processing statistics.
+    """
+    ...
