@@ -2009,6 +2009,137 @@ fn extract_vocab_batch(
     Ok((total_words, global_counts))
 }
 
+/// Stats for parallel vocab extraction
+#[pyclass]
+#[derive(Clone)]
+pub struct VocabBatchStats {
+    #[pyo3(get)]
+    pub total_files: usize,
+    #[pyo3(get)]
+    pub files_processed: usize,
+    #[pyo3(get)]
+    pub total_words: u64,
+    #[pyo3(get)]
+    pub unique_candidates: usize,
+    #[pyo3(get)]
+    pub total_bytes: u64,
+}
+
+/// Parallel batch extract vocabulary from multiple files using Rayon
+/// Returns: (VocabBatchStats, HashMap<word_lower, (word, count, is_cap, is_suspicious, reason, context)>)
+#[pyfunction]
+#[pyo3(signature = (file_paths, context_chars, num_threads=None))]
+fn extract_vocab_batch_parallel(
+    file_paths: Vec<String>,
+    context_chars: usize,
+    num_threads: Option<usize>,
+) -> PyResult<(VocabBatchStats, std::collections::HashMap<String, (String, u64, bool, bool, String, String)>)> {
+    use std::collections::HashMap;
+    
+    let threads = num_threads.unwrap_or(24);
+    
+    // Configure thread pool
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+        .ok();
+    
+    let total_files = file_paths.len();
+    let files_processed = AtomicUsize::new(0);
+    let total_words = AtomicU64::new(0);
+    let total_bytes = AtomicU64::new(0);
+    
+    // Process files in parallel, each returning a local HashMap
+    let local_results: Vec<HashMap<String, (String, u64, bool, bool, String, String)>> = file_paths
+        .par_iter()
+        .filter_map(|file_path| {
+            let content = match std::fs::read_to_string(file_path) {
+                Ok(c) => c,
+                Err(_) => return None,
+            };
+            
+            files_processed.fetch_add(1, Ordering::Relaxed);
+            total_bytes.fetch_add(content.len() as u64, Ordering::Relaxed);
+            
+            let mut local_counts: HashMap<String, (String, u64, bool, bool, String, String)> = HashMap::new();
+            let mut local_word_count: u64 = 0;
+            
+            for cap in WORD_PATTERN.find_iter(&content) {
+                let word = cap.as_str();
+                let word_lower = word.to_lowercase();
+                
+                // Skip common words, short words (<3 chars), whitelisted words, and Roman numerals
+                if word.len() < 3 || SKIP_WORDS.contains(word_lower.as_str()) || is_whitelisted(&word_lower) || ROMAN_NUMERAL_PATTERN.is_match(word) {
+                    continue;
+                }
+                
+                // Skip ANY word that's in the dictionary
+                if dictionary::dictionaries_loaded() && dictionary::is_known_word(&word_lower) {
+                    continue;
+                }
+                
+                local_word_count += 1;
+                
+                let is_cap = word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+                
+                if let Some(entry) = local_counts.get_mut(&word_lower) {
+                    entry.1 += 1;  // Increment count
+                    if is_cap {
+                        entry.2 = true;  // Mark as seen capitalized
+                        if !entry.0.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                            entry.0 = word.to_string();  // Prefer capitalized form
+                        }
+                    }
+                } else {
+                    let suspicious = check_suspicious(word);
+                    let context = extract_context(&content, cap.start(), cap.end(), context_chars);
+                    
+                    local_counts.insert(word_lower.clone(), (
+                        word.to_string(),
+                        1,
+                        is_cap,
+                        suspicious.is_some(),
+                        suspicious.unwrap_or("").to_string(),
+                        context,
+                    ));
+                }
+            }
+            
+            total_words.fetch_add(local_word_count, Ordering::Relaxed);
+            Some(local_counts)
+        })
+        .collect();
+    
+    // Merge all local HashMaps into one global result
+    let mut global_counts: HashMap<String, (String, u64, bool, bool, String, String)> = HashMap::new();
+    
+    for local_map in local_results {
+        for (word_lower, (word, count, is_cap, is_susp, reason, context)) in local_map {
+            if let Some(entry) = global_counts.get_mut(&word_lower) {
+                entry.1 += count;  // Add counts
+                if is_cap {
+                    entry.2 = true;  // Mark as seen capitalized
+                    if !entry.0.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                        entry.0 = word;  // Prefer capitalized form
+                    }
+                }
+            } else {
+                global_counts.insert(word_lower, (word, count, is_cap, is_susp, reason, context));
+            }
+        }
+    }
+    
+    let stats = VocabBatchStats {
+        total_files,
+        files_processed: files_processed.load(Ordering::Relaxed),
+        total_words: total_words.load(Ordering::Relaxed),
+        unique_candidates: global_counts.len(),
+        total_bytes: total_bytes.load(Ordering::Relaxed),
+    };
+    
+    Ok((stats, global_counts))
+}
+
 // =============================================================================
 // DOCUMENT TRIAGE MODULE
 // =============================================================================
@@ -3474,6 +3605,8 @@ fn rust_ocr_clean(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BatchStats>()?;
     m.add_class::<TriageResultWithLang>()?;
     m.add_class::<TriageBatchStats>()?;
+    m.add_class::<VocabBatchStats>()?;
+    m.add_function(wrap_pyfunction!(extract_vocab_batch_parallel, m)?)?;
     m.add_function(wrap_pyfunction!(extract_vocab_from_file, m)?)?;
     m.add_function(wrap_pyfunction!(extract_vocab_batch, m)?)?;
     m.add_function(wrap_pyfunction!(count_context_patterns, m)?)?;

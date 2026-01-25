@@ -415,7 +415,7 @@ def cmd_extract(args):
         # Rust module is required - no Python fallback
         import rust_ocr_clean  # type: ignore[import-not-found]
 
-        rust_extract_batch = rust_ocr_clean.extract_vocab_batch
+        rust_extract_batch_parallel = rust_ocr_clean.extract_vocab_batch_parallel
 
         # Initialize Rust dictionaries for multi-language word lookup (en, de, fr, la)
         # This is done once per run; dictionaries are loaded globally in the Rust module
@@ -500,98 +500,62 @@ def cmd_extract(args):
             print(f"No files matching '{args.pattern}' found in {input_dir}", file=sys.stderr)
             sys.exit(1)
 
+        # Determine thread count (default 24, can be overridden)
+        num_threads = getattr(args, "threads", 24) or 24
+
         print(f"\n{'=' * 60}", file=sys.stderr)
-        print("Vocabulary Extraction - Rust engine", file=sys.stderr)
+        print(
+            f"Vocabulary Extraction - Rust engine (parallel, {num_threads} threads)",
+            file=sys.stderr,
+        )
         print(f"{'=' * 60}", file=sys.stderr)
         print(f"  Files to process: {total_files:,}", file=sys.stderr)
         print(f"{'=' * 60}\n", file=sys.stderr)
 
-        candidates: dict[str, VocabCandidate] = {}
-        total_words = 0
         start_time = time.time()
 
-        # Process in batches with Rust
-        batch_size = 500
-        for batch_start in range(0, total_files, batch_size):
-            if _interrupted:
-                break
-
-            batch_end = min(batch_start + batch_size, total_files)
-            batch_files = [str(f) for f in files[batch_start:batch_end]]
-
-            batch_words, batch_results = rust_extract_batch(batch_files, args.context_chars)
-            total_words += batch_words
-
-            # Merge batch results into candidates
-            for word_lower, (
-                word,
-                count,
-                is_cap,
-                is_susp,
-                reason,
-                context,
-            ) in batch_results.items():
-                if word_lower in candidates:
-                    c = candidates[word_lower]
-                    c.frequency += count
-                    if is_cap:
-                        c.is_capitalized = True
-                        if not c.word[0].isupper():
-                            c.word = word
-                else:
-                    # Skip dictionary lookup in hot path - too slow
-                    # is_unknown will be set in post-processing if needed
-                    candidates[word_lower] = VocabCandidate(
-                        word=word,
-                        frequency=count,
-                        contexts=[context] if context else [],
-                        is_capitalized=is_cap,
-                        is_unknown=True,  # Default to unknown, filter by suspicious instead
-                        is_suspicious=is_susp,
-                        suspicious_reason=reason,
-                    )
-
-            # Progress update
-            elapsed = time.time() - start_time
-            files_done = batch_end
-            files_per_sec = files_done / elapsed if elapsed > 0 else 0
-            pct = (files_done / total_files) * 100
-            remaining = (total_files - files_done) / files_per_sec if files_per_sec > 0 else 0
-
-            if remaining >= 3600:
-                eta = f"{remaining / 3600:.1f}h"
-            elif remaining >= 60:
-                eta = f"{remaining / 60:.1f}m"
-            else:
-                eta = f"{remaining:.0f}s"
-
-            # Count candidates meeting frequency threshold
-            above_threshold = sum(1 for c in candidates.values() if c.frequency >= args.min_freq)
-
-            print(
-                f"  [{pct:5.1f}%] {files_done:,}/{total_files:,} files | "
-                f"{files_per_sec:.1f} files/s | ETA: {eta} | "
-                f"vocab: {above_threshold:,}",
-                file=sys.stderr,
-            )
+        # Single parallel call processes all files
+        all_paths = [str(f) for f in files]
+        stats, batch_results = rust_extract_batch_parallel(
+            all_paths, args.context_chars, num_threads
+        )
 
         elapsed = time.time() - start_time
+
+        # Convert results to VocabCandidate objects
+        candidates: dict[str, VocabCandidate] = {}
+        for word_lower, (
+            word,
+            count,
+            is_cap,
+            is_susp,
+            reason,
+            context,
+        ) in batch_results.items():
+            candidates[word_lower] = VocabCandidate(
+                word=word,
+                frequency=count,
+                contexts=[context] if context else [],
+                is_capitalized=is_cap,
+                is_unknown=True,  # Default to unknown, filter by suspicious instead
+                is_suspicious=is_susp,
+                suspicious_reason=reason,
+            )
+
+        # Calculate throughput
+        files_per_sec = stats.files_processed / elapsed if elapsed > 0 else 0
+        mb_per_sec = (stats.total_bytes / 1024 / 1024) / elapsed if elapsed > 0 else 0
+
         print(f"\n{'=' * 60}", file=sys.stderr)
-        if _interrupted:
-            print("INTERRUPTED - showing partial results", file=sys.stderr)
-        else:
-            print("COMPLETE", file=sys.stderr)
+        print("COMPLETE", file=sys.stderr)
         print(f"{'=' * 60}", file=sys.stderr)
         print(f"  Time elapsed: {elapsed:.1f}s", file=sys.stderr)
-        print(f"  Total words processed: {total_words:,}", file=sys.stderr)
-        print(f"  Unique candidates: {len(candidates):,}", file=sys.stderr)
+        print(f"  Throughput: {files_per_sec:.1f} files/s, {mb_per_sec:.1f} MB/s", file=sys.stderr)
+        print(f"  Total words processed: {stats.total_words:,}", file=sys.stderr)
+        print(f"  Unique candidates: {stats.unique_candidates:,}", file=sys.stderr)
 
-        # Filter by frequency (skip if interrupted - this is slow with 200M+ candidates)
-        if not _interrupted:
-            above_threshold = sum(1 for c in candidates.values() if c.frequency >= args.min_freq)
-            print(
-                f"  Candidates >= {args.min_freq} occurrences: {above_threshold:,}", file=sys.stderr
-            )
+        above_threshold = sum(1 for c in candidates.values() if c.frequency >= args.min_freq)
+        print(f"  Candidates >= {args.min_freq} occurrences: {above_threshold:,}", file=sys.stderr)
         print(f"{'=' * 60}", file=sys.stderr)
 
         # Post-process: dictionary check for suspicious words
