@@ -418,48 +418,44 @@ def cmd_extract(args):
         rust_extract_batch_parallel = rust_ocr_clean.extract_vocab_batch_parallel
 
         # Initialize Rust dictionaries for multi-language word lookup (en, de, fr, la)
-        # Skip if --no-dict flag is set (faster for noise-only extraction)
-        use_dict = not getattr(args, "no_dict", False)
+        # Dictionaries are always loaded for extraction-time filtering (skips known words)
+        # The --skip-dict-check flag only skips the post-processing validation loop
+        skip_dict_check = getattr(args, "skip_dict_check", False)
 
-        if use_dict:
-            # This is done once per run; dictionaries are loaded globally in the Rust module
-            # Try multiple possible locations for the dictionaries
-            possible_dict_dirs = [
-                # Development: relative to source file
-                Path(__file__).parent.parent.parent.parent / "rust-ocr-clean" / "dictionaries",
-                # Development: relative to cwd
-                Path.cwd() / "rust-ocr-clean" / "dictionaries",
-                # Installed: next to the rust module
-                Path(rust_ocr_clean.__file__).parent / "dictionaries"
-                if hasattr(rust_ocr_clean, "__file__")
-                else None,
-            ]
+        # This is done once per run; dictionaries are loaded globally in the Rust module
+        # Try multiple possible locations for the dictionaries
+        possible_dict_dirs = [
+            # Development: relative to source file
+            Path(__file__).parent.parent.parent.parent / "rust-ocr-clean" / "dictionaries",
+            # Development: relative to cwd
+            Path.cwd() / "rust-ocr-clean" / "dictionaries",
+            # Installed: next to the rust module
+            Path(rust_ocr_clean.__file__).parent / "dictionaries"
+            if hasattr(rust_ocr_clean, "__file__")
+            else None,
+        ]
 
-            dict_dir = None
-            for candidate in possible_dict_dirs:
-                if candidate and candidate.exists():
-                    dict_dir = candidate
-                    break
+        dict_dir = None
+        for candidate in possible_dict_dirs:
+            if candidate and candidate.exists():
+                dict_dir = candidate
+                break
 
-            if dict_dir:
-                rust_ocr_clean.init_dictionaries(str(dict_dir))
-                if rust_ocr_clean.dictionaries_loaded():
-                    print(f"Dictionaries loaded from: {dict_dir}", file=sys.stderr)
-                else:
-                    print(
-                        "WARNING: Dictionary init called but dictionaries_loaded() is False!",
-                        file=sys.stderr,
-                    )
+        if dict_dir:
+            rust_ocr_clean.init_dictionaries(str(dict_dir))
+            if rust_ocr_clean.dictionaries_loaded():
+                print(f"Dictionaries loaded from: {dict_dir}", file=sys.stderr)
             else:
-                print("WARNING: Dictionary directory not found! Tried:", file=sys.stderr)
-                for p in possible_dict_dirs:
-                    if p:
-                        print(f"  - {p}", file=sys.stderr)
                 print(
-                    "Capitalized English words will NOT be filtered from output.", file=sys.stderr
+                    "WARNING: Dictionary init called but dictionaries_loaded() is False!",
+                    file=sys.stderr,
                 )
         else:
-            print("Dictionary lookup disabled (--no-dict)", file=sys.stderr)
+            print("WARNING: Dictionary directory not found! Tried:", file=sys.stderr)
+            for p in possible_dict_dirs:
+                if p:
+                    print(f"  - {p}", file=sys.stderr)
+            print("Capitalized English words will NOT be filtered from output.", file=sys.stderr)
 
         # Load known vocab whitelist
         if hasattr(args, "no_whitelist") and args.no_whitelist:
@@ -615,8 +611,8 @@ def cmd_extract(args):
         # Post-process: dictionary check for suspicious words
         # NOTE: Rust now does dictionary checks during extraction, but we do a final pass
         # here to catch any edge cases with the is_known_word function
-        # Skip if --no-dict flag is set
-        if not _interrupted and use_dict and rust_ocr_clean.dictionaries_loaded():
+        # Skip if --skip-dict-check flag is set
+        if not _interrupted and not skip_dict_check and rust_ocr_clean.dictionaries_loaded():
             suspicious_to_check = [
                 c for c in candidates.values() if c.is_suspicious and c.frequency >= args.min_freq
             ]
@@ -774,9 +770,9 @@ Examples:
         help="Disable the built-in known vocabulary whitelist",
     )
     extract_parser.add_argument(
-        "--no-dict",
+        "--skip-dict-check",
         action="store_true",
-        help="Skip dictionary loading and lookup (faster for noise-only extraction)",
+        help="Skip post-processing dictionary validation (dicts still used for filtering)",
     )
 
     # Simplify command
