@@ -948,6 +948,21 @@ Examples:
     analyze_parser.add_argument("--sample", type=int, default=1000, help="Sample size")
     analyze_parser.add_argument("--report", type=Path, help="Save report to JSON")
 
+    # DB-driven triage (batched with progress)
+    triage_db_parser = subparsers.add_parser(
+        "triage-db", help="Run document triage with DB tracking (resumable, batched)"
+    )
+    triage_db_parser.add_argument("--db", required=True, type=Path, help="Path to SQLite database")
+    triage_db_parser.add_argument(
+        "--raw-dir", required=True, type=Path, help="Directory containing raw files"
+    )
+    triage_db_parser.add_argument(
+        "--batch-size", type=int, default=10000, help="Files per batch (default: 10000)"
+    )
+    triage_db_parser.add_argument(
+        "--threads", type=int, default=24, help="Thread count (default: 24)"
+    )
+
     args = parser.parse_args()
 
     if args.command == "clean":
@@ -1196,6 +1211,190 @@ Examples:
         else:
             print(f"Error: {input_path} does not exist", file=sys.stderr)
             sys.exit(1)
+
+    elif args.command == "triage-db":
+        import signal
+        import sqlite3
+        import time
+        from datetime import datetime
+
+        db_path = Path(args.db).resolve()
+        raw_dir = Path(args.raw_dir).resolve()
+        batch_size = args.batch_size
+        num_threads = args.threads
+
+        if not db_path.exists():
+            print(f"Error: Database not found: {db_path}", file=sys.stderr)
+            sys.exit(1)
+
+        if not raw_dir.exists():
+            print(f"Error: Raw directory not found: {raw_dir}", file=sys.stderr)
+            sys.exit(1)
+
+        # Set up interrupt handling
+        interrupted = False
+
+        def handle_interrupt(signum, frame):
+            nonlocal interrupted
+            if interrupted:
+                print("\n\nForce quit.", file=sys.stderr)
+                sys.exit(1)
+            interrupted = True
+            print("\n\nInterrupted! Finishing current batch, then stopping...", file=sys.stderr)
+
+        old_handler = signal.signal(signal.SIGINT, handle_interrupt)
+
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=60.0)
+            conn.row_factory = sqlite3.Row
+
+            # Get total count for progress
+            total_pending = conn.execute(
+                "SELECT COUNT(*) FROM items WHERE downloaded_at IS NOT NULL AND triage_action IS NULL"
+            ).fetchone()[0]
+
+            total_done = conn.execute(
+                "SELECT COUNT(*) FROM items WHERE triage_action IS NOT NULL"
+            ).fetchone()[0]
+
+            print(f"\n{'=' * 60}")
+            print("DB-Driven Document Triage (Rust parallel, batched)")
+            print(f"{'=' * 60}")
+            print(f"  Database: {db_path}")
+            print(f"  Raw files: {raw_dir}")
+            print(f"  Already triaged: {total_done:,}")
+            print(f"  Pending: {total_pending:,}")
+            print(f"  Batch size: {batch_size:,}")
+            print(f"  Threads: {num_threads}")
+            print(f"{'=' * 60}\n")
+
+            if total_pending == 0:
+                print("No files pending triage.")
+                sys.exit(0)
+
+            # Process in batches
+            processed = 0
+            passed = 0
+            quarantined = 0
+            rejected = 0
+            start_time = time.time()
+
+            while not interrupted:
+                # Get next batch of untriaged files
+                rows = conn.execute(
+                    """
+                    SELECT identifier, text_filename
+                    FROM items
+                    WHERE downloaded_at IS NOT NULL AND triage_action IS NULL
+                    LIMIT ?
+                    """,
+                    (batch_size,),
+                ).fetchall()
+
+                if not rows:
+                    break
+
+                # Build file paths
+                paths = []
+                id_map = {}
+                for row in rows:
+                    identifier = row["identifier"]
+                    filename = row["text_filename"]
+                    file_path = raw_dir / identifier / filename
+                    if file_path.exists():
+                        path_str = str(file_path)
+                        paths.append(path_str)
+                        id_map[path_str] = identifier
+
+                if not paths:
+                    # No valid files in batch, mark them as failed
+                    for row in rows:
+                        conn.execute(
+                            "UPDATE items SET triage_action = 'error', triage_at = ? WHERE identifier = ?",
+                            (datetime.now().isoformat(), row["identifier"]),
+                        )
+                    conn.commit()
+                    continue
+
+                # Run triage
+                results, stats = rust_ocr_clean.triage_batch_parallel(paths, num_threads, 0.5)
+
+                # Update database
+                updates = []
+                for r in results:
+                    identifier = id_map.get(r.path)
+                    if identifier:
+                        updates.append(
+                            (
+                                r.action,
+                                ",".join(r.problems) if r.problems else None,
+                                r.alpha_ratio,
+                                r.detected_lang if r.detected_lang else None,
+                                r.lang_confidence if r.detected_lang else None,
+                                datetime.now().isoformat(),
+                                identifier,
+                            )
+                        )
+
+                conn.executemany(
+                    """
+                    UPDATE items SET
+                        triage_action = ?,
+                        triage_problems = ?,
+                        triage_alpha_ratio = ?,
+                        triage_lang = ?,
+                        triage_lang_confidence = ?,
+                        triage_at = ?
+                    WHERE identifier = ?
+                    """,
+                    updates,
+                )
+                conn.commit()
+
+                # Update counts
+                processed += len(results)
+                passed += stats.passed
+                quarantined += stats.quarantined
+                rejected += stats.rejected
+
+                # Progress
+                elapsed = time.time() - start_time
+                rate = processed / elapsed if elapsed > 0 else 0
+                remaining = (total_pending - processed) / rate if rate > 0 else 0
+
+                if remaining >= 3600:
+                    eta = f"{remaining / 3600:.1f}h"
+                elif remaining >= 60:
+                    eta = f"{remaining / 60:.1f}m"
+                else:
+                    eta = f"{remaining:.0f}s"
+
+                pct = (processed / total_pending) * 100
+                print(
+                    f"  [{pct:5.1f}%] {processed:,}/{total_pending:,} | "
+                    f"{rate:.0f}/s | ETA: {eta} | "
+                    f"pass={passed:,} quar={quarantined:,} rej={rejected:,}"
+                )
+
+            # Final summary
+            elapsed = time.time() - start_time
+            print(f"\n{'=' * 60}")
+            if interrupted:
+                print(f"INTERRUPTED after {processed:,} files")
+            else:
+                print("COMPLETE")
+            print(f"{'=' * 60}")
+            print(f"  Files triaged: {processed:,}")
+            print(f"  Passed: {passed:,}")
+            print(f"  Quarantined: {quarantined:,}")
+            print(f"  Rejected: {rejected:,}")
+            print(f"  Time: {elapsed:.1f}s ({processed / elapsed:.0f} files/s)")
+            print(f"{'=' * 60}")
+
+            conn.close()
+
+        finally:
+            signal.signal(signal.SIGINT, old_handler)
 
     elif args.command == "analyze":
         report = analyze_corpus(args.corpus_dir, args.sample)
