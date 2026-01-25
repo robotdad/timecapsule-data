@@ -447,6 +447,7 @@ def clean_batch(
     boilerplate_log: Optional[Path] = None,
     parallel: bool = True,
     num_threads: int = 24,
+    input_files: Optional[list[Path]] = None,
 ) -> CleanupStats:
     """
     Clean all text files in a directory.
@@ -464,6 +465,7 @@ def clean_batch(
         boilerplate_log: If set, write boilerplate audit log to this JSONL file
         parallel: If True, use multi-threaded Rayon processing (default: True)
         num_threads: Number of threads for parallel processing (default: 24)
+        input_files: If provided, use this file list instead of scanning input_dir
     """
     import signal
     import sys
@@ -490,39 +492,44 @@ def clean_batch(
 
         rust_clean_file = rust_ocr_clean.clean_file_to_file
 
-        # Discover files using os.scandir (faster than glob)
-        print(f"Scanning {input_dir} for {file_pattern} files...", end="", flush=True)
+        # Use provided file list or discover files
+        if input_files is not None:
+            print(f"Using provided file list: {len(input_files):,} files")
+            stats.total_files = len(input_files)
+        else:
+            # Discover files using os.scandir (faster than glob)
+            print(f"Scanning {input_dir} for {file_pattern} files...", end="", flush=True)
 
-        import fnmatch
-        import os
+            import fnmatch
+            import os
 
-        def fast_find_files(directory: Path, pattern: str) -> list[Path]:
-            """Fast recursive file discovery using os.scandir."""
-            results = []
-            dirs_to_scan = [directory]
-            scanned = 0
+            def fast_find_files(directory: Path, pattern: str) -> list[Path]:
+                """Fast recursive file discovery using os.scandir."""
+                results = []
+                dirs_to_scan = [directory]
+                scanned = 0
 
-            while dirs_to_scan:
-                current_dir = dirs_to_scan.pop()
-                try:
-                    with os.scandir(current_dir) as it:
-                        for entry in it:
-                            if entry.is_dir(follow_symlinks=False):
-                                dirs_to_scan.append(Path(entry.path))
-                            elif entry.is_file() and fnmatch.fnmatch(entry.name, pattern):
-                                results.append(Path(entry.path))
-                except PermissionError:
-                    continue
+                while dirs_to_scan:
+                    current_dir = dirs_to_scan.pop()
+                    try:
+                        with os.scandir(current_dir) as it:
+                            for entry in it:
+                                if entry.is_dir(follow_symlinks=False):
+                                    dirs_to_scan.append(Path(entry.path))
+                                elif entry.is_file() and fnmatch.fnmatch(entry.name, pattern):
+                                    results.append(Path(entry.path))
+                    except PermissionError:
+                        continue
 
-                scanned += 1
-                if scanned % 500 == 0:
-                    print(".", end="", flush=True)
+                    scanned += 1
+                    if scanned % 500 == 0:
+                        print(".", end="", flush=True)
 
-            return results
+                return results
 
-        input_files = fast_find_files(input_dir, file_pattern)
-        stats.total_files = len(input_files)
-        print(f" found {stats.total_files:,} files")
+            input_files = fast_find_files(input_dir, file_pattern)
+            stats.total_files = len(input_files)
+            print(f" found {stats.total_files:,} files")
 
         if stats.total_files == 0:
             print("No files found.")
@@ -930,6 +937,17 @@ Examples:
         type=Path,
         help="Override boilerplate audit log location (default: {output_parent}/_boilerplate_stripped.jsonl)",
     )
+    batch_parser.add_argument(
+        "--from-db",
+        type=Path,
+        help="Read file list from DB (files where triage_action='pass'). Implies --skip-triage.",
+    )
+    batch_parser.add_argument(
+        "--threads",
+        type=int,
+        default=24,
+        help="Thread count for parallel processing (default: 24)",
+    )
 
     # Strip boilerplate only (standalone command)
     strip_parser = subparsers.add_parser(
@@ -1016,13 +1034,50 @@ Examples:
         if args.skip_boilerplate:
             boilerplate_path = None
 
+        # Load file list from DB if --from-db is specified
+        input_files = None
+        skip_triage = args.skip_triage
+        if args.from_db:
+            import sqlite3
+
+            db_path = Path(args.from_db).resolve()
+            if not db_path.exists():
+                print(f"Error: Database not found: {db_path}", file=sys.stderr)
+                sys.exit(1)
+
+            print(f"Loading passed files from database: {db_path}")
+            conn = sqlite3.connect(str(db_path), timeout=60.0)
+            conn.row_factory = sqlite3.Row
+
+            rows = conn.execute(
+                """
+                SELECT identifier, text_filename
+                FROM items
+                WHERE triage_action = 'pass' AND text_filename IS NOT NULL
+                """
+            ).fetchall()
+            conn.close()
+
+            # Build file paths
+            input_files = []
+            for row in rows:
+                file_path = args.input_dir / row["identifier"] / row["text_filename"]
+                if file_path.exists():
+                    input_files.append(file_path)
+
+            print(f"  Found {len(input_files):,} files that passed triage")
+            skip_triage = True  # Already triaged via DB
+            triage_path = None  # No need to write triage results
+
         stats = clean_batch(
             args.input_dir,
             args.output_dir,
             args.pattern,
-            skip_triage=args.skip_triage,
+            skip_triage=skip_triage,
             triage_output=triage_path,
             boilerplate_log=boilerplate_path,
+            num_threads=args.threads,
+            input_files=input_files,
         )
 
         run_end = datetime.now()
