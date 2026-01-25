@@ -654,6 +654,14 @@ def clean_batch(
                 output_path = input_path  # in-place
             file_pairs.append((str(input_path), str(output_path)))
 
+        # Filter out already-processed files (output exists) for resumability
+        if output_dir:
+            before_count = len(file_pairs)
+            file_pairs = [(inp, out) for inp, out in file_pairs if not Path(out).exists()]
+            skipped = before_count - len(file_pairs)
+            if skipped > 0:
+                print(f"  Resuming: skipping {skipped:,} already processed files")
+
         if parallel and not interrupted:
             # ===== PARALLEL PROCESSING WITH RAYON =====
             total_to_process = len(file_pairs)

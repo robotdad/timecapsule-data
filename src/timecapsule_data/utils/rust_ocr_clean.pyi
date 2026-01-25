@@ -10,7 +10,6 @@ from typing import Optional
 # Classes (PyO3 exported)
 # =============================================================================
 
-
 class WordInfo:
     """Information about a word extracted from text."""
 
@@ -26,7 +25,6 @@ class WordInfo:
     """Reason for suspicion (empty if not suspicious)."""
     context: str
     """Surrounding context from first occurrence."""
-
 
 class TriageResult:
     """Result of document quality triage."""
@@ -52,7 +50,6 @@ class TriageResult:
     char_count: int
     """Total character count."""
 
-
 class CleanupResult:
     """Result of OCR cleanup with category breakdown."""
 
@@ -63,7 +60,6 @@ class CleanupResult:
     substitutions_by_category: dict[str, int]
     """Substitution counts by category (e.g., 'li_h_confusion': 45, 'long_s': 123)."""
 
-
 class LangDetectResult:
     """Result of language detection."""
 
@@ -73,7 +69,6 @@ class LangDetectResult:
     """Detected language code (e.g., 'eng', 'deu', 'fra')."""
     confidence: float
     """Detection confidence (0.0-1.0)."""
-
 
 class PreprocessResult:
     """Result of text preprocessing (unicode fix + language detection)."""
@@ -87,11 +82,9 @@ class PreprocessResult:
     unicode_was_fixed: bool
     """Whether unicode normalization made changes."""
 
-
 # =============================================================================
 # OCR Cleanup Functions
 # =============================================================================
-
 
 def clean_text(text: str) -> tuple[str, int]:
     """Clean OCR text using pattern-based corrections.
@@ -107,7 +100,6 @@ def clean_text(text: str) -> tuple[str, int]:
     """
     ...
 
-
 def clean_text_with_categories(text: str) -> CleanupResult:
     """Clean OCR text and return detailed category breakdown.
 
@@ -121,7 +113,6 @@ def clean_text_with_categories(text: str) -> CleanupResult:
         CleanupResult with text, total_substitutions, and substitutions_by_category.
     """
     ...
-
 
 def clean_file_to_file(
     input_path: str, output_path: str
@@ -144,15 +135,11 @@ def clean_file_to_file(
     """
     ...
 
-
 # =============================================================================
 # Vocabulary Extraction Functions
 # =============================================================================
 
-
-def extract_vocab_from_file(
-    file_path: str, context_chars: int
-) -> tuple[int, list[WordInfo]]:
+def extract_vocab_from_file(file_path: str, context_chars: int) -> tuple[int, list[WordInfo]]:
     """Extract vocabulary from a single file.
 
     Args:
@@ -163,7 +150,6 @@ def extract_vocab_from_file(
         Tuple of (total_word_count, list of WordInfo for unique words).
     """
     ...
-
 
 def extract_vocab_batch(
     file_paths: list[str], context_chars: int
@@ -180,11 +166,9 @@ def extract_vocab_batch(
     """
     ...
 
-
 # =============================================================================
 # Context Pattern Functions
 # =============================================================================
-
 
 def count_context_patterns(text: str) -> dict[str, int]:
     """Count context-dependent patterns that need review.
@@ -200,7 +184,6 @@ def count_context_patterns(text: str) -> dict[str, int]:
     """
     ...
 
-
 def count_context_patterns_file(file_path: str) -> dict[str, int]:
     """Count context-dependent patterns in a file.
 
@@ -211,7 +194,6 @@ def count_context_patterns_file(file_path: str) -> dict[str, int]:
         Dict mapping pattern_name to count.
     """
     ...
-
 
 def count_context_patterns_batch(file_paths: list[str]) -> dict[str, int]:
     """Count context-dependent patterns across multiple files.
@@ -224,11 +206,88 @@ def count_context_patterns_batch(file_paths: list[str]) -> dict[str, int]:
     """
     ...
 
+# =============================================================================
+# Batch Processing Classes
+# =============================================================================
+
+class BatchStats:
+    """Statistics from batch OCR cleanup processing."""
+
+    files_processed: int
+    files_modified: int
+    files_failed: int
+    total_substitutions: int
+    total_bytes: int
+    long_s_fixes: int
+    boilerplate_files: int
+    boilerplate_chars: int
+
+class TriageResultWithLang:
+    """Triage result with integrated language detection."""
+
+    path: str
+    action: str
+    problems: list[str]
+    alpha_ratio: float
+    line_length_cv: float
+    mean_words_per_line: float
+    fragment_ratio: float
+    list_pattern_ratio: float
+    line_count: int
+    char_count: int
+    detected_lang: str
+    lang_confidence: float
+    is_english: bool
+
+class TriageBatchStats:
+    """Statistics from batch triage processing."""
+
+    total: int
+    passed: int
+    quarantined: int
+    rejected: int
+    non_english: int
+
+# =============================================================================
+# Batch Processing Functions (Rayon parallel)
+# =============================================================================
+
+def clean_batch_parallel(
+    file_pairs: list[tuple[str, str]], num_threads: int | None = None
+) -> BatchStats:
+    """Clean multiple files in parallel using Rayon.
+
+    Args:
+        file_pairs: List of (input_path, output_path) tuples.
+        num_threads: Number of threads (default: 24).
+
+    Returns:
+        BatchStats with aggregated statistics.
+    """
+    ...
+
+def triage_batch_parallel(
+    paths: list[str],
+    num_threads: int | None = None,
+    lang_confidence_threshold: float | None = None,
+) -> tuple[list[TriageResultWithLang], TriageBatchStats]:
+    """Triage multiple files in parallel with integrated language detection.
+
+    Combines structural triage and language detection in one parallel pass.
+
+    Args:
+        paths: List of file paths to triage.
+        num_threads: Number of threads (default: 24).
+        lang_confidence_threshold: Minimum confidence for English (default: 0.5).
+
+    Returns:
+        Tuple of (list of TriageResultWithLang, TriageBatchStats).
+    """
+    ...
 
 # =============================================================================
 # Document Triage Functions
 # =============================================================================
-
 
 def triage_text(text: str, path: str = "") -> TriageResult:
     """Triage text for quality issues.
@@ -245,7 +304,6 @@ def triage_text(text: str, path: str = "") -> TriageResult:
     """
     ...
 
-
 def triage_file(path: str) -> TriageResult:
     """Triage a file for quality issues.
 
@@ -256,7 +314,6 @@ def triage_file(path: str) -> TriageResult:
         TriageResult with action and quality metrics.
     """
     ...
-
 
 def triage_batch(paths: list[str]) -> list[TriageResult]:
     """Triage multiple files in parallel.
@@ -271,11 +328,9 @@ def triage_batch(paths: list[str]) -> list[TriageResult]:
     """
     ...
 
-
 # =============================================================================
 # Language Detection Functions
 # =============================================================================
-
 
 def detect_language(text: str, confidence_threshold: Optional[float] = None) -> LangDetectResult:
     """Detect the language of text.
@@ -292,7 +347,6 @@ def detect_language(text: str, confidence_threshold: Optional[float] = None) -> 
     """
     ...
 
-
 def detect_language_file(
     path: str, confidence_threshold: Optional[float] = None
 ) -> LangDetectResult:
@@ -307,11 +361,9 @@ def detect_language_file(
     """
     ...
 
-
 # =============================================================================
 # Unicode Normalization Functions
 # =============================================================================
-
 
 def fix_unicode(text: str) -> str:
     """Fix common Unicode issues in text.
@@ -329,7 +381,6 @@ def fix_unicode(text: str) -> str:
     """
     ...
 
-
 def fix_unicode_file(input_path: str, output_path: Optional[str] = None) -> bool:
     """Fix Unicode issues in a file.
 
@@ -342,11 +393,9 @@ def fix_unicode_file(input_path: str, output_path: Optional[str] = None) -> bool
     """
     ...
 
-
 # =============================================================================
 # Preprocessing Functions (Combined Operations)
 # =============================================================================
-
 
 def preprocess_text(
     text: str, confidence_threshold: Optional[float] = None
@@ -361,7 +410,6 @@ def preprocess_text(
         Tuple of (fixed_text, PreprocessResult).
     """
     ...
-
 
 def preprocess_file(
     input_path: str,
@@ -382,11 +430,9 @@ def preprocess_file(
     """
     ...
 
-
 # =============================================================================
 # Dictionary Functions (Multi-language word lookup)
 # =============================================================================
-
 
 def init_dictionaries(dict_dir: str) -> bool:
     """Initialize multi-language dictionaries from a directory.
@@ -402,7 +448,6 @@ def init_dictionaries(dict_dir: str) -> bool:
     """
     ...
 
-
 def is_known_word(word: str) -> bool:
     """Check if a word exists in any loaded dictionary.
 
@@ -417,7 +462,6 @@ def is_known_word(word: str) -> bool:
     """
     ...
 
-
 def word_languages(word: str) -> list[str]:
     """Get list of languages that recognize a word.
 
@@ -431,7 +475,6 @@ def word_languages(word: str) -> list[str]:
     """
     ...
 
-
 def dictionaries_loaded() -> bool:
     """Check if dictionaries have been initialized.
 
@@ -439,7 +482,6 @@ def dictionaries_loaded() -> bool:
         True if init_dictionaries() has been called and at least one dictionary loaded.
     """
     ...
-
 
 def init_whitelist(words: list[str]) -> int:
     """Initialize the whitelist with known good words to skip during vocab extraction.
@@ -455,11 +497,9 @@ def init_whitelist(words: list[str]) -> int:
     """
     ...
 
-
 # =============================================================================
 # Line Unwrapping Functions
 # =============================================================================
-
 
 class UnwrapResult:
     """Result of line unwrapping."""
@@ -472,7 +512,6 @@ class UnwrapResult:
     """Number of hyphenated words that were rejoined."""
     spaces_normalized: int
     """Number of extra spaces that were normalized."""
-
 
 def unwrap_lines(text: str) -> UnwrapResult:
     """Unwrap cosmetic line breaks while preserving paragraph structure.
@@ -488,7 +527,6 @@ def unwrap_lines(text: str) -> UnwrapResult:
     """
     ...
 
-
 def unwrap_lines_file(input_path: str, output_path: str) -> UnwrapResult:
     """Unwrap lines in a file and write to output.
 
@@ -500,7 +538,6 @@ def unwrap_lines_file(input_path: str, output_path: str) -> UnwrapResult:
         UnwrapResult with statistics.
     """
     ...
-
 
 def unwrap_lines_batch(input_dir: str, output_dir: str) -> tuple[int, int, int, int]:
     """Batch unwrap lines in multiple files.
@@ -514,11 +551,9 @@ def unwrap_lines_batch(input_dir: str, output_dir: str) -> tuple[int, int, int, 
     """
     ...
 
-
 # =============================================================================
 # Boilerplate Stripping Functions
 # =============================================================================
-
 
 class StrippedRegion:
     """A region that was stripped from a document."""
@@ -534,7 +569,6 @@ class StrippedRegion:
     char_count: int
     """Number of characters stripped."""
 
-
 class BoilerplateResult:
     """Result of boilerplate stripping."""
 
@@ -544,7 +578,6 @@ class BoilerplateResult:
     """List of regions that were stripped."""
     total_chars_stripped: int
     """Total number of characters removed."""
-
 
 def strip_boilerplate(text: str) -> BoilerplateResult:
     """Strip digitization boilerplate from text.
@@ -562,10 +595,7 @@ def strip_boilerplate(text: str) -> BoilerplateResult:
     """
     ...
 
-
-def strip_boilerplate_file(
-    input_path: str, output_path: Optional[str] = None
-) -> BoilerplateResult:
+def strip_boilerplate_file(input_path: str, output_path: Optional[str] = None) -> BoilerplateResult:
     """Strip boilerplate from a file.
 
     Args:
@@ -577,10 +607,7 @@ def strip_boilerplate_file(
     """
     ...
 
-
-def strip_boilerplate_batch(
-    input_dir: str, output_dir: str
-) -> tuple[int, int, int]:
+def strip_boilerplate_batch(input_dir: str, output_dir: str) -> tuple[int, int, int]:
     """Batch strip boilerplate from files in a directory.
 
     Args:
@@ -592,11 +619,9 @@ def strip_boilerplate_batch(
     """
     ...
 
-
 # =============================================================================
 # Noise Word Stripping Functions
 # =============================================================================
-
 
 class StripBatchStats:
     """Statistics from batch noise stripping."""
@@ -605,7 +630,6 @@ class StripBatchStats:
     files_modified: int
     total_words_stripped: int
     total_bytes: int
-
 
 def init_noise_words(vocab_path: str, categories: list[str] | None = None) -> int:
     """Initialize noise word set from vocab candidates file.
@@ -621,7 +645,6 @@ def init_noise_words(vocab_path: str, categories: list[str] | None = None) -> in
     """
     ...
 
-
 def noise_words_count() -> int:
     """Get the count of currently loaded noise words.
 
@@ -629,7 +652,6 @@ def noise_words_count() -> int:
         Number of noise words in the global set.
     """
     ...
-
 
 def strip_noise_words(text: str) -> tuple[str, int]:
     """Strip noise words from text.
@@ -642,10 +664,7 @@ def strip_noise_words(text: str) -> tuple[str, int]:
     """
     ...
 
-
-def strip_noise_file(
-    input_path: str, output_path: str
-) -> tuple[bool, int, int]:
+def strip_noise_file(input_path: str, output_path: str) -> tuple[bool, int, int]:
     """Strip noise words from a file and write to output.
 
     Args:
@@ -656,7 +675,6 @@ def strip_noise_file(
         Tuple of (was_modified, words_stripped, bytes_processed).
     """
     ...
-
 
 def strip_noise_batch_parallel(
     file_pairs: list[tuple[str, str]], num_threads: int
@@ -671,7 +689,6 @@ def strip_noise_batch_parallel(
         StripBatchStats with processing statistics.
     """
     ...
-
 
 def strip_noise_batch_parallel_logged(
     file_pairs: list[tuple[str, str]], num_threads: int
