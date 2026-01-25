@@ -1351,27 +1351,19 @@ Examples:
                 if not rows:
                     break
 
-                # Build file paths
+                # Build file paths (skip exists() check - let Rust handle missing files)
                 paths = []
                 id_map = {}
                 for row in rows:
                     identifier = row["identifier"]
                     filename = row["text_filename"]
                     file_path = raw_dir / identifier / filename
-                    if file_path.exists():
-                        path_str = str(file_path)
-                        paths.append(path_str)
-                        id_map[path_str] = identifier
+                    path_str = str(file_path)
+                    paths.append(path_str)
+                    id_map[path_str] = identifier
 
                 if not paths:
-                    # No valid files in batch, mark them as failed
-                    for row in rows:
-                        conn.execute(
-                            "UPDATE items SET triage_action = 'error', triage_at = ? WHERE identifier = ?",
-                            (datetime.now().isoformat(), row["identifier"]),
-                        )
-                    conn.commit()
-                    continue
+                    break
 
                 # Run triage
                 results, stats = rust_ocr_clean.triage_batch_parallel(paths, num_threads, 0.5)
@@ -1430,7 +1422,8 @@ Examples:
                 print(
                     f"  [{pct:5.1f}%] {processed:,}/{total_pending:,} | "
                     f"{rate:.0f}/s | ETA: {eta} | "
-                    f"pass={passed:,} quar={quarantined:,} rej={rejected:,}"
+                    f"pass={passed:,} quar={quarantined:,} rej={rejected:,}",
+                    flush=True,
                 )
 
             # Final summary
