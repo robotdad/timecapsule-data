@@ -179,7 +179,7 @@ Boilerplate stripping logs to `_boilerplate_stripped.jsonl` for auditing what wa
 | rn/m confusion | tirne→time, frorn→from | ~10 |
 | Google watermarks | "Digitized by Google" | ~10 |
 
-**Performance**: ~35x faster than Python (~14 MB/s on NVMe).
+**Performance**: Parallel Rust engine with Rayon (~64 files/s, ~51 MB/s on NVMe with 24 threads).
 
 ### tc-ocr-score - Quality Scoring
 
@@ -352,16 +352,20 @@ Hyphen rejoining handles most cases, but some fragments remain.
 
 ## Performance
 
-Benchmarked on Ryzen 5950X, NVMe storage:
+Benchmarked on Ryzen 5950X, 64GB RAM, Samsung 970 EVO NVMe:
 
-| Component | Language | Throughput |
-|-----------|----------|------------|
-| Preprocessing | Rust | ~20 MB/s |
-| OCR patterns | Rust | ~14 MB/s |
-| Scoring | Python (C-backed) | ~5 MB/s |
-| SymSpell | Python | ~2 MB/s |
+| Component | Throughput | Notes |
+|-----------|------------|-------|
+| **Full OCR Pipeline** | **64 files/s, 51 MB/s** | Triage + cleanup + boilerplate (24 threads) |
+| **Vocab Extraction** | **47 files/s, 33 MB/s** | Parallel with 5-dict lookup (24 threads) |
+| Scoring | ~5 MB/s | Python (C-backed pyenchant) |
+| SymSpell | ~2 MB/s | Python |
 
-For 2M+ documents, the Rust components are critical for reasonable processing times.
+**Real-world benchmark** (100k Internet Archive files):
+- OCR cleanup: **21 minutes** (43M substitutions, 54M chars boilerplate stripped)
+- Vocab extraction: **~28 minutes** (with 5 dictionary lookups per word)
+
+For 1M+ documents, the parallel Rust components with Rayon are critical for reasonable processing times.
 
 ---
 

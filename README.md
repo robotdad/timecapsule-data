@@ -427,22 +427,26 @@ Perseus texts are scholarly editions, also high quality.
 
 ## OCR Cleanup - Rust Engine
 
-The OCR cleanup tool uses a high-performance Rust engine (`rust-ocr-clean`) for pattern matching and text substitution. This provides **~35x speedup** over the original pure-Python regex implementation.
+The OCR cleanup tool uses a high-performance Rust engine (`rust-ocr-clean`) with **Rayon parallel processing** for pattern matching and text substitution.
 
 ### Performance
 
 Benchmarked on Windows 11, Ryzen 5950X, 64GB RAM, Samsung 970 EVO NVMe:
 
-| Metric | Python (original) | Rust Engine |
-|--------|-------------------|-------------|
-| Throughput | ~0.4 MB/s | **13.9 MB/s** |
-| 325k files | ~250 hours | **4.9 hours** |
-| Speedup | baseline | **~35x faster** |
+| Metric | Result |
+|--------|--------|
+| Throughput | **64 files/s, 51 MB/s** |
+| 100k files | **21 minutes** |
+| Threads | 24 (configurable) |
 
-Real-world results on 325,642 Internet Archive texts:
-- **143.9 million** substitutions applied
-- **99.5%** of files had OCR errors corrected
-- **~442** substitutions per file average
+The pipeline includes document triage, language detection, boilerplate stripping, and 150+ OCR pattern corrections - all running in parallel.
+
+Real-world results on 100,000 Internet Archive texts:
+- **43.3 million** substitutions applied
+- **99.8%** of files had OCR errors corrected
+- **~538** substitutions per file average
+- **19,395** files filtered by triage (14,664 quarantined, 4,731 rejected)
+- **54 million** characters of boilerplate stripped
 
 ### Pattern Categories
 
