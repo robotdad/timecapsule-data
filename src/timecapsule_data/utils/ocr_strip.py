@@ -7,8 +7,8 @@ from the vocabulary candidates file. These are pure noise that
 degrades LLM training quality.
 
 Usage:
-    # In-place modification (saves disk space)
-    tc-ocr-strip batch ./cleaned --in-place --vocab _vocab_candidates.txt --log strip.jsonl
+    # In-place modification (saves disk space, auto-generates _strip_log.jsonl)
+    tc-ocr-strip batch ./cleaned --in-place --vocab _vocab_candidates.txt
 
     # Copy to new directory
     tc-ocr-strip batch ./cleaned -o ./training --vocab _vocab_candidates.txt
@@ -20,6 +20,9 @@ Workflow:
     1. Run tc-ocr-clean batch (OCR pattern fixes)
     2. Run tc-ocr-vocab extract (identify noise words)
     3. Run tc-ocr-strip batch --in-place (remove G/R noise for training)
+
+Output:
+    _strip_log.jsonl - JSONL log of modified files (auto-increments if exists)
 """
 
 from __future__ import annotations
@@ -30,6 +33,27 @@ import signal
 import sys
 import time
 from pathlib import Path
+
+
+def get_unique_path(path: Path) -> Path:
+    """Return a unique path by adding numeric suffix if file exists.
+
+    Examples:
+        _strip_log.jsonl -> _strip_log_1.jsonl -> _strip_log_2.jsonl
+    """
+    if not path.exists():
+        return path
+
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+
+    counter = 1
+    while True:
+        new_path = parent / f"{stem}_{counter}{suffix}"
+        if not new_path.exists():
+            return new_path
+        counter += 1
 
 
 def cmd_batch(args: argparse.Namespace) -> int:
@@ -51,7 +75,15 @@ def cmd_batch(args: argparse.Namespace) -> int:
         return 1
 
     output_dir = input_dir if in_place else Path(args.output_dir).resolve()
-    log_path = Path(args.log).resolve() if args.log else None
+
+    # Determine log path (auto-generate with increment if not specified)
+    if args.log:
+        log_path = Path(args.log).resolve()
+    elif not getattr(args, "no_log", False):
+        # Default: _strip_log.jsonl in input directory (with auto-increment)
+        log_path = get_unique_path(input_dir / "_strip_log.jsonl")
+    else:
+        log_path = None
 
     if not input_dir.exists():
         print(f"Error: Input directory not found: {input_dir}", file=sys.stderr)
@@ -347,10 +379,13 @@ Categories:
 
 Examples:
   tc-ocr-strip batch ./cleaned --in-place --vocab _vocab_candidates.txt
-  tc-ocr-strip batch ./cleaned --in-place --vocab vocab.txt --log strip.jsonl
+  tc-ocr-strip batch ./cleaned --in-place --vocab vocab.txt --no-log
   tc-ocr-strip batch ./cleaned -o ./training --vocab _vocab_candidates.txt
   tc-ocr-strip file doc.txt -o doc_clean.txt --vocab vocab.txt
   tc-ocr-strip check doc.txt --vocab vocab.txt
+
+Output files (auto-generated, auto-incremented):
+  _strip_log.jsonl    Log of modified files with word counts
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -374,7 +409,12 @@ Examples:
     batch_parser.add_argument("--threads", type=int, default=24, help="Thread count (default: 24)")
     batch_parser.add_argument(
         "--log",
-        help="Write JSONL log of modified files to this path",
+        help="Override log file path (default: {input_dir}/_strip_log.jsonl)",
+    )
+    batch_parser.add_argument(
+        "--no-log",
+        action="store_true",
+        help="Disable log file generation",
     )
 
     # File command
