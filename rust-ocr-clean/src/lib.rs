@@ -3802,6 +3802,75 @@ fn strip_noise_batch_parallel(
     })
 }
 
+/// Batch strip noise words with per-file logging.
+/// Returns (StripBatchStats, Vec<(path, words_stripped)>) for modified files only.
+#[pyfunction]
+fn strip_noise_batch_parallel_logged(
+    file_pairs: Vec<(String, String)>,
+    num_threads: usize,
+) -> PyResult<(StripBatchStats, Vec<(String, u64)>)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    
+    // Configure thread pool
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build()
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            format!("Failed to create thread pool: {}", e)
+        ))?;
+    
+    let files_processed = AtomicU64::new(0);
+    let files_modified = AtomicU64::new(0);
+    let total_stripped = AtomicU64::new(0);
+    let total_bytes = AtomicU64::new(0);
+    let modified_files: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+    
+    pool.install(|| {
+        file_pairs.par_iter().for_each(|(input_path, output_path)| {
+            // Read file
+            let content = match std::fs::read_to_string(input_path) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            
+            let bytes = content.len();
+            total_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+            
+            // Strip noise
+            let (cleaned, stripped) = strip_noise_words(&content);
+            
+            // Ensure parent directory exists
+            if let Some(parent) = std::path::Path::new(output_path.as_str()).parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            
+            // Write output
+            if std::fs::write(output_path, &cleaned).is_ok() {
+                files_processed.fetch_add(1, Ordering::Relaxed);
+                if stripped > 0 {
+                    files_modified.fetch_add(1, Ordering::Relaxed);
+                    total_stripped.fetch_add(stripped as u64, Ordering::Relaxed);
+                    // Log this file
+                    if let Ok(mut log) = modified_files.lock() {
+                        log.push((input_path.clone(), stripped as u64));
+                    }
+                }
+            }
+        });
+    });
+    
+    let stats = StripBatchStats {
+        files_processed: files_processed.load(Ordering::Relaxed),
+        files_modified: files_modified.load(Ordering::Relaxed),
+        total_words_stripped: total_stripped.load(Ordering::Relaxed),
+        total_bytes: total_bytes.load(Ordering::Relaxed),
+    };
+    
+    let log = modified_files.into_inner().unwrap_or_default();
+    Ok((stats, log))
+}
+
 #[pymodule]
 fn rust_ocr_clean(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(clean_text, m)?)?;
@@ -3858,6 +3927,7 @@ fn rust_ocr_clean(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(strip_noise_words, m)?)?;
     m.add_function(wrap_pyfunction!(strip_noise_file, m)?)?;
     m.add_function(wrap_pyfunction!(strip_noise_batch_parallel, m)?)?;
+    m.add_function(wrap_pyfunction!(strip_noise_batch_parallel_logged, m)?)?;
     m.add_class::<StripBatchStats>()?;
     Ok(())
 }

@@ -7,13 +7,19 @@ from the vocabulary candidates file. These are pure noise that
 degrades LLM training quality.
 
 Usage:
+    # In-place modification (saves disk space)
+    tc-ocr-strip batch ./cleaned --in-place --vocab _vocab_candidates.txt --log strip.jsonl
+
+    # Copy to new directory
     tc-ocr-strip batch ./cleaned -o ./training --vocab _vocab_candidates.txt
+
+    # Single file
     tc-ocr-strip file input.txt -o output.txt --vocab _vocab_candidates.txt
 
 Workflow:
     1. Run tc-ocr-clean batch (OCR pattern fixes)
     2. Run tc-ocr-vocab extract (identify noise words)
-    3. Run tc-ocr-strip batch (remove G/R noise for training)
+    3. Run tc-ocr-strip batch --in-place (remove G/R noise for training)
 """
 
 from __future__ import annotations
@@ -28,13 +34,24 @@ from pathlib import Path
 
 def cmd_batch(args: argparse.Namespace) -> int:
     """Strip noise words from batch of files."""
+    import json
+
     import rust_ocr_clean  # type: ignore[import-not-found]
 
     input_dir = Path(args.input_dir).resolve()
-    output_dir = (
-        Path(args.output_dir).resolve() if args.output_dir else input_dir.parent / "training"
-    )
     vocab_path = Path(args.vocab).resolve()
+
+    # Determine output mode
+    in_place = getattr(args, "in_place", False)
+    if in_place and args.output_dir:
+        print("Error: Cannot use both --in-place and --output-dir", file=sys.stderr)
+        return 1
+    if not in_place and not args.output_dir:
+        print("Error: Must specify either --output-dir or --in-place", file=sys.stderr)
+        return 1
+
+    output_dir = input_dir if in_place else Path(args.output_dir).resolve()
+    log_path = Path(args.log).resolve() if args.log else None
 
     if not input_dir.exists():
         print(f"Error: Input directory not found: {input_dir}", file=sys.stderr)
@@ -107,15 +124,16 @@ def cmd_batch(args: argparse.Namespace) -> int:
             print("No files to process.", file=sys.stderr)
             return 0
 
-        # Build file pairs
+        # Build file pairs (for in-place, input == output)
         file_pairs = []
         for input_path in files:
             relative = input_path.relative_to(input_dir)
             output_path = output_dir / relative
             file_pairs.append((str(input_path), str(output_path)))
 
-        # Create output directory
-        output_dir.mkdir(parents=True, exist_ok=True)
+        # Create output directory (only if not in-place)
+        if not in_place:
+            output_dir.mkdir(parents=True, exist_ok=True)
 
         num_threads = args.threads or 24
 
@@ -125,9 +143,14 @@ def cmd_batch(args: argparse.Namespace) -> int:
         print(f"{'=' * 60}")
         print(f"  Files to process: {len(file_pairs):,}")
         print(f"  Noise words: {noise_count:,}")
-        print(f"  Output: {output_dir}")
+        print(f"  Mode: {'in-place' if in_place else 'copy to ' + str(output_dir)}")
+        if log_path:
+            print(f"  Log: {log_path}")
         print(f"  Threads: {num_threads}")
         print(f"{'=' * 60}\n")
+
+        # Open log file if requested
+        log_file = open(log_path, "w", encoding="utf-8") if log_path else None
 
         # Process in batches for progress reporting
         start_time = time.time()
@@ -139,46 +162,65 @@ def cmd_batch(args: argparse.Namespace) -> int:
         total_stripped = 0
         bytes_processed = 0
 
-        for batch_start in range(0, total_to_process, BATCH_SIZE):
-            if interrupted:
-                break
+        try:
+            for batch_start in range(0, total_to_process, BATCH_SIZE):
+                if interrupted:
+                    break
 
-            batch_end = min(batch_start + BATCH_SIZE, total_to_process)
-            batch = file_pairs[batch_start:batch_end]
+                batch_end = min(batch_start + BATCH_SIZE, total_to_process)
+                batch = file_pairs[batch_start:batch_end]
 
-            # Process batch in parallel using Rust/Rayon
-            batch_stats = rust_ocr_clean.strip_noise_batch_parallel(batch, num_threads)
+                # Process batch - use logged version if logging enabled
+                if log_file:
+                    batch_stats, modified_files = rust_ocr_clean.strip_noise_batch_parallel_logged(
+                        batch, num_threads
+                    )
+                    # Write log entries for modified files
+                    for path, words_stripped in modified_files:
+                        # Make path relative to input_dir for cleaner logs
+                        try:
+                            rel_path = str(Path(path).relative_to(input_dir))
+                        except ValueError:
+                            rel_path = path
+                        log_file.write(
+                            json.dumps({"path": rel_path, "words_stripped": words_stripped}) + "\n"
+                        )
+                else:
+                    batch_stats = rust_ocr_clean.strip_noise_batch_parallel(batch, num_threads)
 
-            # Aggregate stats
-            files_processed += batch_stats.files_processed
-            files_modified += batch_stats.files_modified
-            total_stripped += batch_stats.total_words_stripped
-            bytes_processed += batch_stats.total_bytes
+                # Aggregate stats
+                files_processed += batch_stats.files_processed
+                files_modified += batch_stats.files_modified
+                total_stripped += batch_stats.total_words_stripped
+                bytes_processed += batch_stats.total_bytes
 
-            # Progress update
-            now = time.time()
-            elapsed = now - start_time
-            current_count = batch_end
-            files_per_sec = current_count / elapsed if elapsed > 0 else 0
-            mb_per_sec = (bytes_processed / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-            remaining = (
-                (total_to_process - current_count) / files_per_sec if files_per_sec > 0 else 0
-            )
+                # Progress update
+                now = time.time()
+                elapsed = now - start_time
+                current_count = batch_end
+                files_per_sec = current_count / elapsed if elapsed > 0 else 0
+                mb_per_sec = (bytes_processed / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                remaining = (
+                    (total_to_process - current_count) / files_per_sec if files_per_sec > 0 else 0
+                )
 
-            # Format remaining time
-            if remaining >= 3600:
-                eta = f"{remaining / 3600:.1f}h"
-            elif remaining >= 60:
-                eta = f"{remaining / 60:.1f}m"
-            else:
-                eta = f"{remaining:.0f}s"
+                # Format remaining time
+                if remaining >= 3600:
+                    eta = f"{remaining / 3600:.1f}h"
+                elif remaining >= 60:
+                    eta = f"{remaining / 60:.1f}m"
+                else:
+                    eta = f"{remaining:.0f}s"
 
-            pct = (current_count / total_to_process) * 100 if total_to_process > 0 else 100
-            print(
-                f"  [{pct:5.1f}%] {current_count:,}/{total_to_process:,} files | "
-                f"{files_per_sec:.1f} files/s | {mb_per_sec:.1f} MB/s | "
-                f"ETA: {eta} | stripped: {total_stripped:,}"
-            )
+                pct = (current_count / total_to_process) * 100 if total_to_process > 0 else 100
+                print(
+                    f"  [{pct:5.1f}%] {current_count:,}/{total_to_process:,} files | "
+                    f"{files_per_sec:.1f} files/s | {mb_per_sec:.1f} MB/s | "
+                    f"ETA: {eta} | stripped: {total_stripped:,}"
+                )
+        finally:
+            if log_file:
+                log_file.close()
 
         # Final stats
         elapsed = time.time() - start_time
@@ -196,6 +238,8 @@ def cmd_batch(args: argparse.Namespace) -> int:
         print(f"  Words stripped:  {total_stripped:,}")
         print(f"  Time elapsed:    {elapsed:.1f}s")
         print(f"  Throughput:      {files_per_sec:.1f} files/s, {mb_per_sec:.1f} MB/s")
+        if log_path:
+            print(f"  Log written:     {log_path}")
         print(f"{'=' * 60}")
 
         return 0 if not interrupted else 1
@@ -302,8 +346,9 @@ Categories:
   M = mixed_case (random capitals - NOT stripped by default)
 
 Examples:
+  tc-ocr-strip batch ./cleaned --in-place --vocab _vocab_candidates.txt
+  tc-ocr-strip batch ./cleaned --in-place --vocab vocab.txt --log strip.jsonl
   tc-ocr-strip batch ./cleaned -o ./training --vocab _vocab_candidates.txt
-  tc-ocr-strip batch ./cleaned --vocab vocab.txt --categories G,R,F
   tc-ocr-strip file doc.txt -o doc_clean.txt --vocab vocab.txt
   tc-ocr-strip check doc.txt --vocab vocab.txt
         """,
@@ -315,13 +360,22 @@ Examples:
     # Batch command
     batch_parser = subparsers.add_parser("batch", help="Process directory of files")
     batch_parser.add_argument("input_dir", help="Input directory")
-    batch_parser.add_argument("-o", "--output-dir", help="Output directory (default: ../training)")
+    batch_parser.add_argument("-o", "--output-dir", help="Output directory")
+    batch_parser.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Modify files in place (no output directory needed)",
+    )
     batch_parser.add_argument("--vocab", required=True, help="Vocab candidates file")
     batch_parser.add_argument(
         "--categories",
         help="Comma-separated categories to strip (default: G,R)",
     )
     batch_parser.add_argument("--threads", type=int, default=24, help="Thread count (default: 24)")
+    batch_parser.add_argument(
+        "--log",
+        help="Write JSONL log of modified files to this path",
+    )
 
     # File command
     file_parser = subparsers.add_parser("file", help="Process single file")

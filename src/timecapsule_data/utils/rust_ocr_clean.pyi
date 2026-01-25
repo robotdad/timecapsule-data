@@ -671,3 +671,21 @@ def strip_noise_batch_parallel(
         StripBatchStats with processing statistics.
     """
     ...
+
+
+def strip_noise_batch_parallel_logged(
+    file_pairs: list[tuple[str, str]], num_threads: int
+) -> tuple[StripBatchStats, list[tuple[str, int]]]:
+    """Batch strip noise words with per-file logging.
+
+    Same as strip_noise_batch_parallel but also returns a list of
+    (path, words_stripped) for files that were modified.
+
+    Args:
+        file_pairs: List of (input_path, output_path) tuples.
+        num_threads: Number of threads to use.
+
+    Returns:
+        Tuple of (StripBatchStats, list of (path, words_stripped) for modified files).
+    """
+    ...
