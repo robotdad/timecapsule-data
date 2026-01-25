@@ -77,11 +77,11 @@ def cmd_batch(args: argparse.Namespace) -> int:
     output_dir = input_dir if in_place else Path(args.output_dir).resolve()
 
     # Determine log path (auto-generate with increment if not specified)
+    # Default location is parent of input_dir (consistent with other tools)
     if args.log:
         log_path = Path(args.log).resolve()
     elif not getattr(args, "no_log", False):
-        # Default: _strip_log.jsonl in input directory (with auto-increment)
-        log_path = get_unique_path(input_dir / "_strip_log.jsonl")
+        log_path = get_unique_path(input_dir.parent / "_strip_log.jsonl")
     else:
         log_path = None
 
